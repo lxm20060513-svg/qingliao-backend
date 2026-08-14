@@ -1,0 +1,13 @@
+# 运行时数据/密钥文件（绝不可提交）
+__pycache__/
+*.pyc
+data/
+*.enc
+.secrets_key
+auth_config.json
+auth_tokens.json
+ha_config.json
+upload_config.json
+sessions_loc.json
+*.log
+.env

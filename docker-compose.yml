@@ -1,0 +1,36 @@
+services:
+  qingliao:
+    build: .
+    container_name: qingliao
+    restart: unless-stopped
+    ports:
+      - "9125-9141:9125-9141"
+    environment:
+      # 必填：统一访问密码（所有 API 的密码鉴权）
+      QL_PASSWORD: change-me
+      # 数据目录（容器内，与 volume 对应）
+      QL_DATA_DIR: /data
+      # 上游 LLM（OpenAI 兼容端点，如 Hermes/DeepSeek/OpenCode）
+      QL_HERMES_URL: http://host.docker.internal:9123/v1/chat/completions
+      QL_HERMES_KEY: ""
+      # Home Assistant（可选，智能家居模块）
+      QL_HA_URL: http://host.docker.internal:8123
+      QL_HA_TOKEN: ""
+      # 路由器（可选，Clash 管理模块；需容器内可访问路由器 SSH）
+      QL_ROUTER_HOST: ""
+      QL_ROUTER_USER: root
+      QL_ROUTER_PASSWORD: ""
+      # Docker 部署目录（docker_api 模块，compose 文件存放位置）
+      QL_DOCKER_ROOT: /data/docker
+      # 流式任务数据目录
+      STREAM_DATA_DIR: /data/streams_data
+      # 会话数据目录
+      SESSIONS_DATA_DIR: /data/sessions
+      # 日志来源容器名（logs_api 查 docker logs 用）
+      QL_LOG_CONTAINER: hermes
+    volumes:
+      - ./data:/data
+      # docker_api 管理容器需要挂载 docker socket（可选；不需要可注释）
+      - /var/run/docker.sock:/var/run/docker.sock
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
