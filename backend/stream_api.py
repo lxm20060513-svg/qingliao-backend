@@ -241,10 +241,106 @@ def _maybe_push(st):
         print("[push] 微信推送失败:", str(e)[:200], flush=True)
 
 
+# ---- v2.0.96 方案B：Agent（工具调用循环）----
+
+AGENT_URL = os.environ.get("QL_AGENT_URL", "https://api.deepseek.com/v1/chat/completions")
+AGENT_KEY = os.environ.get("QL_AGENT_KEY", "")   # 优先 env，否则读 config.yaml 的 providers.deepseek.api_key
+AGENT_MODEL = os.environ.get("QL_AGENT_MODEL", "deepseek-chat")
+# 强意图（控制/执行类，命中即走 Agent）vs 弱意图（查询类，需动词+主题双命中，防闲聊误伤）
+AGENT_STRONG = ("控制", "开关", "启动", "停止", "重启", "关灯", "开灯", "清理", "清空", "执行", "设置", "布防", "离家", "空调")
+AGENT_VERBS = ("查", "看", "问", "多少", "怎么样", "状态", "情况", "使用率", "帮我", "运行", "温度")
+AGENT_TOPICS = ("天气", "磁盘", "容器", "服务", "内存", "空间", "温度", "系统")
+
+
+def _agent_key():
+    if AGENT_KEY:
+        return AGENT_KEY
+    try:
+        import re
+        txt = open(os.environ.get("QL_HERMES_CONFIG", "/etc/hermes/config.yaml"), encoding="utf-8").read()
+        m = re.search(r"deepseek:\s*\n\s*api_key:\s*([A-Za-z0-9_\-]+)", txt)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return ""
+
+
+def _is_agent_request(messages):
+    """最后一条用户消息：强意图词直接触发；弱意图需动词+主题双命中（防闲聊误伤）"""
+    try:
+        last = None
+        for m in reversed(messages):
+            if isinstance(m, dict) and m.get("role") == "user":
+                last = m
+                break
+        if not last:
+            return False
+        c = last.get("content", "")
+        if isinstance(c, list):
+            c = " ".join(str(b.get("text", "")) for b in c if isinstance(b, dict))
+        c = str(c)
+        if any(h in c for h in AGENT_STRONG):
+            return True
+        return any(v in c for v in AGENT_VERBS) and any(t in c for t in AGENT_TOPICS)
+    except Exception:
+        return False
+
+
+def _chat_once(body):
+    import urllib.request
+    req = urllib.request.Request(AGENT_URL, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json",
+                                          "Authorization": "Bearer " + _agent_key()}, method="POST")
+    with urllib.request.urlopen(req, timeout=120) as r:
+        return json.loads(r.read())
+
+
+def _agent_loop(messages):
+    """工具调用循环：模型返回 tool_calls → 执行 → 回填 → 再问（上限 8 轮）"""
+    try:
+        import tool_executor
+    except Exception as e:
+        return f"Agent 工具模块不可用：{e}"
+    try:
+        msgs = [m for m in messages if isinstance(m, dict) and m.get("role") != "system"]
+        sys_p = {"role": "system",
+                 "content": "你是家庭 NAS 管家 Agent。可以调用工具查询/控制 NAS、Docker、智能家居。"
+                            "工具结果如实转达用户；失败要说明原因和建议。回答简洁中文，用 emoji 点缀。"}
+        msgs = [sys_p] + msgs
+        for _ in range(8):
+            body = {"model": AGENT_MODEL, "messages": msgs,
+                    "tools": tool_executor.TOOLS, "stream": False, "max_tokens": 1500}
+            resp = _chat_once(body)
+            msg = resp["choices"][0]["message"]
+            if msg.get("tool_calls"):
+                msgs.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": msg["tool_calls"]})
+                for tc in msg["tool_calls"]:
+                    fn = tc["function"]
+                    try:
+                        args = json.loads(fn.get("arguments") or "{}")
+                    except Exception:
+                        args = {}
+                    result = tool_executor.execute(fn["name"], args)
+                    msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                continue
+            return msg.get("content") or "（模型无返回内容）"
+        return "Agent 工具循环超过 8 轮，已停止"
+    except Exception as e:
+        return f"Agent 执行失败：{e}"
+
+
 def _worker(task_id, task):
     st = task["state"]
     last_write = time.time()
     try:
+        # v2.0.96 方案B：Agent 分流（工具调用循环，直连支持 function calling 的模型）
+        if _is_agent_request(st["messages"]):
+            st["content"] = _agent_loop(st["messages"])
+            st["status"] = "done"
+            _write_state(task_id, task)
+            _maybe_push(st)
+            return
         req_body = {
             "model": st["model"],
             "messages": memory_store.inject(kb_inject.inject(st["messages"])),

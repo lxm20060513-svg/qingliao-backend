@@ -20,6 +20,7 @@
 | 9139 | hw | NAS 硬件温度 |
 | 9140 | memory | AI 记忆 |
 | 9141 | weather | 天气（Open-Meteo，无 key） |
+| 9142 | scenes | 智能家居场景（AI 生成动作组，一键执行） |
 
 ## 🚀 快速开始
 
@@ -50,6 +51,20 @@ docker compose up -d
 | `STREAM_DATA_DIR` | | `$QL_DATA_DIR/streams_data` | 流式任务数据 |
 | `SESSIONS_DATA_DIR` | | `$QL_DATA_DIR/sessions` | 会话数据 |
 | `QL_LOG_CONTAINER` | | `hermes` | 日志模块查询的容器名 |
+| `QL_AGENT_URL` | | DeepSeek 官方 | Agent 模式模型端点（需支持 function calling） |
+| `QL_AGENT_KEY` | | 空 | Agent 模式 API Key |
+| `QL_AGENT_MODEL` | | `deepseek-chat` | Agent 模式模型名 |
+
+## 🤖 Agent 模式（工具调用）
+
+消息含控制/查询意图（如"帮我查磁盘""把空调关了""生成离家模式"）时，自动切换 **Agent 通道**：直连支持 function calling 的模型（默认 DeepSeek 官方 API），模型可调用工具执行后回填结果：
+
+- `get_time` / `get_disk_usage` / `get_service_status` / `get_temperature`
+- `docker_ps` / `docker_action`（容器启停）
+- `ha_list_entities` / `ha_call`（智能家居控制）
+- `get_weather` / `scene_save` / `scene_run` / `scene_list`（场景）
+
+**场景**：聊天里说「帮我生成离家模式：关灯、关空调、布防」→ Agent 查询 HA 实体 → 生成动作组存 `scenes.json` → 看板点场景卡一键执行（`POST /api/scenes/run`）。
 
 ## 🔗 上游依赖
 

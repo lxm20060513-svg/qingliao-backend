@@ -4,7 +4,7 @@ services:
     container_name: qingliao
     restart: unless-stopped
     ports:
-      - "9125-9141:9125-9141"
+      - "9125-9142:9125-9142"
     environment:
       # 必填：统一访问密码（所有 API 的密码鉴权）
       QL_PASSWORD: change-me
@@ -22,6 +22,10 @@ services:
       QL_ROUTER_PASSWORD: ""
       # Docker 部署目录（docker_api 模块，compose 文件存放位置）
       QL_DOCKER_ROOT: /data/docker
+      # Agent 模式（工具调用循环）：OpenAI 兼容端点 + Key（支持 function calling）
+      QL_AGENT_URL: https://api.deepseek.com/v1/chat/completions
+      QL_AGENT_KEY: 
+      QL_AGENT_MODEL: deepseek-chat
       # 流式任务数据目录
       STREAM_DATA_DIR: /data/streams_data
       # 会话数据目录
