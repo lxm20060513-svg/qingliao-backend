@@ -130,6 +130,26 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "hermes_execute",
+            "description": "将超出本地工具能力的任务转交给 Hermes Agent 执行。Hermes 拥有完整工具链（联网搜索/网页、终端命令、文件读写、代码执行、浏览器等）。当用户任务需要这些能力（如查资料、写脚本、操作文件、执行命令）而本地工具无法完成时，调用此工具并把任务完整转述",
+            "parameters": {
+                "type": "object",
+                "properties": {"task": {"type": "string", "description": "完整任务描述（用户原话或转述，含必要上下文）"}},
+                "required": ["task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_memory_usage",
+            "description": "获取 NAS 内存使用情况（总量/已用/可用）",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_weather",
             "description": "获取指定城市的当前天气（中文城市名）",
             "parameters": {
@@ -173,6 +193,8 @@ def execute(name, args):
                 return f"CPU {d.get('cpu_temp')}°C, SSD {d.get('ssd_temp')}°C"
             except Exception:
                 return "温度查询失败"
+        if name == "get_memory_usage":
+            return _sh("free -h | awk 'NR==1 || /Mem/ {print}'")
         if name == "docker_ps":
             return _sh("docker ps -a --format '{{.Names}}|{{.Status}}' | head -15")
         if name == "docker_action":
@@ -204,9 +226,39 @@ def execute(name, args):
             import scenes_api
             scenes = scenes_api.list_scenes()
             return "、".join(s.get("name", "") for s in scenes) if scenes else "（暂无场景）"
+        if name == "hermes_execute":
+            return _hermes_execute(args.get("task", ""))
         return f"未知工具 {name}"
     except Exception as e:
         return f"工具执行异常: {e}"
+
+
+def _hermes_execute(task):
+    """转交 Hermes 执行（9123 完整工具链：联网/终端/文件/代码）"""
+    if not task:
+        return "任务为空"
+    try:
+        # 复用 stream_api 的 Hermes 配置（运行时 import 避免循环依赖）
+        import stream_api
+        body = {"model": "deepseek-v4-flash",
+                "messages": [{"role": "system",
+                              "content": "你是家庭 NAS 管家 Hermes。用户把任务转交给你执行，你有完整工具链（联网搜索/终端/文件/代码执行）。直接完成任务，用中文简洁回复结果。"},
+                             {"role": "user", "content": task}],
+                "stream": False, "max_tokens": 2500}
+        req = urllib.request.Request(stream_api.HERMES_URL, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json",
+                                              "Authorization": "Bearer " + stream_api.HERMES_KEY},
+                                     method="POST")
+        with urllib.request.urlopen(req, timeout=300) as r:
+            d = json.loads(r.read())
+        c = ""
+        try:
+            c = d["choices"][0]["message"]["content"] or ""
+        except Exception:
+            pass
+        return c or "（Hermes 无返回内容）"
+    except Exception as e:
+        return f"Hermes 转交失败：{str(e)[:150]}"
 
 
 def _ha_call(entity, service, data):

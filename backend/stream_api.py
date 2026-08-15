@@ -304,9 +304,13 @@ def _agent_loop(messages):
         return f"Agent 工具模块不可用：{e}"
     try:
         msgs = [m for m in messages if isinstance(m, dict) and m.get("role") != "system"]
-        sys_p = {"role": "system",
-                 "content": "你是家庭 NAS 管家 Agent。可以调用工具查询/控制 NAS、Docker、智能家居。"
-                            "工具结果如实转达用户；失败要说明原因和建议。回答简洁中文，用 emoji 点缀。"}
+        import agent_rules
+        hint = agent_rules.rules_hint()
+        sys_content = ("你是家庭 NAS 管家 Agent。可以调用工具查询/控制 NAS、Docker、智能家居。"
+                       "工具结果如实转达用户；失败要说明原因和建议。回答简洁中文，用 emoji 点缀。")
+        if hint:
+            sys_content += "\n" + hint
+        sys_p = {"role": "system", "content": sys_content}
         msgs = [sys_p] + msgs
         for _ in range(8):
             body = {"model": AGENT_MODEL, "messages": msgs,
@@ -335,7 +339,22 @@ def _worker(task_id, task):
     last_write = time.time()
     try:
         # v2.0.96 方案B：Agent 分流（工具调用循环，直连支持 function calling 的模型）
-        if _is_agent_request(st["messages"]):
+        # v2.0.98：设置开关 agentEnabled=false 时禁用；agent_rules 规则命中强制走 agent；
+        #          用户声明「以后XX都用agent」→ 提取并存规则（下次同类直接 agent）
+        import agent_rules
+        last_user = None
+        for m in reversed(st["messages"]):
+            if isinstance(m, dict) and m.get("role") == "user":
+                last_user = m.get("content", "")
+                if isinstance(last_user, list):
+                    last_user = " ".join(str(b.get("text", "")) for b in last_user if isinstance(b, dict))
+                break
+        new_rule = agent_rules.extract_from_text(last_user or "")
+        if new_rule:
+            agent_rules.add_rule(new_rule)
+        agent_on = st.get("agentEnabled", True)
+        if agent_on and (_is_agent_request(st["messages"]) or agent_rules.match(last_user or "")):
+            st["agent"] = True
             st["content"] = _agent_loop(st["messages"])
             st["status"] = "done"
             _write_state(task_id, task)
@@ -417,6 +436,28 @@ class StreamHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _proxy_asr(self):
+        """蜂窝 relay ASR：raw 音频 body 透传 127.0.0.1:9143/api/asr/transcribe"""
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(n)
+            headers = {"Content-Type": "application/octet-stream"}
+            tok = self.headers.get("X-Auth-Token", "")
+            if tok:
+                headers["X-Auth-Token"] = tok
+            req = urllib.request.Request("http://127.0.0.1:9143/api/asr/transcribe",
+                                         data=body, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=95) as r:
+                resp = r.read()
+                self.send_response(r.status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(resp)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(resp)
+        except Exception as e:
+            self._send(500, {"ok": False, "error": str(e)[:150]})
+
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -429,6 +470,10 @@ class StreamHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path.startswith("/r?") or self.path == "/r":
             _relay_query(self)
+            return
+        # 蜂窝 relay ASR 转写（v2.0.98）：/r/asr/transcribe/{uid} → 透传 9143 asr_api
+        if self.path.startswith("/r/asr/transcribe/"):
+            self._proxy_asr()
             return
         self.path = _relay_alias(self.path)
         if not _auth(self):
@@ -444,6 +489,7 @@ class StreamHandler(BaseHTTPRequestHandler):
             model = str(data.get("model", "deepseek-v4-flash"))
             messages = data.get("messages")
             push_enabled = bool(data.get("pushEnabled", False))  # V1.4 微信推送开关
+            agent_enabled = bool(data.get("agentEnabled", True))  # v2.0.98 Agent 开关（设置页可关）
             provider = str(data.get("provider", "") or "")  # V1.5.3 模型精确路由（9123 需 provider 才不回退默认）
             if not messages or not isinstance(messages, list):
                 return self._send(400, {"error": "messages required"})
@@ -458,6 +504,7 @@ class StreamHandler(BaseHTTPRequestHandler):
                     "content": "",
                     "status": "streaming",
                     "pushEnabled": push_enabled,
+                    "agentEnabled": agent_enabled,
                     "provider": provider,
                     "createdAt": time.time(),
                     "updatedAt": time.time()
@@ -599,6 +646,7 @@ class StreamHandler(BaseHTTPRequestHandler):
                                     "done": True,
                                     "status": st.get("status", "done"),
                                     "error": st.get("error", ""),
+                                    "agent": st.get("agent", False),
                                     "fromDisk": True
                                 })
                         except Exception:
@@ -632,7 +680,8 @@ class StreamHandler(BaseHTTPRequestHandler):
                 "done": st["status"] != "streaming",
                 "status": st["status"],
                 "sessionId": st["sessionId"],
-                "error": st.get("error", "")
+                "error": st.get("error", ""),
+                "agent": st.get("agent", False)   # v2.0.98：Agent 回复标记（设置页开关关闭时恒 false）
             })
         return self._send(404, {"error": "not found"})
 
