@@ -33,7 +33,7 @@ def _get_weather(lat=None, lon=None, city=None):
             rs = (g.get("results") or [])
             if rs:
                 lat, lon = rs[0]["latitude"], rs[0]["longitude"]
-                city = rs[0].get("name") or rs[0].get("admin1") or city
+                # v2.0.101：保留用户输入的城市名（Open-Meteo 搜"南宁"首个结果可能是区级"兴宁区"，覆盖会显示错乱）
         except Exception:
             pass
     try:
@@ -56,8 +56,9 @@ def _get_weather(lat=None, lon=None, city=None):
                 city = loc.get("city") or city
         except Exception:
             pass
-    else:
+    elif not city:
         # v2.0.87ag：坐标反查城市（Nominatim，显示具体地点）
+        # v2.0.101：仅无手动城市时反查——否则 Nominatim zoom=10 会把"南宁"反查成区级"兴宁区"
         try:
             rev = _fetch("https://nominatim.openstreetmap.org/reverse?lat=%.4f&lon=%.4f"
                          "&format=json&zoom=10" % (lat, lon), timeout=6)

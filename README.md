@@ -21,6 +21,8 @@
 | 9140 | memory | AI 记忆 |
 | 9141 | weather | 天气（Open-Meteo，无 key） |
 | 9142 | scenes | 智能家居场景（AI 生成动作组，一键执行） |
+| 9143 | asr | 语音转文字（faster-whisper 转写，供 App 上传录音） |
+| 9145 | agent | Agent 记忆规则管理（「以后XX都用agent」话术） |
 
 ## 🚀 快速开始
 
@@ -32,6 +34,12 @@ docker compose up -d
 ```
 
 服务启动后，各 API 以 `/api/<模块>/` 前缀对外暴露（建议用 nginx 反代统一入口）。
+
+> ⚠️ **nginx 路由部署须知（踩坑记录）**：新增 API 模块时，必须在**全部入口**配置特化 location：
+> - `8080`（hermes-webui.conf）——**它有 `location /api/` 泛匹配兜底转发到 Hermes(9123)，新增路由不配特化会被 Hermes 404 吞掉**（scenes/asr/agent 都踩过）
+> - `16668`（qingliao_http.conf）与 `443`（webui_443.conf）——按模块名加 `location /api/xxx { proxy_pass http://127.0.0.1:PORT; }`
+>
+> ⚠️ **场景动作 service 格式**：动作里存 `climate.turn_off`（点分隔），执行时后端自动拆为 HA 路径 `/api/services/climate/turn_off`（斜杠），勿直接拼接点号字符串（会 404）。
 
 ## ⚙️ 环境变量
 

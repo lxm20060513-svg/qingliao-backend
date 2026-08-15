@@ -168,8 +168,12 @@ def _collect_nas_status():
         services["qingliao"] = None
         services["qingliao_mem"] = None
     try:
-        hkey = os.environ.get("HERMES_KEY", "")
-        r = subprocess.run(["curl", "-s", "-m", "3", "-o", "/dev/null", "-w", "%{http_code}", "-H", "Authorization: Bearer " + hkey, HERMES_URL], capture_output=True, text=True, timeout=8)
+        # v2.0.102c：读 STREAM_HERMES_KEY（qingliao.service 注入；原 HERMES_KEY 为空 → 401）+
+        #           健康检查打 /health（原打 /v1/chat/completions 是 POST 端点，GET 恒 405 → 永远误判离线）
+        hkey = os.environ.get("STREAM_HERMES_KEY", "")
+        health_url = os.environ.get("STREAM_HERMES_HEALTH_URL", "http://127.0.0.1:9123/health")
+        r = subprocess.run(["curl", "-s", "-m", "3", "-o", "/dev/null", "-w", "%{http_code}",
+                            "-H", "Authorization: Bearer " + hkey, health_url], capture_output=True, text=True, timeout=8)
         services["hermes"] = r.stdout.strip() == "200"
         p = subprocess.run(["pgrep", "-f", "hermes gateway run"], capture_output=True, text=True, timeout=8)
         services["hermes_mem"] = _proc_rss(p.stdout.strip().splitlines()[0]) if p.stdout.strip() else None

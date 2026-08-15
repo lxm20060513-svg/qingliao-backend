@@ -65,8 +65,11 @@ def run_scene(name):
         service = act.get("service", "")
         data = act.get("data") or {}
         try:
+            # v2.0.102c：service 可能是 "climate.turn_off"（点分隔）——HA API 路径是 /api/services/climate/turn_off（斜杠）
+            domain, _, svc = service.partition(".")
+            svc_path = svc or domain
             body = json.dumps({"entity_id": entity, **data}).encode()
-            req = urllib.request.Request(f"{HA_URL}/api/services/{service}", data=body,
+            req = urllib.request.Request(f"{HA_URL}/api/services/{domain}/{svc_path}", data=body,
                                          headers={"Authorization": "Bearer " + HA_TOKEN,
                                                   "Content-Type": "application/json"}, method="POST")
             with urllib.request.urlopen(req, timeout=15) as r:

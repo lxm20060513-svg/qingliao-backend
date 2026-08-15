@@ -175,13 +175,48 @@ def _sh(cmd, timeout=15):
         return f"执行失败: {e}"
 
 
+def _fmt_kb(kb):
+    kb = float(kb)
+    for unit in ["K", "M", "G", "T"]:
+        if kb < 1024:
+            return f"{kb:.1f}{unit}"
+        kb /= 1024
+    return f"{kb:.1f}P"
+
+
+def _disk_usage():
+    """宿主存储卷磁盘状态：/volume1/2/3 容量/已用/可用/使用率 + 各卷顶层主要占用。
+    qingliao 跑在宿主 systemd，df/du 天然是宿主视角（区别于容器内 df 只见自身挂载）。
+    注意：勿用 df -hT | head -8——系统分区会占满前 8 行，/volume3 被截断（历史 bug）。"""
+    out = []
+    df = _sh("df -h /volume1 /volume2 /volume3", timeout=20)
+    for row in df.splitlines()[1:]:
+        p = row.split()
+        if len(p) < 6:
+            continue
+        mount, size, used, avail, pct = p[5], p[1], p[2], p[3], p[4]
+        try:
+            pnum = int(pct.rstrip("%"))
+        except ValueError:
+            pnum = 0
+        flag = " 🔴" if pnum >= 85 else (" ⚠️" if pnum >= 75 else "")
+        out.append(f"{mount}：{size} 总，已用 {used}，可用 {avail}（{pct}）{flag}")
+        du = _sh(f"du -x --max-depth=1 {mount} 2>/dev/null | sort -rn | sed 1d | head -5", timeout=60)
+        if du:
+            for d in du.splitlines():
+                parts = d.split(None, 1)
+                if len(parts) == 2:
+                    out.append(f"  - {parts[1]} {_fmt_kb(parts[0])}")
+    return "\n".join(out) if out else "磁盘查询失败"
+
+
 def execute(name, args):
     """执行工具，返回字符串结果（供模型读取）"""
     try:
         if name == "get_time":
             return time.strftime("%Y-%m-%d %H:%M:%S %A")
         if name == "get_disk_usage":
-            return _sh("df -hT | awk 'NR>1 && $2 !~ /overlay|rootfs|squashfs|tmpfs|devtmpfs/ {print $7, $6\" 已用\", $4\" 可用\"}' | head -8")
+            return _disk_usage()
         if name == "get_service_status":
             q = _sh("systemctl is-active qingliao 2>/dev/null").strip()
             h = _sh("curl -s -m 3 -o /dev/null -w '%{http_code}' http://localhost:9123/health").strip()
