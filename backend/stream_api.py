@@ -251,7 +251,7 @@ AGENT_URL = os.environ.get("QL_AGENT_URL", "https://api.deepseek.com/v1/chat/com
 AGENT_KEY = os.environ.get("QL_AGENT_KEY", "")   # 优先 env，否则读 config.yaml 的 providers.deepseek.api_key
 AGENT_MODEL = os.environ.get("QL_AGENT_MODEL", "deepseek-chat")
 # 强意图（控制/执行类，命中即走 Agent）vs 弱意图（查询类，需动词+主题双命中，防闲聊误伤）
-AGENT_STRONG = ("控制", "开关", "启动", "停止", "重启", "关灯", "开灯", "清理", "清空", "执行", "设置", "布防", "离家", "空调")
+AGENT_STRONG = ("控制", "开关", "启动", "停止", "重启", "关灯", "开灯", "打开", "关闭", "清理", "清空", "执行", "设置", "布防", "离家", "空调", "风扇", "灯", "排气扇")
 AGENT_VERBS = ("查", "看", "问", "多少", "怎么样", "状态", "情况", "使用率", "帮我", "运行", "温度")
 AGENT_TOPICS = ("天气", "磁盘", "容器", "服务", "内存", "空间", "温度", "系统")
 
@@ -284,11 +284,30 @@ def _is_agent_request(messages):
         if isinstance(c, list):
             c = " ".join(str(b.get("text", "")) for b in c if isinstance(b, dict))
         c = str(c)
-        if any(h in c for h in AGENT_STRONG):
+        # v2.0.105：合并设置页自定义关键词（agent_keywords.json）
+        strong, verbs, topics = _effective_keywords()
+        if any(h in c for h in strong):
             return True
-        return any(v in c for v in AGENT_VERBS) and any(t in c for t in AGENT_TOPICS)
+        return any(v in c for v in verbs) and any(t in c for t in topics)
     except Exception:
         return False
+
+
+def _effective_keywords():
+    """内置 + 用户自定义（agent_keywords.json，设置页管理）"""
+    try:
+        with open(os.path.join(DATA_DIR, "agent_keywords.json"), encoding="utf-8") as f:
+            d = json.load(f)
+        return (AGENT_STRONG + tuple(d.get("strong", [])),
+                AGENT_VERBS + tuple(d.get("verbs", [])),
+                AGENT_TOPICS + tuple(d.get("topics", [])))
+    except Exception:
+        return AGENT_STRONG, AGENT_VERBS, AGENT_TOPICS
+
+
+def _is_auto_request(text):
+    """定时/自动化意图话术（"X分钟后执行Y"等）——Agent 关闭时用于拦截防幻觉"""
+    return any(k in text for k in ("分钟后", "定时", "自动化", "延时", "延迟", "秒后", "小时后再", "几小时后"))
 
 
 def _chat_once(body):
@@ -311,7 +330,25 @@ def _agent_loop(messages):
         import agent_rules
         hint = agent_rules.rules_hint()
         sys_content = ("你是家庭 NAS 管家 Agent。可以调用工具查询/控制 NAS、Docker、智能家居。"
-                       "工具结果如实转达用户；失败要说明原因和建议。回答简洁中文，用 emoji 点缀。")
+                       "工具结果如实转达用户；失败要说明原因和建议。回答简洁中文，用 emoji 点缀。"
+                       "重要：定时/自动化请求（如'X分钟后执行Y'、'定时关闭XX'）必须调用 automation_create 工具真正创建，"
+                       "禁止仅文字回复'已设置/已安排'；只有工具返回成功才可向用户确认已创建。")
+        # v2.0.105：本次请求含定时意图时再强化一次（防历史幻觉回复污染导致模型学样不调工具）
+        last_u = ""
+        for _m in reversed(messages):
+            if isinstance(_m, dict) and _m.get("role") == "user":
+                last_u = _m.get("content", "")
+                if isinstance(last_u, list):
+                    last_u = " ".join(str(b.get("text", "")) for b in last_u if isinstance(b, dict))
+                break
+        if last_u and _is_auto_request(str(last_u)):
+            sys_content += ("\n本次用户请求包含定时/自动化意图（如'X分钟后执行Y'）。"
+                            "即使对话历史中曾有类似回复，你也必须调用 automation_create 工具真实创建任务，"
+                            "严禁仅用文字回复'已设置/已安排'。")
+            # v2.0.105：user 级强制指令（比 system 权重高，防历史幻觉污染学样）
+            msgs.append({"role": "user",
+                         "content": "（系统指令：请立即调用 automation_create 工具创建上述定时任务，"
+                                    "确认工具执行成功后再回复用户，禁止仅文字回复“已设置/已安排”。）"})
         if hint:
             sys_content += "\n" + hint
         sys_p = {"role": "system", "content": sys_content}
@@ -357,9 +394,26 @@ def _worker(task_id, task):
         if new_rule:
             agent_rules.add_rule(new_rule)
         agent_on = st.get("agentEnabled", True)
+        # v2.0.105d：分流诊断日志（排查用户侧 agentEnabled 实际值）
+        try:
+            with open("/tmp/stream_agent_debug.log", "a", encoding="utf-8") as _df:
+                _df.write(f"[{time.strftime('%H:%M:%S')}] agent_on={agent_on} is_agent={_is_agent_request(st['messages'])} "
+                          f"rule={agent_rules.match(last_user or '')} model={st.get('model','?')} provider={st.get('provider','?')} "
+                          f"msgs={len(st['messages'])} text={str(last_user or '')[:60]}\n")
+        except Exception:
+            pass
         if agent_on and (_is_agent_request(st["messages"]) or agent_rules.match(last_user or "")):
             st["agent"] = True
             st["content"] = _agent_loop(st["messages"])
+            st["status"] = "done"
+            _write_state(task_id, task)
+            _maybe_push(st)
+            return
+        # v2.0.105：Agent 关闭时定时类话术明确提示（防普通 LLM 幻觉回复"已设置"实际未创建）
+        if not agent_on and _is_auto_request(last_user or ""):
+            st["agent"] = False
+            st["content"] = ("⏰ 定时自动化需要开启「Agent 智能回复」才能创建（设置 → 高级设置 → Agent 智能回复）。\n"
+                             "打开开关后，对我说「X分钟后执行Y」即可自动生成倒计时卡片。")
             st["status"] = "done"
             _write_state(task_id, task)
             _maybe_push(st)
