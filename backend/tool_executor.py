@@ -130,6 +130,32 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "automation_create",
+            "description": "创建定时自动化（延迟执行动作，到点自动执行后消失）。用户说'X分钟后执行Y'（如 5分钟后关闭排气扇、10分钟后关空调）→ 先查实体再调用本工具。delay_seconds 为延迟秒数（如 5分钟=300）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "自动化名称，如 5分钟后关闭排气扇"},
+                    "actions": {"type": "array",
+                                "description": "动作列表，每项 {entity: 实体ID, service: 服务如 fan.turn_off, data: 可选参数}",
+                                "items": {"type": "object"}},
+                    "delay_seconds": {"type": "integer", "description": "延迟执行秒数（1分钟=60，5分钟=300，1小时=3600）"},
+                },
+                "required": ["name", "actions", "delay_seconds"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "automation_list",
+            "description": "列出待执行的定时自动化（含剩余秒数）",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "hermes_execute",
             "description": "将超出本地工具能力的任务转交给 Hermes Agent 执行。Hermes 拥有完整工具链（联网搜索/网页、终端命令、文件读写、代码执行、浏览器等）。当用户任务需要这些能力（如查资料、写脚本、操作文件、执行命令）而本地工具无法完成时，调用此工具并把任务完整转述",
             "parameters": {
@@ -261,6 +287,17 @@ def execute(name, args):
             import scenes_api
             scenes = scenes_api.list_scenes()
             return "、".join(s.get("name", "") for s in scenes) if scenes else "（暂无场景）"
+        if name == "automation_create":
+            import automation_api
+            ok, msg = automation_api.create_automation(args.get("name", ""), args.get("actions") or [],
+                                                        int(args.get("delay_seconds") or 0))
+            return msg
+        if name == "automation_list":
+            import automation_api
+            items = automation_api.list_automations()
+            if not items:
+                return "当前没有待执行的定时自动化"
+            return "\n".join(f"⏱ {a['name']}（剩余 {a['remaining'] // 60} 分 {a['remaining'] % 60} 秒）" for a in items)
         if name == "hermes_execute":
             return _hermes_execute(args.get("task", ""))
         return f"未知工具 {name}"

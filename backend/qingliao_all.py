@@ -21,7 +21,7 @@ from http.server import ThreadingHTTPServer
 
 MODULES = ["auth_api",
     "secrets_api", "scenes_api", "asr_api", "agent_api",
-    "router_api", "cron_api", "ha_proxy", "logs_api", "files_api", "sessions_api", "stream_api", "docker_api", "kb_api", "hw_api", "memory_api", "weather_api"]
+    "router_api", "cron_api", "ha_proxy", "logs_api", "files_api", "sessions_api", "stream_api", "docker_api", "kb_api", "hw_api", "memory_api", "weather_api", "automation_api"]
 
 # (name, host, port, module, handler_attr)
 SERVICES = [
@@ -42,6 +42,7 @@ SERVICES = [
     ("scenes",   "0.0.0.0",   9142, "scenes_api",   "Handler"),
     ("asr",      "0.0.0.0",   9143, "asr_api",      "Handler"),
     ("agent",    "0.0.0.0",   9145, "agent_api",    "Handler"),
+    ("automation", "0.0.0.0", 9146, "automation_api", "Handler"),
 ]
 
 
