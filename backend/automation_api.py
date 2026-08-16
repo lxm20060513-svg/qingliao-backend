@@ -131,6 +131,14 @@ def _scheduler():
                                     f"{'执行成功' if ok else '执行失败'} | {'; '.join(results)}\n")
                     except Exception:
                         pass
+                    # v2.0.113：执行结果 → 微信推送队列（Hermes cron 每分钟投递）
+                    try:
+                        import push_api
+                        push_api.enqueue(f"⏱ 自动化「{a.get('name')}」已执行："
+                                         f"{'✅ 成功' if ok else '❌ 失败'}"
+                                         + (f"（{'; '.join(results[:2])}）" if results else ""))
+                    except Exception:
+                        pass
                 _save(remaining)
         except Exception:
             pass

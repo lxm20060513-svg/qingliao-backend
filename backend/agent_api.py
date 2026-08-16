@@ -108,6 +108,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/api/agent/keywords"):
             self._send(200, {"ok": True, **get_keywords()})
+        elif self.path.startswith("/api/agent/rules"):
+            # v2.0.113：Agent 记忆规则可视化（agent_rules.py，重写时被覆盖补回）
+            import agent_rules
+            self._send(200, {"ok": True, "rules": agent_rules.list_rules()})
         else:
             self._send(404, {"ok": False, "error": "not found"})
 
@@ -118,6 +122,15 @@ class Handler(BaseHTTPRequestHandler):
                 d = json.loads(self.rfile.read(n) or b"{}")
                 ok, msg = add_keyword(d.get("list", ""), d.get("word", ""))
                 self._send(200, {"ok": ok, "message": msg, **get_keywords()})
+            except Exception as e:
+                self._send(400, {"ok": False, "error": str(e)[:200]})
+        elif self.path.startswith("/api/agent/rules"):
+            import agent_rules
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                d = json.loads(self.rfile.read(n) or b"{}")
+                ok, msg = agent_rules.add_rule(d.get("pattern", ""))
+                self._send(200, {"ok": ok, "message": msg, "rules": agent_rules.list_rules()})
             except Exception as e:
                 self._send(400, {"ok": False, "error": str(e)[:200]})
         else:
@@ -131,6 +144,13 @@ class Handler(BaseHTTPRequestHandler):
             word = (q.get("word") or [""])[0]
             ok, msg = remove_keyword(list_name, word)
             self._send(200, {"ok": ok, "message": msg, **get_keywords()})
+        elif self.path.startswith("/api/agent/rules"):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            rid = (q.get("id") or [""])[0]
+            import agent_rules
+            ok, msg = agent_rules.delete_rule(rid)
+            self._send(200, {"ok": ok, "message": msg, "rules": agent_rules.list_rules()})
         else:
             self._send(404, {"ok": False, "error": "not found"})
 
