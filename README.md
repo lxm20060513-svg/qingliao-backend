@@ -18,6 +18,7 @@
 | 9137 | docker | Docker Compose 部署管理 |
 | 9138 | kb | 知识库（文档检索注入） |
 | 9139 | hw | NAS 硬件温度 |
+| 9149 | local | 本地模型管理（Ollama 状态/开关/模型/拉取/删除） |
 | 9140 | memory | AI 记忆 |
 | 9141 | weather | 天气（Open-Meteo，无 key） |
 | 9142 | scenes | 智能家居场景（AI 生成动作组，一键执行） |
@@ -100,6 +101,15 @@ python3 qingliao_all.py
 - 纯标准库（HTTP 服务/JSON/线程），无 Web 框架
 - 流式输出：后端持流（上游 SSE → 落盘 JSON），客户端按 `taskId` 轮询增量
 - 数据落盘：`$QL_DATA_DIR` 下的 JSON 文件（会话/流式任务/配置）
+
+## 🆕 2026-08-16 变更（本地模型 + 修复，接手必读）
+
+- **stream_api**：新增 `provider=local` 分支——直连 Ollama（`http://127.0.0.1:11434/v1/chat/completions`，不经 Hermes 9123，断网可用）；`/api/stream/sync-models` 的 provider key 从 `/data/hermes_config.yaml` 读取（含 deepseek/stepfun/xiaomi/opencode key；文件缺失时同步返回 `ok:false`——已生成）
+- **local_api.py**（新，9149）：`/api/local/status|toggle|models|update|delete`（docker exec ollama 封装）
+- **docker_api**：镜像 `in_use` 匹配修复（兼容 repo:tag / repo 无 tag / repo@digest / 镜像 ID；原 `endswith(":tag")` 把所有同 tag 镜像误标绿点）
+- **Ollama 容器**：`docker run -d --name ollama --restart=always -p 11434:11434 -v /volume1/docker/ollama:/root/.ollama ollama/ollama`；模型 qwen3:4b（N5105 约 1.5 tok/s）/ qwen2.5:1.5b；⚠️ 勿用 `docker system prune` 清 Exited 的 ollama 容器（会误删，需重建）
+- **Hermes 配置**（/opt/data/config.yaml）：providers.ollama 已配（手动可选）；fallback_providers 已按用户要求清空（不做云端→本地自动切换）
+- 部署方式：改文件 → 写入 `/volume1/docker/hermes/微信文件/轻聊web/backend/` → `systemctl restart qingliao` → `is-active` 确认
 
 ## 📄 License
 
