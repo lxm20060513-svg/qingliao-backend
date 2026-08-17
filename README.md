@@ -25,6 +25,7 @@
 | 9143 | asr | 语音转文字（faster-whisper 转写，供 App 上传录音） |
 | 9145 | agent | Agent 记忆规则管理（「以后XX都用agent」话术） |
 | 9146 | automation | 定时自动化（「X分钟后执行Y」延迟动作，到点自动执行后消失） |
+| 9147 | push | 微信推送队列（enqueue/pending/done + 推送开关，X-Push-Token 鉴权） |
 
 ## 🚀 快速开始
 
@@ -42,6 +43,10 @@ docker compose up -d
 > - `16668`（qingliao_http.conf）与 `443`（webui_443.conf）——按模块名加 `location /api/xxx { proxy_pass http://127.0.0.1:PORT; }`
 >
 > ⚠️ **场景动作 service 格式**：动作里存 `climate.turn_off`（点分隔），执行时后端自动拆为 HA 路径 `/api/services/climate/turn_off`（斜杠），勿直接拼接点号字符串（会 404）。
+
+## 📖 避坑指南
+
+完整踩坑实录（sudo/nginx/systemd/后端 patch/鉴权 token/PWA 缓存/ASR 自愈/docker 解析/看门狗）在 NAS 部署目录的 **`避坑指南.md`**，动手改任何模块前必读。
 
 ## ⚙️ 环境变量
 
