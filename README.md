@@ -44,9 +44,9 @@ docker compose up -d
 >
 > ⚠️ **场景动作 service 格式**：动作里存 `climate.turn_off`（点分隔），执行时后端自动拆为 HA 路径 `/api/services/climate/turn_off`（斜杠），勿直接拼接点号字符串（会 404）。
 
-## 📖 避坑指南
+## 📖 踩坑记录在哪
 
-完整踩坑实录（sudo/nginx/systemd/后端 patch/鉴权 token/PWA 缓存/ASR 自愈/docker 解析/看门狗）在 NAS 部署目录的 **`避坑指南.md`**，动手改任何模块前必读。
+完整踩坑实录（sudo/nginx/systemd/后端 patch/鉴权 token/PWA 缓存/ASR 自愈/docker 解析/看门狗）沉淀在 Hermes 技能 `qingliao-webui`（开发/调试/部署轻聊必读）与 NAS `轻聊app/避坑指南.md`（iOS 端）。
 
 ## ⚙️ 环境变量
 
