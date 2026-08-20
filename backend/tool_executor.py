@@ -4,6 +4,7 @@
 
 import json
 import os
+import re
 import subprocess
 import time
 import urllib.request
@@ -260,8 +261,15 @@ def execute(name, args):
             return _sh("docker ps -a --format '{{.Names}}|{{.Status}}' | head -15")
         if name == "docker_action":
             n, a = args.get("name", ""), args.get("action", "")
-            r = _sh(f"docker {a} {n} 2>&1", timeout=60)
-            return f"docker {a} {n}: {r or '成功'}"
+            # v2.0.116 review：命令注入修复——原 shell 拼接可注入（模型参数直接进 shell）；
+            # 改 list 参数 + 动作白名单 + 名称净化
+            if a not in ("start", "stop", "restart", "rm"):
+                return f"不支持的 docker 动作：{a}"
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", n or ""):
+                return f"非法的容器名：{n}"
+            r = subprocess.run(["docker", a, n], capture_output=True, text=True, timeout=60)
+            out = (r.stdout + r.stderr).strip()[:2000]
+            return f"docker {a} {n}: {out or '成功'}"
         if name == "ha_call":
             return _ha_call(args.get("entity", ""), args.get("service", ""), args.get("data") or {})
         if name == "ha_list_entities":

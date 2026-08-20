@@ -97,8 +97,10 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _auth(self):
-        pw = os.environ.get("QL_PASSWORD", "change-me")
-        return self.headers.get("X-Auth-Token") == pw
+        # v2.0.116 review：统一走 auth_api 校验（原 X-Auth-Token==pw 永远不匹配）
+        import auth_api
+        return auth_api.check_auth(self.headers, "X-Agent-Password",
+                                   os.environ.get("QL_PASSWORD", ""))
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -106,16 +108,28 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        # v2.0.116 review：显式鉴权（原接口无鉴权，内网任意访问）
+        if not self._auth():
+            self._send(401, {"ok": False, "error": "unauthorized"})
+            return
         if self.path.startswith("/api/agent/keywords"):
             self._send(200, {"ok": True, **get_keywords()})
         elif self.path.startswith("/api/agent/rules"):
             # v2.0.113：Agent 记忆规则可视化（agent_rules.py，重写时被覆盖补回）
             import agent_rules
             self._send(200, {"ok": True, "rules": agent_rules.list_rules()})
+        elif self.path.startswith("/api/agent/last_suggestion"):
+            # v2.0.116：最近主动建议（看板展示）
+            import suggest_engine
+            self._send(200, {"ok": True, "suggestion": suggest_engine.last_suggestion()})
         else:
             self._send(404, {"ok": False, "error": "not found"})
 
     def do_POST(self):
+        # v2.0.116 review：显式鉴权
+        if not self._auth():
+            self._send(401, {"ok": False, "error": "unauthorized"})
+            return
         if self.path.startswith("/api/agent/keywords"):
             try:
                 n = int(self.headers.get("Content-Length") or 0)
@@ -133,10 +147,31 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"ok": ok, "message": msg, "rules": agent_rules.list_rules()})
             except Exception as e:
                 self._send(400, {"ok": False, "error": str(e)[:200]})
+        elif self.path.startswith("/api/agent/suggest"):
+            # v2.0.116：看板智能建议（基于天气/NAS/设备状态生成简短建议）
+            import stream_api
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                d = json.loads(self.rfile.read(n) or b"{}")
+                context = (d.get("context") or "")[:400]
+                prompt = ("你是家庭智能管家。基于以下家庭状态给出 1-2 条简短实用的建议，"
+                          "中文，每条不超过 30 字，直接列点，不要客套。\n家庭状态：\n" + context)
+                body = {"model": stream_api.AGENT_MODEL,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "stream": False, "max_tokens": 300}
+                resp = stream_api._chat_once(body)
+                text = (resp.get("choices") or [{}])[0].get("message", {}).get("content", "")
+                self._send(200, {"ok": True, "text": text.strip()[:400]})
+            except Exception as e:
+                self._send(200, {"ok": False, "text": "", "error": str(e)[:150]})
         else:
             self._send(404, {"ok": False, "error": "not found"})
 
     def do_DELETE(self):
+        # v2.0.116 review：显式鉴权
+        if not self._auth():
+            self._send(401, {"ok": False, "error": "unauthorized"})
+            return
         if self.path.startswith("/api/agent/keywords"):
             from urllib.parse import urlparse, parse_qs
             q = parse_qs(urlparse(self.path).query)

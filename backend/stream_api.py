@@ -36,7 +36,10 @@ import uuid
 import socket
 from http.server import BaseHTTPRequestHandler
 
-STREAM_PASS = "123"
+# v2.0.116 review：流式密码默认置空（只走 X-Auth-Token 鉴权）；需要密码兜底时注入强 STREAM_PASS
+# （原硬编码 "123" 弱口令，生产未注入——已核实）
+STREAM_PASS = os.environ.get("STREAM_PASS", "")
+MAX_CONTENT_LEN = 200_000   # v2.0.116 review：回复内容上限（防无限输出）
 DATA_DIR = os.environ.get("STREAM_DATA_DIR", "/data/streams_data")
 STREAM_DIR = os.path.join(DATA_DIR, "streams")
 HERMES_URL = os.environ.get("STREAM_HERMES_URL", "http://127.0.0.1:9123/v1/chat/completions")
@@ -195,8 +198,13 @@ _tasks_lock = threading.Lock()
 
 
 def _auth(h):
+    # v2.0.116 review：X-Auth-Token 优先（App 登录 token，AUTO_LOGIN 关闭后仍可用）；
+    # X-Stream-Password 仅作兼容兜底（STREAM_PASS 注入强密码时）
     import auth_api
-    return auth_api.check_auth(h.headers, "X-Stream-Password", STREAM_PASS)
+    if auth_api.check_auth(h.headers, "X-Stream-Password", STREAM_PASS):
+        return True
+    pw = h.headers.get("X-Stream-Password", "")
+    return bool(pw) and hmac.compare_digest(pw, STREAM_PASS)
 
 
 def _write_state(task_id, task):
@@ -319,8 +327,9 @@ def _chat_once(body):
         return json.loads(r.read())
 
 
-def _agent_loop(messages):
-    """工具调用循环：模型返回 tool_calls → 执行 → 回填 → 再问（上限 8 轮）"""
+def _agent_loop(messages, task=None):
+    """工具调用循环：模型返回 tool_calls → 执行 → 回填 → 再问（上限 8 轮）
+    v2.0.116 review：支持中途取消（task.cancelled）——原循环不读取消标志，用户 stop 最长 20 分钟无效"""
     try:
         import tool_executor
     except Exception as e:
@@ -354,6 +363,9 @@ def _agent_loop(messages):
         sys_p = {"role": "system", "content": sys_content}
         msgs = [sys_p] + msgs
         for _ in range(8):
+            # v2.0.116 review：每轮检查取消标志（用户点停止立即中断）
+            if task is not None and task.get("cancelled"):
+                return "已取消"
             body = {"model": AGENT_MODEL, "messages": msgs,
                     "tools": tool_executor.TOOLS, "stream": False, "max_tokens": 1500}
             resp = _chat_once(body)
@@ -395,8 +407,12 @@ def _worker(task_id, task):
             agent_rules.add_rule(new_rule)
         agent_on = st.get("agentEnabled", True)
         # v2.0.105d：分流诊断日志（排查用户侧 agentEnabled 实际值）
+        # v2.0.116 review：日志限 500 行轮转（防 /tmp 占满）
         try:
-            with open("/tmp/stream_agent_debug.log", "a", encoding="utf-8") as _df:
+            _dbg = "/tmp/stream_agent_debug.log"
+            if os.path.exists(_dbg) and os.path.getsize(_dbg) > 200_000:
+                os.rename(_dbg, _dbg + ".old")
+            with open(_dbg, "a", encoding="utf-8") as _df:
                 _df.write(f"[{time.strftime('%H:%M:%S')}] agent_on={agent_on} is_agent={_is_agent_request(st['messages'])} "
                           f"rule={agent_rules.match(last_user or '')} model={st.get('model','?')} provider={st.get('provider','?')} "
                           f"msgs={len(st['messages'])} text={str(last_user or '')[:60]}\n")
@@ -404,7 +420,8 @@ def _worker(task_id, task):
             pass
         if agent_on and (_is_agent_request(st["messages"]) or agent_rules.match(last_user or "")):
             st["agent"] = True
-            st["content"] = _agent_loop(st["messages"])
+            # v2.0.116 review：传 task 使 Agent 循环支持中途取消
+            st["content"] = _agent_loop(st["messages"], task)
             st["status"] = "done"
             _write_state(task_id, task)
             _maybe_push(st)
@@ -425,6 +442,46 @@ def _worker(task_id, task):
         }
         if st.get("provider"):
             req_body["provider"] = st["provider"]   # V1.5.3：精确路由，避免回退默认模型
+        # v2.0.117：本地模型（provider=local）——直连 Ollama（11434 OpenAI 兼容端点），断网兜底不经 9123
+        if st.get("provider") == "local":
+            try:
+                local_model = st.get("model") or "qwen3:4b"
+                lbody = json.dumps({"model": local_model, "messages": req_body["messages"], "stream": True}).encode("utf-8")
+                lreq = urllib.request.Request("http://127.0.0.1:11434/v1/chat/completions",
+                                              data=lbody, headers={"Content-Type": "application/json"})
+                lresp = urllib.request.urlopen(lreq, timeout=900)
+                for raw in lresp:
+                    if task["cancelled"]:
+                        break
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line.startswith("data: "):
+                        continue
+                    payload = line[6:]
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        j = json.loads(payload)
+                        delta = j.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                        if delta:
+                            if len(st["content"]) < MAX_CONTENT_LEN:
+                                st["content"] += delta[:MAX_CONTENT_LEN - len(st["content"])]
+                            else:
+                                st["status"] = "done"
+                                break
+                            now = time.time()
+                            if now - last_write >= WRITE_INTERVAL:
+                                _write_state(task_id, task)
+                    except Exception:
+                        continue
+                st["status"] = "cancelled" if task["cancelled"] else "done"
+                _write_state(task_id, task)
+                _maybe_push(st)
+                return
+            except Exception as e:
+                st["content"] = f"⚠️ 本地模型不可用：{str(e)[:120]}（请确认「设置 → 本地模型」已开启）"
+                st["status"] = "done"
+                _write_state(task_id, task)
+                return
         body = json.dumps(req_body).encode("utf-8")
         req = urllib.request.Request(HERMES_URL, data=body, headers={
             "Authorization": "Bearer " + HERMES_KEY,
@@ -444,7 +501,12 @@ def _worker(task_id, task):
                 j = json.loads(payload)
                 delta = j.get("choices", [{}])[0].get("delta", {}).get("content", "")
                 if delta:
-                    st["content"] += delta
+                    # v2.0.116 review：内容上限 200k 字符（防无限输出撑爆内存/磁盘）
+                    if len(st["content"]) < MAX_CONTENT_LEN:
+                        st["content"] += delta[:MAX_CONTENT_LEN - len(st["content"])]
+                    else:
+                        st["status"] = "done"
+                        break
                     now = time.time()
                     if now - last_write >= WRITE_INTERVAL:
                         _write_state(task_id, task)

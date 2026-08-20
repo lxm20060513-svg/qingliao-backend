@@ -140,8 +140,12 @@ class HAProxyHandler(http.server.BaseHTTPRequestHandler):
             pass
 
     def do_OPTIONS(self):
+        # v2.0.116 review：补全 preflight 头（原缺失 Methods/Headers，浏览器跨域预检失败；
+        # 且此定义覆盖了 62 行的同名方法——保留完整版）
         self.send_response(204)
         self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Auth-Token, X-HA-Password')
         self.end_headers()
 
     def do_GET(self):

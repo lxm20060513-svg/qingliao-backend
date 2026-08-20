@@ -21,7 +21,7 @@ from http.server import ThreadingHTTPServer
 
 MODULES = ["auth_api",
     "secrets_api", "scenes_api", "asr_api", "agent_api",
-    "router_api", "cron_api", "ha_proxy", "logs_api", "files_api", "sessions_api", "stream_api", "docker_api", "kb_api", "hw_api", "memory_api", "weather_api", "automation_api", "push_api"]
+    "router_api", "cron_api", "ha_proxy", "logs_api", "files_api", "sessions_api", "stream_api", "docker_api", "kb_api", "hw_api", "memory_api", "weather_api", "automation_api", "push_api", "local_api"]
 
 # (name, host, port, module, handler_attr)
 SERVICES = [
@@ -43,27 +43,47 @@ SERVICES = [
     ("asr",      "0.0.0.0",   9143, "asr_api",      "Handler"),
     ("agent",    "0.0.0.0",   9145, "agent_api",    "Handler"),
     ("automation", "0.0.0.0", 9146, "automation_api", "Handler"),
-    ("push",     "0.0.0.0",   9147, "push_api",      "Handler"),
+    ("push", "0.0.0.0", 9147, "push_api", "Handler"),
+    ("local", "0.0.0.0", 9149, "local_api", "Handler"),   # v2.0.117：本地模型管理（Ollama 状态/开关/更新）,
 ]
 
 
 def main():
     # 逐个 import（各模块均有 __main__ 保护，import 无副作用）
+    # v2.0.116 review：import 容错——单模块失败（语法/依赖）不拖垮全部服务
     mods = {}
     for m in MODULES:
-        mods[m] = importlib.import_module(m)
-        print(f"[import] {m} ok", flush=True)
+        try:
+            mods[m] = importlib.import_module(m)
+            print(f"[import] {m} ok", flush=True)
+        except Exception as e:
+            print(f"[import] {m} FAILED: {e}", flush=True)
 
     servers = []
     threads = []
     for name, host, port, mod, attr in SERVICES:
-        handler_cls = getattr(mods[mod], attr)
-        srv = ThreadingHTTPServer((host, port), handler_cls)
-        t = threading.Thread(target=srv.serve_forever, daemon=True, name=f"ql-{name}")
-        t.start()
-        servers.append(srv)
-        threads.append(t)
-        print(f"[listen] {name} on {host}:{port}", flush=True)
+        try:
+            handler_cls = getattr(mods[mod], attr)
+            srv = ThreadingHTTPServer((host, port), handler_cls)
+            t = threading.Thread(target=srv.serve_forever, daemon=True, name=f"ql-{name}")
+            t.start()
+            servers.append(srv)
+            threads.append(t)
+            print(f"[listen] {name} on {host}:{port}", flush=True)
+        except Exception as e:
+            # v2.0.116 review：端口冲突/模块缺失 → 该服务跳过，其余照常
+            print(f"[listen] {name} on {host}:{port} FAILED: {e}（跳过）", flush=True)
+
+    # v2.0.116：主动建议引擎（天气突变/设备长开/低电量巡检，import 时启动）
+    try:
+        import suggest_engine
+        suggest_engine.start_engine()
+        print("[engine] suggest_engine started", flush=True)
+    except Exception as e:
+        print(f"[engine] suggest_engine failed: {e}", flush=True)
+
+    # v2.0.116 review：端口冲突/模块异常降级——失败的端口跳过不阻塞其余服务
+    # （原任一端口被占 → 整体崩溃，systemd 无限重启循环）
 
     print(f"[ready] all {len(servers)} services running", flush=True)
     try:

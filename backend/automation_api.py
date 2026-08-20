@@ -8,6 +8,7 @@ import json
 import os
 import threading
 import time
+import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler
@@ -16,6 +17,61 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("QL_DATA_DIR", os.path.join(os.path.dirname(BASE), "data"))
 AUTO_FILE = os.path.join(DATA_DIR, "automations.json")
 LOG_FILE = os.path.join(DATA_DIR, "automations.log")
+HISTORY_FILE = os.path.join(DATA_DIR, "execution_history.json")   # v2.0.116：执行历史（自动化+场景）
+MAX_HISTORY = 200
+
+
+def append_history(htype, name, ok, detail=""):
+    """记录执行历史（自动化 scheduler / 场景执行 共用）"""
+    try:
+        items = []
+        try:
+            with open(HISTORY_FILE, encoding="utf-8") as f:
+                items = json.load(f)
+        except Exception:
+            pass
+        items.append({"id": f"{time.strftime('%m%d%H%M%S')}-{len(items)}",
+                      "ts": time.strftime("%m-%d %H:%M:%S"),
+                      "type": htype, "name": name,
+                      "ok": bool(ok), "detail": (detail or "")[:120]})
+        items = items[-MAX_HISTORY:]
+        _write_history(items)
+    except Exception:
+        pass
+
+
+def _write_history(items):
+    tmp = HISTORY_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, HISTORY_FILE)
+
+
+def load_history():
+    """读取历史；老数据无 id 字段时按位置补 id（保证删除接口可作用于存量数据）"""
+    try:
+        with open(HISTORY_FILE, encoding="utf-8") as f:
+            items = json.load(f)
+    except Exception:
+        return []
+    for i, h in enumerate(items):
+        if not h.get("id"):
+            h["id"] = f"legacy-{i}-{h.get('ts', '')}"
+    return items
+
+
+def delete_history(ids):
+    """按 id 列表删除单条/多条，返回剩余列表"""
+    ids = set(ids)
+    items = [h for h in load_history() if h.get("id") not in ids]
+    _write_history(items)
+    return items
+
+
+def clear_history():
+    """清空全部历史"""
+    _write_history([])
+    return []
 
 HA_URL = os.environ.get("QL_HA_URL", "http://localhost:8123")
 HA_TOKEN = os.environ.get("QL_HA_TOKEN", "")
@@ -25,11 +81,13 @@ _scheduler_started = False
 
 
 def _load():
-    try:
-        with open(AUTO_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return []
+    # v2.0.116 review：读加锁（原读无锁，与调度线程写并发会读到半写状态）
+    with _lock:
+        try:
+            with open(AUTO_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
 
 
 def _save(items):
@@ -139,6 +197,11 @@ def _scheduler():
                                          + (f"（{'; '.join(results[:2])}）" if results else ""))
                     except Exception:
                         pass
+                    # v2.0.116：执行历史
+                    try:
+                        append_history("自动化", a.get("name"), ok, "; ".join(results[:2]))
+                    except Exception:
+                        pass
                 _save(remaining)
         except Exception:
             pass
@@ -172,9 +235,10 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _auth(self):
-        pw = os.environ.get("QL_PASSWORD", "change-me")
-        return (self.headers.get("X-Automations-Password") == pw
-                or self.headers.get("X-Auth-Token") == pw)
+        # v2.0.116 review：统一走 auth_api 校验（原 X-Auth-Token==pw 永远不匹配且未被调用）
+        import auth_api
+        return auth_api.check_auth(self.headers, "X-Automations-Password",
+                                   os.environ.get("QL_PASSWORD", ""))
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -182,12 +246,23 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        # v2.0.116 review：显式鉴权（原未调用）
+        if not self._auth():
+            self._send(401, {"ok": False, "error": "unauthorized"})
+            return
         if self.path.startswith("/api/automations/list"):
             self._send(200, {"ok": True, "automations": list_automations()})
+        elif self.path.startswith("/api/history"):
+            # v2.0.116：执行历史（自动化 + 场景）；v2.0.132：load_history 统一补 id
+            self._send(200, {"ok": True, "history": load_history()})
         else:
             self._send(404, {"ok": False, "error": "not found"})
 
     def do_POST(self):
+        # v2.0.116 review：显式鉴权
+        if not self._auth():
+            self._send(401, {"ok": False, "error": "unauthorized"})
+            return
         if self.path.startswith("/api/automations/create"):
             try:
                 n = int(self.headers.get("Content-Length") or 0)
@@ -201,10 +276,24 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"ok": False, "error": "not found"})
 
     def do_DELETE(self):
+        # v2.0.116 review：显式鉴权
+        if not self._auth():
+            self._send(401, {"ok": False, "error": "unauthorized"})
+            return
         if self.path.startswith("/api/automations/"):
             aid = self.path.rsplit("/", 1)[-1]
             ok = cancel_automation(aid)
             self._send(200, {"ok": ok, "automations": list_automations()})
+        elif self.path.startswith("/api/history"):
+            # v2.0.132：执行历史管理——DELETE /api/history 清空全部；
+            # DELETE /api/history?ids=a,b,c 删除指定多条（逗号分隔 id）
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            ids = q.get("ids", [""])[0]
+            if ids.strip():
+                items = delete_history([i for i in ids.split(",") if i])
+                self._send(200, {"ok": True, "history": items})
+            else:
+                self._send(200, {"ok": True, "history": clear_history()})
         else:
             self._send(404, {"ok": False, "error": "not found"})
 

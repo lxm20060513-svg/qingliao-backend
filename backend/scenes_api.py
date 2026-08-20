@@ -5,6 +5,7 @@
 - 执行：逐条调用 Home Assistant，汇总结果
 端口 9142。"""
 import json
+import hmac
 import os
 import urllib.request
 from http.server import BaseHTTPRequestHandler
@@ -107,9 +108,15 @@ class Handler(BaseHTTPRequestHandler):
             return {}
 
     def _auth(self):
-        # 密码鉴权（与其他模块一致）
+        # v2.0.116 review：修复任意非空 X-Auth-Token 即放行——token 必须真实有效
         pw = os.environ.get("QL_PASSWORD", "change-me")
-        return self.headers.get("X-Scenes-Password") == pw or self.headers.get("X-Auth-Token")
+        tok = self.headers.get("X-Auth-Token", "")
+        if tok:
+            import auth_api
+            if auth_api.check_auth(self.headers, "X-Scenes-Password", pw):
+                return True
+        return bool(self.headers.get("X-Scenes-Password")) and \
+            hmac.compare_digest(self.headers.get("X-Scenes-Password", ""), pw)
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -117,12 +124,20 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        # v2.0.116 review：显式鉴权（原未调用）
+        if not self._auth():
+            self._send(401, {"ok": False, "error": "unauthorized"})
+            return
         if self.path.startswith("/api/scenes/list"):
             self._send(200, {"ok": True, "scenes": list_scenes()})
             return
         self._send(404, {"ok": False, "error": "not found"})
 
     def do_POST(self):
+        # v2.0.116 review：显式鉴权（原未调用）
+        if not self._auth():
+            self._send(401, {"ok": False, "error": "unauthorized"})
+            return
         body = self._read_json()
         p = self.path
         if p.startswith("/api/scenes/save"):
@@ -133,6 +148,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": ok, "message": msg})
         elif p.startswith("/api/scenes/run"):
             ok, msg = run_scene(str(body.get("name") or ""))
+            # v2.0.116：场景执行历史（复用 automation_api.append_history）
+            try:
+                import automation_api
+                automation_api.append_history("场景", str(body.get("name") or ""), ok, msg[:120])
+            except Exception:
+                pass
             self._send(200, {"ok": ok, "message": msg})
         else:
             self._send(404, {"ok": False, "error": "not found"})

@@ -8,9 +8,13 @@
 import http.server
 import json
 import os
+import threading
 DATA_DIR = os.environ.get("QL_DATA_DIR", "/data")
 import time
 import hmac
+
+# v2.0.116 review：并发保存锁（多设备 merge 写覆盖丢数据）
+_save_lock = threading.Lock()
 
 # 访问密码（与 files_api.py 保持一致）
 SESSIONS_PASSWORD = os.environ.get("QL_PASSWORD", "change-me")
@@ -49,12 +53,14 @@ def load_sessions():
 
 def save_sessions(sessions):
     """原子写入：先写 tmp 再 rename，防止写一半损坏"""
-    os.makedirs(_data_dir(), exist_ok=True)
-    with open(_tmp_file(), 'w', encoding='utf-8') as f:
-        json.dump(sessions, f, ensure_ascii=False)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(_tmp_file(), _data_file())
+    # v2.0.116 review：加锁防并发合并写覆盖（多设备同时 merge 丢数据）
+    with _save_lock:
+        os.makedirs(_data_dir(), exist_ok=True)
+        with open(_tmp_file(), 'w', encoding='utf-8') as f:
+            json.dump(sessions, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(_tmp_file(), _data_file())
 
 
 def merge_sessions(local, incoming, deleted):

@@ -27,7 +27,19 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(DATA_DIR, "auth_config.json")
 TOKENS_PATH = os.path.join(BASE_DIR, "auth_tokens.json")
 DEFAULT_USER = "qingliao"
-DEFAULT_PASS = "123"
+# v2.0.116 review：默认密码优先 QL_PASSWORD 环境变量；未注入则随机生成并写文件告知
+# （原硬编码 "123" 弱口令，文档声称 QL_PASSWORD 实际代码 123——已核实）
+DEFAULT_PASS = os.environ.get("QL_PASSWORD", "")
+if not DEFAULT_PASS:
+    DEFAULT_PASS = secrets.token_urlsafe(12)
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        _pw_file = os.path.join(DATA_DIR, "initial_password.txt")
+        with open(_pw_file, "w", encoding="utf-8") as f:
+            f.write("initial login: %s / %s\n" % (DEFAULT_USER, DEFAULT_PASS))
+        os.chmod(_pw_file, 0o600)
+    except Exception:
+        pass
 TOKEN_TTL_REMEMBER = 7 * 24 * 3600   # 记住登录
 TOKEN_TTL_SESSION = 24 * 3600        # 不记住
 
@@ -56,6 +68,12 @@ def _save_json(path, obj):
 
 
 def _hash_pw(pw, salt):
+    # v2.0.116 review：pbkdf2 迭代哈希（原 sha256 单次无迭代，弱口令可离线秒破）
+    return hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt.encode("utf-8"), 200_000).hex()
+
+
+def _hash_pw_legacy(pw, salt):
+    # 旧 sha256 哈希（兼容已存配置，登录成功后自动迁移）
     return hashlib.sha256((salt + ":" + pw).encode("utf-8")).hexdigest()
 
 
@@ -72,13 +90,16 @@ def _init_config():
 
 def _load_tokens():
     global _tokens
+    # v2.0.116：磁盘存 sha256(token) 哈希表——重启后恢复，token 跨重启有效（校验时哈希比对）
     now = time.time()
     raw = _load_json(TOKENS_PATH, {})
-    _tokens = {t: exp for t, exp in raw.items() if exp > now}
+    _tokens = {h: exp for h, exp in raw.items() if exp > now}
 
 
 def _persist_tokens():
-    _save_json(TOKENS_PATH, _tokens)
+    # v2.0.116：落盘只存 sha256(token) 哈希（防文件泄露直接冒用）
+    hashed = {h: exp for h, exp in _tokens.items()}
+    _save_json(TOKENS_PATH, hashed)
 
 
 # V1.8.4.1 review：密码头兜底默认关闭（前端已不再硬编码密码，防外网裸奔绕过登录）。
@@ -86,7 +107,9 @@ def _persist_tokens():
 ALLOW_PW_FALLBACK = os.environ.get("QINGLIAO_ALLOW_PW_FALLBACK", "").lower() in ("1", "true", "yes")
 
 
-AUTO_LOGIN = True  # 免登录模式（iOS 27 蜂窝上行挂起临时方案：App 请求免 token）
+# v2.0.116 review：免登录模式改为环境变量控制，默认关闭
+# （原硬编码 True 致全后端 check_auth 恒通过、鉴权体系失效；iOS 27 蜂窝如需可临时 QL_AUTO_LOGIN=1）
+AUTO_LOGIN = os.environ.get("QL_AUTO_LOGIN", "0").lower() in ("1", "true", "yes")
 
 
 def check_auth(headers, pass_header, service_pass):
@@ -95,8 +118,9 @@ def check_auth(headers, pass_header, service_pass):
         return True
     tok = headers.get("X-Auth-Token", "")
     if tok:
+        h = hashlib.sha256(tok.encode("utf-8")).hexdigest()
         with _lock:
-            exp = _tokens.get(tok)
+            exp = _tokens.get(h)
             if exp and exp > time.time():
                 return True
     if ALLOW_PW_FALLBACK:
@@ -108,11 +132,13 @@ def check_auth(headers, pass_header, service_pass):
 def issue_token(remember):
     tok = secrets.token_hex(24)
     ttl = TOKEN_TTL_REMEMBER if remember else TOKEN_TTL_SESSION
+    # v2.0.116：内存/落盘统一用 sha256(token) 作键——重启后从哈希表恢复，token 跨重启有效
+    h = hashlib.sha256(tok.encode("utf-8")).hexdigest()
     with _lock:
         _prune_expired()  # V1.8.4.1 review：顺带裁剪过期项，防 token 表无限增长
-        _tokens[tok] = time.time() + ttl
+        _tokens[h] = time.time() + ttl
         _persist_tokens()
-        return tok, _tokens[tok]
+        return tok, _tokens[h]
 
 
 def _prune_expired():
@@ -125,16 +151,28 @@ def _prune_expired():
 
 
 def revoke_token(tok):
+    h = hashlib.sha256(tok.encode("utf-8")).hexdigest()
     with _lock:
-        if tok in _tokens:
-            del _tokens[tok]
+        if h in _tokens:
+            del _tokens[h]
             _persist_tokens()
 
 
 def verify_password(user, pw):
     if not _config or user != _config.get("username"):
         return False
-    return hmac.compare_digest(_hash_pw(pw, _config["salt"]), _config["password_hash"])
+    target = _config["password_hash"]
+    if hmac.compare_digest(_hash_pw(pw, _config["salt"]), target):
+        return True
+    # v2.0.116 review：兼容旧 sha256 哈希，校验通过后自动迁移到 pbkdf2
+    if hmac.compare_digest(_hash_pw_legacy(pw, _config["salt"]), target):
+        with _lock:
+            new_salt = secrets.token_hex(8)
+            _config["salt"] = new_salt
+            _config["password_hash"] = _hash_pw(pw, new_salt)
+            _save_json(CONFIG_PATH, _config)
+        return True
+    return False
 
 
 def change_password(user, old, new):
@@ -183,8 +221,9 @@ class AuthHandler(BaseHTTPRequestHandler):
 
     def _require_token(self):
         tok = self.headers.get("X-Auth-Token", "")
+        h = hashlib.sha256(tok.encode("utf-8")).hexdigest() if tok else ""
         with _lock:
-            exp = _tokens.get(tok)
+            exp = _tokens.get(h)
         return (tok, exp) if exp and exp > time.time() else (None, None)
 
     def do_POST(self):
@@ -247,6 +286,18 @@ class AuthHandler(BaseHTTPRequestHandler):
             if not path.startswith("/api/"):
                 self._relay_reply(400, "bad path")
                 return
+            # v2.0.116 review：relay 转发前校验请求头 token（防开放代理被内网任意设备滥用）
+            hdr = {str(k).lower(): str(v) for k, v in headers.items()}
+            tok = hdr.get("x-auth-token", "")
+            pw = hdr.get("x-stream-password", "") or hdr.get("x-scenes-password", "")
+            ok = False
+            if tok:
+                ok = check_auth(hdr, "x-stream-password", os.environ.get("QL_PASSWORD", ""))
+            if not ok and pw:
+                ok = bool(pw) and hmac.compare_digest(pw, os.environ.get("QL_PASSWORD", ""))
+            if not ok and not AUTO_LOGIN:
+                self._relay_reply(401, "unauthorized")
+                return
             url = "http://127.0.0.1:16668" + path
             req = urllib.request.Request(url, data=body, method=method)
             for k, v in headers.items():
@@ -277,6 +328,10 @@ class AuthHandler(BaseHTTPRequestHandler):
             self._relay()
             return
         if self.path.startswith("/api/auth/auto_login"):
+            # v2.0.116 review：仅 QL_AUTO_LOGIN=1（免登录模式）时可用，否则拒绝签发
+            if not AUTO_LOGIN:
+                self._send(403, {"ok": False, "error": "auto_login disabled"})
+                return
             tok, exp = issue_token(True)
             self._send(200, {"ok": True, "token": tok, "expiresAt": exp, "username": _config.get("username"), "auto": True})
             return

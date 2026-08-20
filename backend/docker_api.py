@@ -291,8 +291,14 @@ def _images():
             if not iid or iid in seen:
                 continue
             seen.add(iid)
-            in_use = any(iid in ref or (ref.count(":") == 1 and ref.endswith(":" + tag))
-                         for ref in running_refs)
+            # v2.0.120 fix：in_use 匹配（ref 可能：repo:tag / repo 无tag / repo@digest / 镜像ID）
+            def _ref_matches(ref, name, iid):
+                if ref == name or ref == iid or (len(ref) >= 12 and ref.startswith(iid)):
+                    return True
+                repo = name.split(":")[0] if ":" in name else name
+                base = ref.split("@")[0]
+                return base == repo
+            in_use = any(_ref_matches(ref, name, iid) for ref in running_refs)
             out.append({"name": name, "id": iid,
                         "size": d.get("Size", "") or "", "in_use": in_use})
         return out

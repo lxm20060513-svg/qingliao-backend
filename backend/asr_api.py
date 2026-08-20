@@ -2,8 +2,10 @@
 """ASR 代理 API（v2.0.96c）：POST /api/asr/transcribe（raw 音频 body）→ Hermes 容器 faster-whisper 转写。
 容器挂载 /volume1/docker/hermes → /opt/hermes_host，音频经共享目录传递，一次 docker exec。端口 9143。"""
 import json
+import hmac
 import os
 import subprocess
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler
 
@@ -16,12 +18,29 @@ ASR_URL = "http://127.0.0.1:9144/transcribe"
 
 
 def _ensure_server():
-    """自愈：容器内 9144 未监听则拉起 asr_server"""
+    """自愈：容器内 9144 未监听则拉起 asr_server，并等待就绪
+    v2.0.117：① pgrep 正则技巧防自匹配 ② nohup 分开执行（原 `pgrep || (nohup &)` 括号子 shell
+    被 docker exec 退出清理——进程起不来）③ 轮询 9144 就绪（原固定 sleep 10——模型加载 30-60s 超时报无响应）"""
     try:
+        # ① 已在跑？
         r = subprocess.run(["docker", "exec", CONTAINER, "sh", "-c",
-                            "pgrep -f asr_server >/dev/null || (nohup /opt/data/whisper_venv/bin/python /opt/data/asr_server.py >/tmp/asr_server.log 2>&1 & sleep 10)"],
-                           capture_output=True, text=True, timeout=40)
-        return True
+                            "pgrep -f '[a]sr_server' >/dev/null && echo UP || echo DOWN"],
+                           capture_output=True, text=True, timeout=20)
+        if "UP" in r.stdout:
+            return True
+        # ② 不在跑：直接 nohup（无括号子 shell）
+        subprocess.run(["docker", "exec", CONTAINER, "sh", "-c",
+                        "nohup /opt/data/whisper_venv/bin/python /opt/data/asr_server.py >/tmp/asr_server.log 2>&1 &"],
+                       capture_output=True, text=True, timeout=30)
+        # ③ 轮询 9144 就绪（最多 60 秒，每 3 秒探测；非 000/空响应即就绪）
+        for _ in range(20):
+            r = subprocess.run(["docker", "exec", CONTAINER, "sh", "-c",
+                                "curl -s -m 2 -o /dev/null -w '%{http_code}' http://127.0.0.1:9144/ 2>/dev/null"],
+                               capture_output=True, text=True, timeout=10)
+            if r.stdout.strip() not in ("000", ""):
+                return True
+            time.sleep(3)
+        return False
     except Exception:
         return False
 
@@ -70,8 +89,15 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _auth(self):
+        # v2.0.116 review：修复任意非空 X-Auth-Token 即放行的漏洞——token 必须真实有效
         pw = os.environ.get("QL_PASSWORD", "change-me")
-        return self.headers.get("X-ASR-Password") == pw or self.headers.get("X-Auth-Token")
+        tok = self.headers.get("X-Auth-Token", "")
+        if tok:
+            import auth_api
+            if auth_api.check_auth(self.headers, "X-ASR-Password", pw):
+                return True
+        return bool(self.headers.get("X-ASR-Password")) and \
+            hmac.compare_digest(self.headers.get("X-ASR-Password", ""), pw)
 
     def do_OPTIONS(self):
         self.send_response(204)
