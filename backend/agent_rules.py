@@ -11,7 +11,7 @@ import re
 import time
 import uuid
 
-DATA_DIR = os.environ.get("QL_DATA_DIR", "/volume1/docker/hermes/微信文件/轻聊web/data")
+DATA_DIR = os.environ.get("QL_DATA_DIR", os.environ.get("QL_DATA_DIR", "/data"))
 RULES_PATH = os.path.join(DATA_DIR, "agent_rules.json")
 MAX_RULES = 20
 
@@ -37,10 +37,20 @@ def _load():
 def _save(rules):
     try:
         os.makedirs(os.path.dirname(RULES_PATH), exist_ok=True)
-        with open(RULES_PATH, "w", encoding="utf-8") as f:
+        # v3.0.28 review：原子写（tmp+fsync+os.replace），防并发写坏
+        import tempfile
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(RULES_PATH), suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump({"rules": rules[-MAX_RULES:]}, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, RULES_PATH)
     except Exception:
-        pass
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except Exception:
+            pass
 
 
 def list_rules():

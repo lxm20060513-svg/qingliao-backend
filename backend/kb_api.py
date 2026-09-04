@@ -14,12 +14,11 @@
 """
 import json
 import os
-DATA_DIR = os.environ.get("QL_DATA_DIR", "/data")
 import re
 from http.server import BaseHTTPRequestHandler
 
 KB_DIR = os.environ.get("QL_KB_DIR",
-                        os.path.join(DATA_DIR, "kb"))
+                        os.environ.get("QL_KB_DIR", "/data/kb"))
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
 MAX_DOC = 50

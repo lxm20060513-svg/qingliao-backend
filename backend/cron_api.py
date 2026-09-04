@@ -4,8 +4,10 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 
 HERMES_API = 'http://127.0.0.1:9123'
-HERMES_KEY = os.environ.get("QL_HERMES_KEY", "")
-CRON_PASSWORD = os.environ.get("QL_PASSWORD", "change-me")
+# v3.0.6 security review：Hermes Bearer key / cron 口令改用已有环境变量注入（源码不落硬编码密钥）
+import os as _os
+HERMES_KEY = _os.environ.get("STREAM_HERMES_KEY") or _os.environ.get("QL_AGENT_KEY") or ""
+CRON_PASSWORD = _os.environ.get("QL_PASSWORD", "")
 
 class Handler(BaseHTTPRequestHandler):
     def _check_auth(self):

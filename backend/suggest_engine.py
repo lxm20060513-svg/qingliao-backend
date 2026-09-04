@@ -20,7 +20,7 @@ STATE_FILE = os.path.join(DATA_DIR, "active_suggestions.json")
 
 HA_URL = os.environ.get("QL_HA_URL", "http://localhost:8123")
 HA_TOKEN = os.environ.get("QL_HA_TOKEN", "")
-WEATHER_URL = os.environ.get("QL_WEATHER_URL", "http://127.0.0.1:9141")
+WEATHER_URL = os.environ.get("QL_WEATHER_URL", "http://127.0.0.1:9127")
 
 CHECK_INTERVAL = 1800   # 30 分钟
 LONG_RUN_HOURS = 6      # 长开阈值
@@ -92,8 +92,14 @@ def _check_weather():
     _save_state(s)
     if not prev:
         return   # 首次无基线
-    # 转雨
-    if prev.get("code") != code and str(code) in ("3", "5", "60", "61", "63", "65", "80", "81", "82"):
+    # 转雨（v3.0.6 review fix：原集合含非法 3/5、漏毛毛雨/冻雨/阵雪；补全 WMO 降雨码 51-67/80-82/85-86）
+    RAIN_CODES = {51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82, 85, 86}
+    try:
+        stable_code = int(code)
+        is_rain = stable_code in RAIN_CODES
+    except (ValueError, TypeError):
+        is_rain = False
+    if prev.get("code") != code and is_rain:
         key = f"rain_{today}"
         if not s.get("pushed", {}).get(key):
             _push(f"🌧 天气提醒：当前天气转为降雨，记得收衣服、出门带伞（{temp}°C）")
@@ -181,8 +187,8 @@ def _loop():
     while True:
         try:
             check_once()
-        except Exception:
-            pass
+        except Exception as e:
+            print("[suggest_engine] 巡检异常: %s" % str(e)[:120], flush=True)
         time.sleep(CHECK_INTERVAL)
 
 

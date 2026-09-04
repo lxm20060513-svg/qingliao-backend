@@ -186,6 +186,107 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "搜索互联网获取最新信息。当用户询问新闻、实时信息、技术文档、教程、或任何需要联网查询的问题时使用此工具",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "搜索关键词"}},
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "读取文件内容。支持文本文件（代码、配置、日志等）。二进制文件会返回十六进制摘要",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "文件绝对路径"},
+                    "offset": {"type": "integer", "description": "起始行号（从1开始，默认1）"},
+                    "limit": {"type": "integer", "description": "最大读取行数（默认200）"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "写入文件内容（覆盖整个文件）。创建不存在的目录",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "文件绝对路径"},
+                    "content": {"type": "string", "description": "要写入的内容"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "列出目录内容（文件和子目录）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "目录绝对路径（默认当前目录）"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_files",
+            "description": "按文件名或内容搜索文件。返回匹配的文件路径列表",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "搜索关键词（文件名或内容）"},
+                    "path": {"type": "string", "description": "搜索目录（默认 /volume1）"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_code",
+            "description": "执行 Python 或 Shell 代码并返回输出。用于数据分析、文件处理、计算、系统检查等任务",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "要执行的代码（Python 或 Shell）"},
+                    "language": {"type": "string", "description": "语言：python 或 shell（默认 python）"},
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_task",
+            "description": "将复杂任务委派给子 Agent 执行。子 Agent 拥有独立上下文和完整工具链，适合需要多步骤推理或长时间运行的任务",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "完整任务描述，包含所有必要上下文"},
+                },
+                "required": ["task"],
+            },
+        },
+    },
 ]
 
 # ---- 工具执行 ----
@@ -195,6 +296,8 @@ HA_TOKEN = os.environ.get("QL_HA_TOKEN", "")
 
 
 def _sh(cmd, timeout=15):
+    """WARNING: shell=True — cmd 必须经过白名单/正则净化，禁止直接拼接用户输入。
+    docker_action() 已做容器名正则净化；新增工具调用 _sh 前务必验证参数来源。"""
     try:
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
         return (r.stdout + r.stderr).strip()[:2000]
@@ -212,7 +315,7 @@ def _fmt_kb(kb):
 
 
 def _disk_usage():
-    """宿主存储卷磁盘状态：/volume1/2/3 容量/已用/可用/使用率 + 各卷顶层主要占用。
+    """宿主存储卷磁盘状态：各存储卷容量/已用/可用/使用率 + 顶层主要占用。
     qingliao 跑在宿主 systemd，df/du 天然是宿主视角（区别于容器内 df 只见自身挂载）。
     注意：勿用 df -hT | head -8——系统分区会占满前 8 行，/volume3 被截断（历史 bug）。"""
     out = []
@@ -237,8 +340,9 @@ def _disk_usage():
     return "\n".join(out) if out else "磁盘查询失败"
 
 
-def execute(name, args):
-    """执行工具，返回字符串结果（供模型读取）"""
+def execute(name, args, agent_model=None, agent_provider=None):
+    """执行工具，返回字符串结果（供模型读取）
+    v3.0.30 fix：agent_model/agent_provider——Agent 分流选定的模型透传给 hermes_execute（转交 9123 同模型）"""
     try:
         if name == "get_time":
             return time.strftime("%Y-%m-%d %H:%M:%S %A")
@@ -251,7 +355,7 @@ def execute(name, args):
             return f"qingliao={q}, hermes={'ok' if h=='200' else '异常('+h+')'}, HA={'ok' if ha=='401' else '异常('+ha+')'}"
         if name == "get_temperature":
             try:
-                d = json.loads(_sh("curl -s -m 5 http://localhost:9139/api/hw/status") or "{}")
+                d = json.loads(_sh("curl -s -m 5 http://localhost:9127/api/hw/status") or "{}")
                 return f"CPU {d.get('cpu_temp')}°C, SSD {d.get('ssd_temp')}°C"
             except Exception:
                 return "温度查询失败"
@@ -277,7 +381,7 @@ def execute(name, args):
         if name == "get_weather":
             city = args.get("city", "上海")
             import urllib.parse
-            r = _sh(f"curl -s -m 8 'http://localhost:9141/api/weather?city={urllib.parse.quote(city)}'")
+            r = _sh(f"curl -s -m 8 'http://localhost:9127/api/weather?city={urllib.parse.quote(city)}'")
             try:
                 d = json.loads(r)
                 return f"{city}：{d.get('temp')}°C，天气码 {d.get('code')}" if d.get("ok") else f"查询失败：{d.get('error')}"
@@ -307,24 +411,212 @@ def execute(name, args):
                 return "当前没有待执行的定时自动化"
             return "\n".join(f"⏱ {a['name']}（剩余 {a['remaining'] // 60} 分 {a['remaining'] % 60} 秒）" for a in items)
         if name == "hermes_execute":
-            return _hermes_execute(args.get("task", ""))
+            return _hermes_execute(args.get("task", ""), agent_model, agent_provider)
+        if name == "web_search":
+            return _web_search(args.get("query", ""))
+        if name == "read_file":
+            return _read_file(args.get("path", ""), args.get("offset", 1), args.get("limit", 200))
+        if name == "write_file":
+            return _write_file(args.get("path", ""), args.get("content", ""))
+        if name == "list_files":
+            return _list_files(args.get("path", "."))
+        if name == "search_files":
+            return _search_files(args.get("pattern", ""), args.get("path", "/volume1"))
+        if name == "execute_code":
+            return _execute_code(args.get("code", ""), args.get("language", "python"))
+        if name == "delegate_task":
+            return _delegate_task(args.get("task", ""), agent_model, agent_provider)
         return f"未知工具 {name}"
     except Exception as e:
         return f"工具执行异常: {e}"
 
 
-def _hermes_execute(task):
-    """转交 Hermes 执行（9123 完整工具链：联网/终端/文件/代码）"""
+def _web_search(query):
+    """DuckDuckGo 网页搜索（免费无需 API key）"""
+    if not query:
+        return "搜索词为空"
+    try:
+        import urllib.parse, re
+        q = urllib.parse.quote(query)
+        req = urllib.request.Request(
+            f"https://html.duckduckgo.com/html/?q={q}",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+        # 提取搜索结果标题和摘要
+        results = []
+        blocks = re.findall(r'class="result__a"[^>]*href="([^"]*)"[^>]*>([^<]+)</a>.*?class="result__snippet"[^>]*>(.*?)</(?:a|span|div)', html, re.DOTALL)
+        for url, title, snippet in blocks[:5]:
+            snippet = re.sub(r'<[^>]+>', '', snippet).strip()
+            results.append(f"**{title.strip()}**\n{snippet}\n{url}")
+        if not results:
+            # fallback：简单提取
+            titles = re.findall(r'class="result__a"[^>]*>([^<]+)', html)
+            results = [f"- {t.strip()}" for t in titles[:5]]
+        return "\n\n".join(results) if results else "未找到搜索结果"
+    except Exception as e:
+        return f"搜索失败：{str(e)[:150]}"
+
+
+def _read_file(path, offset=1, limit=200):
+    """读取文件内容"""
+    if not path:
+        return "路径为空"
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
+        total = len(lines)
+        start = max(0, offset - 1)
+        end = min(total, start + limit)
+        selected = lines[start:end]
+        result = f"文件：{path}（共{total}行，显示{start+1}-{end}行）\n"
+        result += "=" * 40 + "\n"
+        for i, line in enumerate(selected, start=start + 1):
+            result += f"{i:4d}| {line}"
+        if end < total:
+            result += f"\n... 还有 {total - end} 行未显示"
+        return result
+    except Exception as e:
+        return f"读取失败：{str(e)[:150]}"
+
+
+def _write_file(path, content):
+    """写入文件"""
+    if not path:
+        return "路径为空"
+    try:
+        import os
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return f"已写入 {path}（{len(content)} 字符）"
+    except Exception as e:
+        return f"写入失败：{str(e)[:150]}"
+
+
+def _list_files(path='.'):
+    """列出目录内容"""
+    if not path:
+        path = '.'
+    try:
+        import os
+        entries = []
+        for name in sorted(os.listdir(path)):
+            full = os.path.join(path, name)
+            if os.path.isdir(full):
+                entries.append(f"📁 {name}/")
+            else:
+                size = os.path.getsize(full)
+                entries.append(f"📄 {name} ({_fmt_kb(size / 1024)})")
+        if not entries:
+            return f"{path} 为空目录"
+        return f"目录：{path}（{len(entries)} 项）\n" + "\n".join(entries[:50])
+    except Exception as e:
+        return f"列目录失败：{str(e)[:150]}"
+
+
+def _search_files(pattern, path='/volume1'):
+    """按文件名搜索"""
+    if not pattern:
+        return "搜索词为空"
+    try:
+        import os
+        results = []
+        for root, dirs, files in os.walk(path):
+            # 跳过隐藏目录和系统目录
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('proc', 'sys')]
+            for name in files + dirs:
+                if pattern.lower() in name.lower():
+                    full = os.path.join(root, name)
+                    results.append(full)
+                    if len(results) >= 20:
+                        break
+            if len(results) >= 20:
+                break
+        if not results:
+            return f"未找到匹配 '{pattern}' 的文件"
+        return f"找到 {len(results)} 个匹配：\n" + "\n".join(results)
+    except Exception as e:
+        return f"搜索失败：{str(e)[:150]}"
+
+
+def _execute_code(code, language='python'):
+    """执行 Python 或 Shell 代码"""
+    if not code:
+        return "代码为空"
+    try:
+        import subprocess
+        if language == 'shell':
+            result = subprocess.run(
+                code, shell=True, capture_output=True, text=True, timeout=30
+            )
+        else:
+            result = subprocess.run(
+                ['python3', '-c', code], capture_output=True, text=True, timeout=30
+            )
+        output = result.stdout
+        if result.stderr:
+            output += f"\n[stderr]\n{result.stderr}"
+        if result.returncode != 0:
+            output += f"\n[exit code: {result.returncode}]"
+        return output.strip()[:3000] if output.strip() else "（无输出）"
+    except subprocess.TimeoutExpired:
+        return "执行超时（30秒限制）"
+    except Exception as e:
+        return f"执行失败：{str(e)[:150]}"
+
+
+def _delegate_task(task, agent_model=None, agent_provider=None):
+    """委派任务给子 Agent（通过 Hermes gateway）"""
+    if not task:
+        return "任务为空"
+    try:
+        import stream_api
+        body = {
+            "model": agent_model or "deepseek-v4-flash",
+            "messages": [
+                {"role": "system", "content": "你是轻聊子 Agent。用户把任务转交给你执行。直接完成任务，用中文简洁回复结果。"},
+                {"role": "user", "content": task}
+            ],
+            "stream": False,
+            "max_tokens": 3000
+        }
+        if agent_provider and agent_provider not in ("", "local"):
+            body["provider"] = agent_provider
+        req = urllib.request.Request(
+            stream_api.HERMES_URL,
+            data=json.dumps(body).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + stream_api.HERMES_KEY
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=300) as r:
+            d = json.loads(r.read())
+        content = d.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return content or "（子 Agent 无返回内容）"
+    except Exception as e:
+        return f"委派失败：{str(e)[:150]}"
+
+
+def _hermes_execute(task, agent_model=None, agent_provider=None):
+    """转交 Hermes 执行（9123 完整工具链：联网/终端/文件/代码）
+    v3.0.30 fix：使用 Agent 分流选定的模型/provider（原硬编码 deepseek-v4-flash 且不带 provider，
+    导致转交 9123 时无论设置选什么模型都走 Hermes 默认模型）"""
     if not task:
         return "任务为空"
     try:
         # 复用 stream_api 的 Hermes 配置（运行时 import 避免循环依赖）
         import stream_api
-        body = {"model": "deepseek-v4-flash",
+        body = {"model": agent_model or "deepseek-v4-flash",
                 "messages": [{"role": "system",
                               "content": "你是家庭 NAS 管家 Hermes。用户把任务转交给你执行，你有完整工具链（联网搜索/终端/文件/代码执行）。直接完成任务，用中文简洁回复结果。"},
                              {"role": "user", "content": task}],
                 "stream": False, "max_tokens": 2500}
+        if agent_provider and agent_provider not in ("", "local"):
+            body["provider"] = agent_provider   # V1.5.3：精确路由，避免回退 Hermes 默认模型
         req = urllib.request.Request(stream_api.HERMES_URL, data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json",
                                               "Authorization": "Bearer " + stream_api.HERMES_KEY},

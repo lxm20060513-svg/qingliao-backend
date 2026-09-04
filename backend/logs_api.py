@@ -8,11 +8,10 @@ import subprocess
 import urllib.parse
 import time
 import os
-DATA_DIR = os.environ.get("QL_DATA_DIR", "/data")
 import hmac
 
-CONTAINER = os.environ.get("QL_LOG_CONTAINER", "hermes")
-LOGS_PASSWORD = os.environ.get("QL_PASSWORD", "change-me")
+CONTAINER = os.environ.get("QL_HERMES_CONTAINER", "hermes-container")
+LOGS_PASSWORD = os.environ.get("QL_LOGS_PASSWORD", "")
 LOG_SOURCES = [
     ("hermes", "docker logs --tail 300 " + CONTAINER + " 2>&1"),
     ("cron", "cat /tmp/cron_api.log 2>/dev/null | tail -200"),
@@ -100,7 +99,11 @@ class LogsHandler(http.server.BaseHTTPRequestHandler):
         params = urllib.parse.parse_qs(parsed.query)
         level = params.get("level", ["all"])[0]
         q = params.get("q", [""])[0]
-        limit = int(params.get("limit", ["200"])[0])
+        # v3.0.6 security review：limit 非数字钳制（原 int() 直接转换抛 ValueError → handler 崩溃）
+        try:
+            limit = max(1, min(int(params.get("limit", ["200"])[0]), 5000))
+        except (ValueError, TypeError):
+            limit = 200
         logs = collect_logs(level_filter=level, keyword=q, limit=limit)
 
         if self.path.startswith("/api/logs/export"):
@@ -169,7 +172,7 @@ class LogsHandler(http.server.BaseHTTPRequestHandler):
             }
             try:
                 # v2.0.47：崩溃日志统一放轻聊文件夹/logs/（用户要求）
-                crash_dir = os.path.join(DATA_DIR, "logs")
+                crash_dir = os.environ.get('QL_LOGS_DIR', '/data/logs')
                 crash_file = os.path.join(crash_dir, 'crash_reports.log')
                 os.makedirs(crash_dir, exist_ok=True)
                 with open(crash_file, 'a', encoding='utf-8') as f:

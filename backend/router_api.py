@@ -50,6 +50,7 @@ for cmd in cmds:
 c.close()
 print(json.dumps(out, ensure_ascii=False))
 '''
+import os
 
 def _router_exec(cmds, pty=False, timeout=45):
     cred = _router_cred()

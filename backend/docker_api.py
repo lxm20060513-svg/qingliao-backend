@@ -102,17 +102,18 @@ def _read_compose(name):
 
 
 def _compose_action(name, action):
-    """stop（停止） / start（启动） / down（删除容器，保留配置目录）"""
+    """stop（停止） / start（启动） / restart（重启） / down（删除容器，保留配置目录）"""
     if not NAME_RE.match(name):
         return False, "名称不合法"
     d = os.path.join(DOCKER_ROOT, name)
     if not os.path.isdir(d):
         return False, "未找到项目目录"
-    cmd = ["docker", "compose", "-p", name] + ([action] if action in ("stop", "start") else ["down"])
+    # v3.0.19：restart 支持（docker compose restart 语法与 stop/start 一致）
+    cmd = ["docker", "compose", "-p", name] + ([action] if action in ("stop", "start", "restart") else ["down"])
     try:
         r = subprocess.run(cmd, cwd=d, capture_output=True, text=True, timeout=120)
         if r.returncode == 0:
-            msg = {"stop": "已停止", "start": "已启动", "down": "已删除容器（配置保留，可重新部署）"}[action]
+            msg = {"stop": "已停止", "start": "已启动", "restart": "已重启", "down": "已删除容器（配置保留，可重新部署）"}[action]
             return True, msg
         return False, (r.stdout + r.stderr)[-800:]
     except Exception as e:
@@ -252,6 +253,12 @@ class DockerHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/docker/start"):
             name = (body.get("name") or "").strip()
             ok, msg = _resolve_action(name, "start")
+            self._send(200, {"ok": ok, "message": msg, "containers": _ps()})
+            return
+        if parsed.path.startswith("/api/docker/restart"):
+            # v3.0.19：云端 control_docker 工具支持重启
+            name = (body.get("name") or "").strip()
+            ok, msg = _resolve_action(name, "restart")
             self._send(200, {"ok": ok, "message": msg, "containers": _ps()})
             return
         if parsed.path.startswith("/api/docker/rm"):

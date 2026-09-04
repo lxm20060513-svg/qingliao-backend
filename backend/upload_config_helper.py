@@ -2,9 +2,8 @@
 """上传目录配置（设置页可自定义 NAS 位置）：upload_config.json 存路径，动态读取"""
 import json
 import os
-DATA_DIR = os.environ.get("QL_DATA_DIR", "/data")
 
-DEFAULT_DIR = os.environ.get("QL_UPLOAD_DIR", os.path.join(DATA_DIR, "uploads"))
+DEFAULT_DIR = os.environ.get("QL_UPLOAD_DIR", "/data/uploads")
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "upload_config.json")
 
 

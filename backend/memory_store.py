@@ -7,11 +7,16 @@ API：/api/memory/list|add|delete（memory_api.py）
 """
 import json
 import os
-DATA_DIR = os.environ.get("QL_DATA_DIR", "/data")
 import re
+import tempfile
+import threading
 
-MEMORY_PATH = os.path.join(DATA_DIR, "memory.json")
+MEMORY_PATH = os.environ.get("QL_MEMORY_PATH", "/data/memory.json")
 MAX_ENTRIES = 50
+
+# v3.0.6 review fix：记忆 JSON 高并发读写（每条流式消息 inject→add_entry），
+# 加全局锁 + 原子写（tmp+os.replace+fsync），防丢条目/写一半损坏
+_lock = threading.Lock()
 
 
 def _load():
@@ -25,35 +30,49 @@ def _load():
 def _save(entries):
     try:
         os.makedirs(os.path.dirname(MEMORY_PATH), exist_ok=True)
-        with open(MEMORY_PATH, "w", encoding="utf-8") as f:
+        # v3.0.6 review fix：tmp + write + flush + fsync + os.replace 原子落盘
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(MEMORY_PATH), suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump({"entries": entries[-MAX_ENTRIES:]}, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, MEMORY_PATH)
     except Exception:
-        pass
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except Exception:
+            pass
 
 
 def list_entries():
-    return _load()
+    with _lock:
+        return _load()
 
 
 def add_entry(text):
     t = text.strip()
     if not t or len(t) < 2:
         return False
-    entries = _load()
-    if t not in entries:
-        entries.append(t)
-        _save(entries)
-        return True
-    return False
+    # v3.0.6 review fix：读-改-写全在锁内，防并发丢条目
+    with _lock:
+        entries = _load()
+        if t not in entries:
+            entries.append(t)
+            _save(entries)
+            return True
+        return False
 
 
 def delete_entry(text):
-    entries = _load()
-    if text in entries:
-        entries.remove(text)
-        _save(entries)
-        return True
-    return False
+    # v3.0.6 review fix：读-改-写全在锁内
+    with _lock:
+        entries = _load()
+        if text in entries:
+            entries.remove(text)
+            _save(entries)
+            return True
+        return False
 
 
 # 记忆意图检测（记住/我是/我喜欢/别忘了…）
@@ -84,10 +103,13 @@ def check_and_save(user_text):
 
 
 def inject(messages):
-    """先检测写入（最后一条 user），再注入记忆条目到 system"""
+    """先检测写入（最后一条 user），再注入记忆条目到 system。
+    v3.0.28 review：避免每次流式请求都 _load()——check_and_save 内部已有锁保护读写，
+    这里只读一次。"""
     try:
         check_and_save(_last_user(messages))
-        entries = _load()
+        with _lock:
+            entries = _load()
         if not entries:
             return messages
         ctx = "关于用户的信息（回答时自然参考，不要逐条复述）：" + "；".join(entries)

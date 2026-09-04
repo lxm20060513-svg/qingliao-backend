@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """ASR 代理 API（v2.0.96c）：POST /api/asr/transcribe（raw 音频 body）→ Hermes 容器 faster-whisper 转写。
-容器挂载 /volume1/docker/hermes → /opt/hermes_host，音频经共享目录传递，一次 docker exec。端口 9143。"""
+音频经容器共享目录传递，一次 docker exec。端口 9143。"""
 import json
 import hmac
 import os
@@ -9,11 +9,11 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler
 
-CONTAINER = os.environ.get("QL_ASR_CONTAINER", "hermes-hermes-1")
-# 宿主共享目录（挂载进容器 /opt/hermes_host）
-HOST_ASR_DIR = os.environ.get("QL_ASR_DIR", "/volume1/docker/hermes/微信文件/轻聊web/data/asr_tmp")
+CONTAINER = os.environ.get("QL_ASR_CONTAINER", os.environ.get("QL_HERMES_CONTAINER", "hermes-container"))
+# 宿主共享目录（挂载进容器）
+HOST_ASR_DIR = os.environ.get("QL_ASR_DIR", os.environ.get("QL_ASR_DIR", "/data/asr_tmp"))
 CONTAINER_ASR_DIR = os.environ.get("QL_ASR_CONTAINER_DIR",
-                                   "/opt/hermes_host/微信文件/轻聊web/data/asr_tmp")
+                                   os.environ.get("QL_ASR_DIR_HOST", "/data/asr_tmp"))
 ASR_URL = "http://127.0.0.1:9144/transcribe"
 
 
@@ -30,7 +30,7 @@ def _ensure_server():
             return True
         # ② 不在跑：直接 nohup（无括号子 shell）
         subprocess.run(["docker", "exec", CONTAINER, "sh", "-c",
-                        "nohup /opt/data/whisper_venv/bin/python /opt/data/asr_server.py >/tmp/asr_server.log 2>&1 &"],
+                        f"nohup {os.environ.get('QL_WHISPER_PYTHON', '/usr/local/bin/python3')} {os.environ.get('QL_ASR_SERVER', '/app/asr_server.py')} >/tmp/asr_server.log 2>&1 &"],
                        capture_output=True, text=True, timeout=30)
         # ③ 轮询 9144 就绪（最多 60 秒，每 3 秒探测；非 000/空响应即就绪）
         for _ in range(20):

@@ -230,7 +230,6 @@ class AuthHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/auth/login"):
             body = self._read_body()
             print("[auth_api] LOGIN " + self.path + " user=" + str((body.get("username") or "")[:20]), flush=True)
-            print("[auth_api] LOGIN " + self.path + " user=" + str((body.get("username") or "")[:20]), flush=True)
             user = (body.get("username") or "").strip()
             pw = body.get("password") or ""
             if verify_password(user, pw):

@@ -150,6 +150,10 @@ class HAProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == '/api/ha/config' or self.path.startswith('/api/ha/config?'):
+            # v3.0.6 security review：config 含 HA token，必须鉴权（防篡改代理指向/泄露）
+            if not self._check_auth():
+                self._send_json({'ok': False, 'error': 'unauthorized'}, 401)
+                return
             c = _ha_config()
             self._send_json({'ok': True, 'address': c.get('address', ''), 'has_token': bool(c.get('token'))})
             return
@@ -158,6 +162,10 @@ class HAProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == '/api/ha/config' or self.path.startswith('/api/ha/config?'):
+            # v3.0.6 security review：config 必须鉴权
+            if not self._check_auth():
+                self._send_json({'ok': False, 'error': 'unauthorized'}, 401)
+                return
             try:
                 n = int(self.headers.get('Content-Length', 0))
                 body = _json.loads(self.rfile.read(n).decode('utf-8'))
@@ -170,8 +178,20 @@ class HAProxyHandler(http.server.BaseHTTPRequestHandler):
                 c['address'] = addr
             if tok:
                 c['token'] = tok
-            open(os.path.join(DATA_DIR, "ha_config.json"), "w").write(_json.dumps(c, ensure_ascii=False))
-            _os.chmod(os.path.join(DATA_DIR, "ha_config.json"), 0o600)
+            # v3.0.28 review：原子写（tmp+os.replace），防并发写坏
+            import tempfile
+            _cfg_path = os.path.join(DATA_DIR, "ha_config.json")
+            fd, _tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    _json.dump(c, f, ensure_ascii=False)
+                os.replace(_tmp, _cfg_path)
+                _os.chmod(_cfg_path, 0o600)
+            except Exception:
+                try:
+                    os.unlink(_tmp)
+                except Exception:
+                    pass
             self._send_json({'ok': True})
             return
 

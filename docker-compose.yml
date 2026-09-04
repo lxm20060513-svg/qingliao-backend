@@ -4,34 +4,67 @@ services:
     container_name: qingliao
     restart: unless-stopped
     ports:
-      - "9125-9142:9125-9142"
+      - "9125-9150:9125-9150"
     environment:
       # 必填：统一访问密码（所有 API 的密码鉴权）
-      QL_PASSWORD: change-me
-      # 数据目录（容器内，与 volume 对应）
-      QL_DATA_DIR: /data
-      # 上游 LLM（OpenAI 兼容端点，如 Hermes/DeepSeek/OpenCode）
-      QL_HERMES_URL: http://host.docker.internal:9123/v1/chat/completions
-      QL_HERMES_KEY: ""
-      # Home Assistant（可选，智能家居模块）
-      QL_HA_URL: http://host.docker.internal:8123
-      QL_HA_TOKEN: ""
-      # 路由器（可选，Clash 管理模块；需容器内可访问路由器 SSH）
-      QL_ROUTER_HOST: ""
-      QL_ROUTER_USER: root
-      QL_ROUTER_PASSWORD: ""
-      # Docker 部署目录（docker_api 模块，compose 文件存放位置）
-      QL_DOCKER_ROOT: /data/docker
-      # Agent 模式（工具调用循环）：OpenAI 兼容端点 + Key（支持 function calling）
-      QL_AGENT_URL: https://api.deepseek.com/v1/chat/completions
-      QL_AGENT_KEY: 
-      QL_AGENT_MODEL: deepseek-chat
-      # 流式任务数据目录
-      STREAM_DATA_DIR: /data/streams_data
-      # 会话数据目录
-      SESSIONS_DATA_DIR: /data/sessions
-      # 日志来源容器名（logs_api 查 docker logs 用）
-      QL_LOG_CONTAINER: hermes
+      QL_PASSWORD: ${QL_PASSWORD:-changeme}
+      
+      # === 数据目录 ===
+      QL_DATA_DIR: ${QL_DATA_DIR:-/data}
+      QL_UPLOAD_DIR: ${QL_UPLOAD_DIR:-/data/uploads}
+      QL_HERMES_DATA_DIR: ${QL_HERMES_DATA_DIR:-/data/hermes}
+      QL_HERMES_HOST_DIR: ${QL_HERMES_HOST_DIR:-/data/hermes_host}
+      QL_HERMES_ROOT_DIR: ${QL_HERMES_ROOT_DIR:-/data/hermes}
+      
+      # === 目录路径 ===
+      QL_ASR_DIR: ${QL_ASR_DIR:-/data/asr_tmp}
+      QL_ASR_DIR_HOST: ${QL_ASR_DIR_HOST:-/data/asr_tmp}
+      QL_KB_DIR: ${QL_KB_DIR:-/data/kb}
+      QL_LOGS_DIR: ${QL_LOGS_DIR:-/data/logs}
+      QL_MEMORY_PATH: ${QL_MEMORY_PATH:-/data/memory.json}
+      QL_SECRETS_STORE: ${QL_SECRETS_STORE:-/data/secrets_store.json.enc}
+      QL_SECRETS_KEY: ${QL_SECRETS_KEY:-/data/.secrets_key}
+      
+      # === 配置文件 ===
+      QL_CONFIG_YAML: ${QL_CONFIG_YAML:-/data/profiles/wechat-profile/config.yaml}
+      QL_CONFIG_YAML_FALLBACK: ${QL_CONFIG_YAML_FALLBACK:-/data/profiles/wechat-profile/config.yaml}
+      
+      # === 工具路径 ===
+      QL_WHISPER_PYTHON: ${QL_WHISPER_PYTHON:-/usr/local/bin/python3}
+      QL_ASR_SERVER: ${QL_ASR_SERVER:-/app/asr_server.py}
+      
+      # === 容器配置 ===
+      QL_HERMES_CONTAINER: ${QL_HERMES_CONTAINER:-hermes-container}
+      QL_LOG_CONTAINER: ${QL_LOG_CONTAINER:-hermes}
+      
+      # === 网络配置 ===
+      STREAM_WEBHOOK_URL: ${STREAM_WEBHOOK_URL:-http://localhost:8644/webhooks/qingliao-push}
+      QL_OLLAMA_URL: ${QL_OLLAMA_URL:-http://localhost:11434/v1}
+      
+      # === 上游 LLM ===
+      QL_HERMES_URL: ${QL_HERMES_URL:-http://host.docker.internal:9123/v1/chat/completions}
+      QL_HERMES_KEY: ${QL_HERMES_KEY:-}
+      
+      # === Home Assistant ===
+      QL_HA_URL: ${QL_HA_URL:-http://host.docker.internal:8123}
+      QL_HA_TOKEN: ${QL_HA_TOKEN:-}
+      
+      # === 路由器 ===
+      QL_ROUTER_HOST: ${QL_ROUTER_HOST:-}
+      QL_ROUTER_USER: ${QL_ROUTER_USER:-root}
+      QL_ROUTER_PASSWORD: ${QL_ROUTER_PASSWORD:-}
+      
+      # === Docker 管理 ===
+      QL_DOCKER_ROOT: ${QL_DOCKER_ROOT:-/data/docker}
+      
+      # === Agent 模式 ===
+      QL_AGENT_URL: ${QL_AGENT_URL:-https://api.deepseek.com/v1/chat/completions}
+      QL_AGENT_KEY: ${QL_AGENT_KEY:-}
+      QL_AGENT_MODEL: ${QL_AGENT_MODEL:-deepseek-chat}
+      
+      # === 数据目录 ===
+      STREAM_DATA_DIR: ${STREAM_DATA_DIR:-/data/streams_data}
+      SESSIONS_DATA_DIR: ${SESSIONS_DATA_DIR:-/data/sessions}
     volumes:
       - ./data:/data
       # docker_api 管理容器需要挂载 docker socket（可选；不需要可注释）

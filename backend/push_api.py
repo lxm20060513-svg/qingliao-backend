@@ -17,7 +17,7 @@ QUEUE_FILE = os.path.join(DATA_DIR, "push_queue.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "push_settings.json")
 PUSH_TOKEN = os.environ.get("QL_PUSH_TOKEN", "ql-push-default")
 
-_lock = threading.Lock()
+_lock = threading.RLock()  # RLock：enqueue 外层持锁内调 _save 也持锁（v3.0.28 review 嵌套导致 Lock 自死锁，2026-08-22 Phase 3 修复）
 
 
 def _load_settings():
@@ -70,13 +70,15 @@ def enqueue(text):
     text = (text or "").strip()
     if not text:
         return False, "消息为空"
-    items = _load()
-    items.append({"id": uuid.uuid4().hex[:12], "text": text,
-                  "ts": time.time(), "status": "pending"})
-    # 队列上限 50（防堆积）
-    if len(items) > 50:
-        items = items[-50:]
-    _save(items)
+    # v3.0.28 review：整个 load→append→save 放在锁内，防并发丢条目
+    with _lock:
+        items = _load()
+        items.append({"id": uuid.uuid4().hex[:12], "text": text,
+                      "ts": time.time(), "status": "pending"})
+        # 队列上限 50（防堆积）
+        if len(items) > 50:
+            items = items[-50:]
+        _save(items)
     return True, "已入队"
 
 
@@ -133,6 +135,18 @@ class Handler(BaseHTTPRequestHandler):
     def _auth(self):
         return self.headers.get("X-Push-Token") == PUSH_TOKEN
 
+    # v3.0.6 security review：settings 接口需鉴权，但要兼容两种调用方——
+    # App 设置页带 X-Auth-Token（登录 token）、微信推送 cron 带 X-Push-Token
+    def _auth_or_login(self):
+        if self._auth():
+            return True
+        try:
+            import auth_api
+            # 仅登录 token（密码头兜底默认关闭）
+            return auth_api.check_auth(self.headers, "X-Push-Password", "")
+        except Exception:
+            return False
+
     def do_OPTIONS(self):
         self.send_response(204)
         self._cors()
@@ -145,6 +159,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(200, {"ok": True, "items": pending()})
         elif self.path.startswith("/api/push/settings"):
+            # v3.0.6 security review：settings 必须鉴权（兼容 App 登录 token / 推送 token）
+            if not self._auth_or_login():
+                self._send(401, {"ok": False, "error": "unauthorized"})
+                return
             # v2.0.113：微信推送开关（App 设置页读写）
             self._send(200, {"ok": True, **{k: v for k, v in _load_settings().items()}})
         else:
@@ -163,6 +181,10 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(400, {"ok": False, "error": str(e)[:200]})
         elif self.path.startswith("/api/push/settings"):
+            # v3.0.6 security review：settings 必须鉴权（兼容 App 登录 token / 推送 token）
+            if not self._auth_or_login():
+                self._send(401, {"ok": False, "error": "unauthorized"})
+                return
             try:
                 n = int(self.headers.get("Content-Length") or 0)
                 d = json.loads(self.rfile.read(n) or b"{}")
@@ -174,6 +196,10 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(400, {"ok": False, "error": str(e)[:200]})
         elif self.path.startswith("/api/push/") and self.path.endswith("/done"):
+            # v3.0.6 security review：done 必须鉴权（防未授权标记/操纵）
+            if not self._auth():
+                self._send(401, {"ok": False, "error": "unauthorized"})
+                return
             mid = self.path.split("/")[3]
             ok = mark_done(mid)
             self._send(200, {"ok": ok})

@@ -7,7 +7,8 @@
 import http.server
 import json
 import os
-DATA_DIR = os.environ.get("QL_DATA_DIR", "/data")
+import threading
+import base64
 import upload_config_helper
 import urllib.parse
 import cgi
@@ -15,15 +16,35 @@ import time
 import hmac
 
 # 文件管理访问密码（修改这里即可更换密码）
-FILES_PASSWORD = os.environ.get("QL_PASSWORD", "change-me")
+FILES_PASSWORD = os.environ.get("QL_FILES_PASSWORD", "")
+
+# v3.0.54：蜂窝分片上传重组状态（内存态；staging 文件落 UPLOAD_DIR/.chunks/，成功后 rename 到 uploads/）
+_chunk_lock = threading.Lock()
+_chunks = {}   # uploadId -> {path, parts:set, total, ext, created}
+CHUNK_MAX_TOTAL = 512          # 单片图像最多分片数（超大图保护）
+CHUNK_MAX_SLICE = 2 * 1024 * 1024
+CHUNK_MAX_B64 = 3 * 1024 * 1024
+CHUNK_TTL = 120                # 未完成分片超过 120s 清理
+_ALLOWED_IMG_EXT = ('jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'heic')
+
+def _expire_chunks(now):
+    """清理超时未完成的分片 staging，防目录/内存堆积"""
+    stale = [u for u, s in _chunks.items() if now - s['created'] > CHUNK_TTL]
+    for u in stale:
+        s = _chunks.pop(u, None)
+        if s:
+            try:
+                os.remove(s['path'])
+            except OSError:
+                pass
 
 # 安全根目录：轻聊数据目录（前端只允许浏览这里）
-ROOT = DATA_DIR
+ROOT = os.environ.get('QL_DATA_DIR', '/data')
 # 额外允许浏览的目录（只读列表，不在此列表的根不可访问）
-# 注意：根目录下避免放置敏感文件
+# 注意：不包含配置根目录（其下有配置等敏感文件）
 ALLOWED_ROOTS = [ROOT]
 # 上传目标目录
-UPLOAD_DIR = os.environ.get("QL_UPLOAD_DIR", os.path.join(DATA_DIR, "uploads"))
+UPLOAD_DIR = os.environ.get('QL_UPLOAD_DIR', '/data/uploads')
 
 
 def resolve_path(p):
@@ -125,13 +146,18 @@ class FilesHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         # 密码校验
-        if not self._check_auth():
-            self._send_json(401, {"error": "需要密码"})
-            return
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
         path_param = params.get('path', [''])[0]
-
+        # v3.0.37：图片持久化 —— 上传目录内文件匿名可读（图片 URL 直接加载/分享，无需 token）
+        # 仅对 download + 上传目录生效；list/config 仍走鉴权
+        is_up = parsed.path.startswith('/api/files/download') and bool(path_param)
+        up_abs = os.path.normpath(os.path.join(upload_config_helper.get_dir(), path_param.lstrip('/'))) if is_up else None
+        if is_up and up_abs and os.path.commonpath([up_abs, upload_config_helper.get_dir()]) == upload_config_helper.get_dir() and os.path.isfile(up_abs):
+            pass  # 上传目录文件匿名可读，跳过鉴权
+        elif not self._check_auth():
+            self._send_json(401, {"error": "需要密码"})
+            return
         if parsed.path.startswith("/api/files/config"):
             self._send_json(200, {"ok": True, "upload_dir": upload_config_helper.get_dir()})
             return
@@ -314,11 +340,97 @@ class FilesHandler(http.server.BaseHTTPRequestHandler):
             except OSError as e:
                 self._send_json(500, {"error": "创建目录失败: " + str(e)[:150]})
             return
-        if parsed.path.startswith("/api/files/config"):
+        if parsed.path.startswith('/api/files/config'):
             body = self._read_json() or {}
             path = (body.get("upload_dir") or "").strip()
             ok, msg = upload_config_helper.set_dir(path)
             self._send_json(200, {"ok": ok, "message": msg, "upload_dir": upload_config_helper.get_dir()})
+            return
+        if parsed.path.startswith('/api/files/upload_chunk'):
+            # v3.0.54：蜂窝分片上传 —— 客户端把图切成小块 base64 JSON POST（小 body 蜂窝可过），
+            # 服务端按 offset(索引*片大小) 写 staging 文件，收齐后 rename 到 uploads/ 返回 url。
+            body = self._read_json() or {}
+            upid = (body.get('uploadId') or '').strip()
+            try:
+                index = int(body.get('index', -1))
+                total = int(body.get('total', 0))
+                slice_size = int(body.get('slice', 0))
+            except Exception:
+                self._send_json(400, {"error": "无效的分片参数"})
+                return
+            ext = (body.get('ext') or 'jpg').strip().lstrip('.')
+            if ext not in _ALLOWED_IMG_EXT:
+                ext = 'jpg'
+            b64 = body.get('base64') or ''
+            if not upid or index < 0 or total <= 0 or slice_size <= 0 or not b64:
+                self._send_json(400, {"error": "分片参数缺失"})
+                return
+            if total > CHUNK_MAX_TOTAL or slice_size > CHUNK_MAX_SLICE or len(b64) > CHUNK_MAX_B64 \
+                    or slice_size * total > 50 * 1024 * 1024:
+                self._send_json(400, {"error": "分片过大"})
+                return
+            try:
+                data = base64.b64decode(b64)
+            except Exception:
+                self._send_json(400, {"error": "base64 解码失败"})
+                return
+
+            up_dir = upload_config_helper.get_dir()
+            chunk_dir = os.path.join(up_dir, '.chunks')
+            try:
+                os.makedirs(chunk_dir, exist_ok=True)
+            except OSError as e:
+                self._send_json(500, {"error": "无法创建分片目录: " + str(e)})
+                return
+
+            now = time.time()
+            with _chunk_lock:
+                _expire_chunks(now)
+                st = _chunks.get(upid)
+                if st is None:
+                    st = {
+                        'path': os.path.join(chunk_dir, 'up_' + upid + '.part'),
+                        'parts': set(),
+                        'total': total,
+                        'ext': ext,
+                        'created': now,
+                    }
+                    _chunks[upid] = st
+                st['parts'].add(index)
+                offset = index * slice_size
+                try:
+                    fd = os.open(st['path'], os.O_CREAT | os.O_RDWR, 0o644)
+                    with os.fdopen(fd, 'r+b') as f:
+                        f.seek(offset)
+                        f.write(data)
+                except OSError as e:
+                    self._send_json(500, {"error": "分片写入失败: " + str(e)})
+                    return
+
+                if len(st['parts']) < st['total']:
+                    # 未收齐：继续收下一片
+                    self._send_json(200, {"ok": True, "received": len(st['parts']), "total": st['total']})
+                    return
+
+                # 收齐 → 组装落 uploads/
+                _chunks.pop(upid, None)
+                final_name = "up_{}_{}.{}".format(int(now), upid[:8], st['ext'])
+                final_path = os.path.join(up_dir, final_name)
+            # 锁外做 IO 收尾（rename/copy）
+            try:
+                os.replace(st['path'], final_path)
+            except OSError:
+                # 跨设备等异常：先 copy 再删 staging
+                try:
+                    import shutil
+                    shutil.copy2(st['path'], final_path)
+                    os.remove(st['path'])
+                except OSError as e:
+                    self._send_json(500, {"error": "文件组装失败: " + str(e)})
+                    return
+            size = os.path.getsize(final_path)
+            url = "/api/files/download?path=" + urllib.parse.quote(final_name)
+            self._send_json(200, {"ok": True, "saved": final_name, "size": size, "url": url})
             return
         if parsed.path.startswith('/api/files/upload'):
             # 确保上传目录存在
@@ -389,7 +501,9 @@ class FilesHandler(http.server.BaseHTTPRequestHandler):
                     data = file_item.file.read()
                     f.write(data)
                 saved_name = os.path.basename(dest)
-                body = json.dumps({"ok": True, "saved": saved_name, "size": len(data)}).encode()
+                # v3.0.37：图片持久化 —— 返回相对路径 url（App 端拼各自 baseURL：WiFi/蜂窝中继均可用）
+                body = json.dumps({"ok": True, "saved": saved_name, "size": len(data),
+                                   "url": "/api/files/download?path=" + urllib.parse.quote(saved_name)}).encode()
                 self.send_response(200)
             except OSError as e:
                 body = json.dumps({"error": "保存失败: " + str(e)}).encode()

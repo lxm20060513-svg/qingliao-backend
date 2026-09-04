@@ -12,6 +12,7 @@ import threading
 DATA_DIR = os.environ.get("QL_DATA_DIR", "/data")
 import time
 import hmac
+import media_convert  # v2.0.130: 历史消息 MEDIA:路径→data URL 图片
 
 # v2.0.116 review：并发保存锁（多设备 merge 写覆盖丢数据）
 _save_lock = threading.Lock()
@@ -139,6 +140,11 @@ class SessionsHandler(http.server.BaseHTTPRequestHandler):
             return
         if self.path.startswith('/api/sessions/list'):
             sessions = load_sessions()
+            for _s in sessions:
+                for _m in (_s.get("messages") or []):
+                    if _m.get("role") == "assistant" and isinstance(_m.get("content"), str) and "MEDIA:" in _m.get("content", ""):
+                        _m["content"] = media_convert.convert_media_marks(_m["content"])
+
             self._send_json(200, {"ok": True, "sessions": sessions, "total": len(sessions)})
             return
         self._send_json(404, {"error": "not found"})

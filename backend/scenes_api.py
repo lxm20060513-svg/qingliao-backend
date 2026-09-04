@@ -7,6 +7,7 @@
 import json
 import hmac
 import os
+import tempfile
 import urllib.request
 from http.server import BaseHTTPRequestHandler
 
@@ -29,8 +30,13 @@ def _load():
 def _save(scenes):
     os.makedirs(DATA_DIR, exist_ok=True)
     with LOCK:
-        with open(SCENES_FILE, "w", encoding="utf-8") as f:
+        # v3.0.6 review fix：tmp + fsync + os.replace 原子写（原 open('w') 崩溃损坏 scenes.json）
+        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(scenes, f, ensure_ascii=False, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, SCENES_FILE)
 
 
 def list_scenes():

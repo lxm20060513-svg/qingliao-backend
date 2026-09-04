@@ -1,14 +1,23 @@
+import os
 import json, os, uuid, threading
-DATA_DIR = os.environ.get("QL_DATA_DIR", "/data")
 from cryptography.fernet import Fernet
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # 凭据安全存储：Fernet 对称加密文件（密钥 600 权限，防 NAS 本地文件泄露）
-STORE = os.path.join(DATA_DIR, "secrets_store.json.enc")
-KEY_FILE = os.path.join(DATA_DIR, ".secrets_key")
+STORE = os.environ.get('QL_SECRETS_STORE', '/data/secrets_store.json.enc')
+KEY_FILE = os.environ.get('QL_SECRETS_KEY', '/data/.secrets_key')
 ALLOWED_TYPES = ('nas', 'router', 'other')
 
 _lock = threading.Lock()
+
+# v3.0.6 security review：secrets 服务鉴权——复用轻聊统一 token 校验（防明文密码泄露）
+def _authorized(h):
+    """校验 X-Auth-Token（轻聊登录 token）。secrets 含明文密码，必须鉴权。"""
+    try:
+        import auth_api
+        return auth_api.check_auth(h.headers, "X-Secrets-Password", "")
+    except Exception:
+        return False
 
 def _load_key():
     if os.path.exists(KEY_FILE):
@@ -89,6 +98,10 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        # v3.0.6 security review：secrets 必须鉴权（含明文密码，防泄露）
+        if not _authorized(self):
+            self._send({'ok': False, 'error': 'unauthorized'}, 401)
+            return
         path = self.path
         # 列表
         if path == '/api/secrets' or path.startswith('/api/secrets?'):
@@ -116,6 +129,10 @@ class Handler(BaseHTTPRequestHandler):
         self._send({'ok': False, 'error': 'not found'}, 404)
 
     def do_POST(self):
+        # v3.0.6 security review：secrets 必须鉴权
+        if not _authorized(self):
+            self._send({'ok': False, 'error': 'unauthorized'}, 401)
+            return
         if self.path != '/api/secrets':
             self._send({'ok': False, 'error': 'not found'}, 404)
             return
@@ -149,6 +166,10 @@ class Handler(BaseHTTPRequestHandler):
         self._send({'ok': True, 'id': sid})
 
     def do_DELETE(self):
+        # v3.0.6 security review：secrets 必须鉴权
+        if not _authorized(self):
+            self._send({'ok': False, 'error': 'unauthorized'}, 401)
+            return
         if not self.path.startswith('/api/secrets/'):
             self._send({'ok': False, 'error': 'not found'}, 404)
             return
