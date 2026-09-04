@@ -1,6 +1,6 @@
 # 轻聊后端（Qingliao Backend）
 
-家庭 NAS 上的 AI 助手后端服务，纯 Python 标准库实现（仅路由器/密码管理两个可选依赖）。为 [轻聊 iOS/Web 客户端](https://github.com/lxm20060513-apple/qingliao-ios) 提供 AI 对话流式代理、会话同步、文件管理、智能家居（Home Assistant）代理、Docker 管理、知识库、定时任务、密码管理等 API。
+家庭 NAS 上的 AI 助手后端服务，纯 Python 标准库实现（仅路由器/密码管理两个可选依赖）。为 [轻聊 iOS/Web 客户端提供 AI 对话流式代理、会话同步、文件管理、智能家居（Home Assistant）代理、Docker 管理、知识库、定时任务、密码管理等 API。
 
 ## ✨ 功能
 
