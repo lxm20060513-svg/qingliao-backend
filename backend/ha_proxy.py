@@ -41,7 +41,9 @@ def _keep_entity(e):
     # 门锁/猫眼只保留电量 + 安防状态
     if ("bacn01" in eid or "chuangmi" in eid) and "battery_level" in eid:
         return True
-    if "alarmstatus" in eid:
+    # v3.9.19：安防状态改读 Aqara 网关「警戒模式」开关（用户已移除萤石插件，
+    # 原 sensor.she_xiang_tou_alarmstatus 不复存在）；alarmstatus 保留兼容旧配置
+    if "alarmstatus" in eid or "guard_mode" in eid:
         return True
     # 温度传感器（看板温度卡）
     if eid.startswith("sensor.") and "temperature" in eid:

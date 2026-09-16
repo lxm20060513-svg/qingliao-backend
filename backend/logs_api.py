@@ -172,7 +172,7 @@ class LogsHandler(http.server.BaseHTTPRequestHandler):
             }
             try:
                 # v2.0.47：崩溃日志统一放轻聊文件夹/logs/（用户要求）
-                crash_dir = os.environ.get('QL_LOGS_DIR', '/data/logs')
+                crash_dir = 'os.environ.get("QL_DATA_DIR", "/data")/logs'
                 crash_file = os.path.join(crash_dir, 'crash_reports.log')
                 os.makedirs(crash_dir, exist_ok=True)
                 with open(crash_file, 'a', encoding='utf-8') as f:

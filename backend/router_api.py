@@ -5,10 +5,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # 连接方式：宿主 docker exec hermes 容器内 paramiko 连路由器（NAS 宿主无 paramiko）
 # 凭据：优先 secrets_api 存储的 type=router 条目，缺省 root/admin
 
-ROUTER_DEFAULT = {'host': os.environ.get("QL_ROUTER_HOST", ""), 'port': 22,
-                'username': os.environ.get("QL_ROUTER_USER", "root"),
-                'password': os.environ.get("QL_ROUTER_PASSWORD", "change-me")}
-CONTAINER = ""
+ROUTER_DEFAULT = {'host': os.environ.get("QL_ROUTER_HOST", ""), 'port': 22, 'username': os.environ.get("QL_ROUTER_USER", "root"), 'password': os.environ.get("QL_ROUTER_PASS", "")}
+CONTAINER = os.environ.get('QL_HERMES_CONTAINER', 'hermes-container')
 PY = sys.executable
 
 def _router_cred():
@@ -50,7 +48,6 @@ for cmd in cmds:
 c.close()
 print(json.dumps(out, ensure_ascii=False))
 '''
-import os
 
 def _router_exec(cmds, pty=False, timeout=45):
     cred = _router_cred()
@@ -58,7 +55,7 @@ def _router_exec(cmds, pty=False, timeout=45):
                                  user=cred['username'], pw=cred['password'])
     payload = base64.b64encode(json.dumps(cmds).encode()).decode()
     r = subprocess.run(
-        [PY, '-c', script, payload, '1' if pty else '0'],
+        ['docker', 'exec', CONTAINER, PY, '-c', script, payload, '1' if pty else '0'],
         capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
         # v2.0.93f：PTY 下 recv_exit_status 遇命令退出码非 0 时 paramiko 可能抛异常，

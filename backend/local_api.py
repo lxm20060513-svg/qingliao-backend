@@ -9,6 +9,7 @@
 """
 import json
 import os
+import re
 import subprocess
 import time
 import urllib.request
@@ -41,10 +42,27 @@ def _ollama_cmd(args, timeout=60):
         return "", str(e)[:150]
 
 
+_LIST_RE = re.compile(r"^(\S+)\s+(\S+)\s+([\d.]+\s*[KMGTP]?B)\s+(.+)$")
+
+
 def _models():
+    """解析 ollama list（NAME ID SIZE MODIFIED）。
+
+    SIZE 在 ollama 输出里是「1.6 GB」两列、MODIFIED 是「3 minutes ago」多列，必须整行解析；
+    按空格取 parts[2] / parts[3:] 会显示成 size=1.6、modified="GB 3 minutes ago"。
+    """
     out, _ = _ollama_cmd(["list"])
     models = []
     for line in (out or "").splitlines()[1:]:
+        line = line.strip()
+        if not line:
+            continue
+        m = _LIST_RE.match(line)
+        if m:
+            models.append({"name": m.group(1),
+                           "size": re.sub(r"\s+", " ", m.group(3)).strip(),
+                           "modified": m.group(4).strip()})
+            continue
         parts = line.split()
         if len(parts) >= 4:
             models.append({"name": parts[0], "size": parts[2], "modified": " ".join(parts[3:])})

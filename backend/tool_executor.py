@@ -252,7 +252,7 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "description": "搜索关键词（文件名或内容）"},
-                    "path": {"type": "string", "description": "搜索目录（默认 /volume1）"},
+                    "path": {"type": "string", "description": "搜索目录（默认 /data）"},
                 },
                 "required": ["pattern"],
             },
@@ -286,6 +286,86 @@ TOOLS = [
                 "required": ["task"],
             },
         },
+    },    {
+        "type": "function",
+        "function": {
+            "name": "web_extract",
+            "description": "从网页URL提取内容为Markdown文本。适合获取文章、文档等网页的正文内容",
+            "parameters": {"type": "object", "properties": {"url": {"type": "string", "description": "要提取内容的网页URL"}}, "required": ["url"]},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "patch_file",
+            "description": "精确替换文件中的指定字符串。适合对已有文件做小范围修改",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "文件路径"}, "old_string": {"type": "string", "description": "要替换的字符串"}, "new_string": {"type": "string", "description": "替换后的新字符串"}}, "required": ["path", "old_string", "new_string"]},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "todo",
+            "description": "任务规划与追踪。创建待办事项列表，跟踪任务进度",
+            "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["create", "list", "update", "complete"]}, "task_id": {"type": "string"}, "content": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"]}}, "required": ["action"]},
+        },
+    },
+
+    {
+        "type": "function",
+        "function": {
+            "name": "image_generate",
+            "description": "AI图片生成。根据文字描述生成图片，返回图片URL",
+            "parameters": {"type": "object", "properties": {"prompt": {"type": "string", "description": "图片描述（英文效果最佳）"}, "aspect_ratio": {"type": "string", "enum": ["1:1", "16:9", "9:16", "4:3", "3:4"], "description": "图片比例，默认1:1"}}, "required": ["prompt"]},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "text_to_speech",
+            "description": "文字转语音。将文本转为语音音频，返回音频文件路径",
+            "parameters": {"type": "object", "properties": {"text": {"type": "string", "description": "要转为语音的文本"}, "voice": {"type": "string", "description": "语音类型，如 zh-CN-XiaoxiaoNeural"}}, "required": ["text"]},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "terminal",
+            "description": "执行Shell命令并返回输出。可用于系统管理、文件操作等",
+            "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "要执行的Shell命令"}, "timeout": {"type": "integer", "description": "超时秒数，默认30"}}, "required": ["command"]},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "process",
+            "description": "管理后台进程。查看、轮询、终止后台运行的进程",
+            "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["list", "poll", "log", "kill"]}, "session_id": {"type": "string", "description": "进程会话ID"}}, "required": ["action"]},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cronjob",
+            "description": "管理定时任务。创建、查看、更新、暂停、恢复、删除定时任务",
+            "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["create", "list", "update", "pause", "resume", "run", "remove"]}, "job_id": {"type": "string"}, "schedule": {"type": "string", "description": "调度时间，如 every 2h, 0 9 * * *"}, "prompt": {"type": "string", "description": "任务内容"}, "name": {"type": "string"}}, "required": ["action"]},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "video_generate",
+            "description": "AI视频生成。根据文字描述或图片生成视频",
+            "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "image_url": {"type": "string", "description": "参考图片URL（可选）"}}, "required": ["prompt"]},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "video_analyze",
+            "description": "视频分析。分析视频内容，提取关键信息",
+            "parameters": {"type": "object", "properties": {"video_path": {"type": "string"}, "question": {"type": "string"}}, "required": ["video_path"]},
+        },
     },
 ]
 
@@ -294,6 +374,24 @@ TOOLS = [
 HA_URL = os.environ.get("QL_HA_URL", "http://localhost:8123")
 HA_TOKEN = os.environ.get("QL_HA_TOKEN", "")
 
+
+
+def _hermes_tool_call(tool_name, tool_args, timeout=120):
+    """通用桥接：调用 Hermes 9123 执行单个工具。"""
+    try:
+        import stream_api
+        body = {"model": "deepseek-v4-flash",
+                "messages": [{"role": "system", "content": "你是工具执行助手。直接调用工具完成任务。"},
+                             {"role": "user", "content": f"请使用 {tool_name} 工具完成：{json.dumps(tool_args, ensure_ascii=False)}"}],
+                "stream": False, "max_tokens": 2000}
+        req = urllib.request.Request(stream_api.HERMES_URL, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", "Authorization": "Bearer " + stream_api.HERMES_KEY}, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            result = json.loads(r.read())
+        c = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return c or f"({tool_name} 无返回内容)"
+    except Exception as e:
+        return f"{tool_name} 桥接失败：{str(e)[:150]}"
 
 def _sh(cmd, timeout=15):
     """WARNING: shell=True — cmd 必须经过白名单/正则净化，禁止直接拼接用户输入。
@@ -315,11 +413,11 @@ def _fmt_kb(kb):
 
 
 def _disk_usage():
-    """宿主存储卷磁盘状态：各存储卷容量/已用/可用/使用率 + 顶层主要占用。
+    """存储卷磁盘状态：容量/已用/可用/使用率 + 各卷顶层主要占用。
     qingliao 跑在宿主 systemd，df/du 天然是宿主视角（区别于容器内 df 只见自身挂载）。
     注意：勿用 df -hT | head -8——系统分区会占满前 8 行，/volume3 被截断（历史 bug）。"""
     out = []
-    df = _sh("df -h /volume1 /volume2 /volume3", timeout=20)
+    df = _sh("df -h /data", timeout=20)
     for row in df.splitlines()[1:]:
         p = row.split()
         if len(p) < 6:
@@ -360,7 +458,24 @@ def execute(name, args, agent_model=None, agent_provider=None):
             except Exception:
                 return "温度查询失败"
         if name == "get_memory_usage":
-            return _sh("free -h | awk 'NR==1 || /Mem/ {print}'")
+            # v3.2.3: 容器 python:3.11-slim 无 procps(free) -> 改读 /proc/meminfo
+            # (容器共享宿主内核, MemTotal/MemAvailable = 宿主视角, 杜绝 free: not found)
+            try:
+                info = {}
+                with open("/proc/meminfo", encoding="utf-8") as f:
+                    for line in f:
+                        k, _, v = line.partition(":")
+                        if v.strip():
+                            info[k.strip()] = int(v.strip().split()[0])
+                total = info.get("MemTotal", 0)
+                avail = info.get("MemAvailable", total)
+                used = total - avail
+                pct = int(used * 100 / total) if total else 0
+                flag = " 🔴" if pct >= 90 else (" ⚠️" if pct >= 80 else "")
+                return ("内存：共 " + _fmt_kb(total) + "，已用 " + _fmt_kb(used)
+                        + "，可用 " + _fmt_kb(avail) + "（" + str(pct) + "%）" + flag)
+            except Exception as e:
+                return "内存查询失败：" + str(e)
         if name == "docker_ps":
             return _sh("docker ps -a --format '{{.Names}}|{{.Status}}' | head -15")
         if name == "docker_action":
@@ -421,12 +536,17 @@ def execute(name, args, agent_model=None, agent_provider=None):
         if name == "list_files":
             return _list_files(args.get("path", "."))
         if name == "search_files":
-            return _search_files(args.get("pattern", ""), args.get("path", "/volume1"))
+            return _search_files(args.get("pattern", ""), args.get("path", os.environ.get("QL_NAS_ROOT", "/data")))
         if name == "execute_code":
             return _execute_code(args.get("code", ""), args.get("language", "python"))
         if name == "delegate_task":
             return _delegate_task(args.get("task", ""), agent_model, agent_provider)
-        return f"未知工具 {name}"
+        if name == "web_extract":
+            return _hermes_tool_call("web_extract", {"urls": [args.get("url", "")]})
+        if name == "patch_file":
+            return _hermes_tool_call("patch", {"path": args.get("path", ""), "old_string": args.get("old_string", ""), "new_string": args.get("new_string", "")})
+        if name == "todo":
+            return _hermes_tool_call("todo", args)
     except Exception as e:
         return f"工具执行异常: {e}"
 
@@ -516,7 +636,7 @@ def _list_files(path='.'):
         return f"列目录失败：{str(e)[:150]}"
 
 
-def _search_files(pattern, path='/volume1'):
+def _search_files(pattern, path=os.environ.get("QL_NAS_ROOT", "/data")):
     """按文件名搜索"""
     if not pattern:
         return "搜索词为空"

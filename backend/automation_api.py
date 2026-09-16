@@ -11,6 +11,7 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
+import rules_engine   # v3.9.21：条件自动化规则引擎（时间窗/HA状态/上报事件 → 边沿触发）
 from http.server import BaseHTTPRequestHandler
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -99,6 +100,47 @@ def _save(items):
             os.replace(tmp, AUTO_FILE)
         except Exception:
             pass
+
+
+def exec_rule_actions(actions):
+    """条件规则的动作执行：kind=ha（HA 服务调用，兼容旧格式）/ kind=push（微信推送队列）"""
+    ha_list = [a for a in (actions or []) if (a.get("kind") or "ha") == "ha"]
+    ok, results = exec_actions(ha_list) if ha_list else (0, [])
+    for a in (actions or []):
+        if (a.get("kind") or "ha") == "push":
+            try:
+                import push_api
+                push_api.enqueue(a.get("text") or "")
+                results.append("✅ push")
+            except Exception as e:
+                results.append("❌ push：" + str(e)[:50])
+    return ok, results
+
+
+def _exec_rule(rule, details):
+    """rules_engine.tick 的执行器：跑动作 + 日志 + 微信推送（可用 silent 关）+ 执行历史"""
+    actions = rule.get("actions") or []
+    ok, results = exec_rule_actions(actions)
+    why = "；".join([d.get("why", "") for d in (details or [])[:3]])
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%m-%d %H:%M:%S')}] 规则「{rule.get('name')}」"
+                    f"{'执行成功' if ok else '执行失败'} | 依据：{why} | {'; '.join(results)}\n")
+    except Exception:
+        pass
+    if not rule.get("silent"):
+        try:
+            import push_api
+            push_api.enqueue(f"⚡️ 规则「{rule.get('name')}」已触发：{'✅ 成功' if ok else '❌ 失败'}"
+                             + (f"（{'; '.join(results[:2])}）" if results else "")
+                             + (f"\n依据：{why}" if why else ""))
+        except Exception:
+            pass
+    try:
+        append_history("规则", rule.get("name"), ok, "; ".join(results[:2]))
+    except Exception:
+        pass
+    return ok, "；".join(results[:2])
 
 
 def exec_actions(actions):
@@ -203,6 +245,11 @@ def _scheduler():
                     except Exception:
                         pass
                 _save(remaining)
+            # v3.9.21：条件规则求值（边沿触发 + 冷却 + 小时限额由 rules_engine 管）
+            try:
+                rules_engine.tick(_exec_rule)
+            except Exception:
+                pass
         except Exception:
             pass
         time.sleep(3)
@@ -250,7 +297,10 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth():
             self._send(401, {"ok": False, "error": "unauthorized"})
             return
-        if self.path.startswith("/api/automations/list"):
+        if self.path.startswith("/api/automations/rules"):
+            self._send(200, {"ok": True, "rules": rules_engine.list_rules(),
+                             "events": rules_engine.load_events()[-20:]})
+        elif self.path.startswith("/api/automations/list"):
             self._send(200, {"ok": True, "automations": list_automations()})
         elif self.path.startswith("/api/history"):
             # v2.0.116：执行历史（自动化 + 场景）；v2.0.132：load_history 统一补 id
@@ -263,7 +313,42 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth():
             self._send(401, {"ok": False, "error": "unauthorized"})
             return
-        if self.path.startswith("/api/automations/create"):
+        if self.path.startswith("/api/automations/rule"):
+            # 建规则 {name, trigger, actions, enabled?, silent?}；
+            # 带 dry=true → 只干跑不落库；带 id+enabled → 启停切换
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                d = json.loads(self.rfile.read(n) or b"{}")
+                if d.get("dry"):
+                    self._send(200, {"ok": True, "simulate": rules_engine.simulate(d)})
+                elif d.get("id") and ("enabled" in d):
+                    self._send(200, {"ok": rules_engine.toggle_rule(d["id"], d["enabled"]),
+                                     "rules": rules_engine.list_rules()})
+                else:
+                    ok, msg = rules_engine.create_rule(d.get("name", ""), d.get("trigger") or {},
+                                                       d.get("actions") or [], d.get("enabled", True))
+                    self._send(200, {"ok": ok, "message": msg, "rules": rules_engine.list_rules()})
+            except Exception as e:
+                self._send(400, {"ok": False, "error": str(e)[:200]})
+        elif self.path.startswith("/api/automations/simulate"):
+            # 干跑：只求值不执行
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                d = json.loads(self.rfile.read(n) or b"{}")
+                self._send(200, {"ok": True, "simulate": rules_engine.simulate(d)})
+            except Exception as e:
+                self._send(400, {"ok": False, "error": str(e)[:200]})
+        elif self.path.startswith("/api/automations/event"):
+            # App / 快捷指令上报事件 {event, ...}；立即求值一次，不等 3s tick
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                d = json.loads(self.rfile.read(n) or b"{}")
+                ev = rules_engine.push_event(d)
+                fired = rules_engine.tick(_exec_rule) if ev else []
+                self._send(200 if ev else 400, {"ok": bool(ev), "event": ev, "fired": fired})
+            except Exception as e:
+                self._send(400, {"ok": False, "error": str(e)[:200]})
+        elif self.path.startswith("/api/automations/create"):
             try:
                 n = int(self.headers.get("Content-Length") or 0)
                 d = json.loads(self.rfile.read(n) or b"{}")
@@ -280,7 +365,11 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth():
             self._send(401, {"ok": False, "error": "unauthorized"})
             return
-        if self.path.startswith("/api/automations/"):
+        if self.path.startswith("/api/automations/rule/"):
+            rid = self.path.rsplit("/", 1)[-1]
+            self._send(200, {"ok": rules_engine.delete_rule(rid),
+                             "rules": rules_engine.list_rules()})
+        elif self.path.startswith("/api/automations/"):
             aid = self.path.rsplit("/", 1)[-1]
             ok = cancel_automation(aid)
             self._send(200, {"ok": ok, "automations": list_automations()})
@@ -303,3 +392,4 @@ class Handler(BaseHTTPRequestHandler):
 
 # import 时启动调度器（qingliao_all 单进程 import 各模块）
 start_scheduler()
+

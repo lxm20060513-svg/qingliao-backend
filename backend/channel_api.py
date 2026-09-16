@@ -12,7 +12,6 @@ wechat-profile = Hermes 独立 profile，微信通道经 profile_routes 路由�
 视觉模型逻辑（Hermes agent.image_input_mode: auto 原生支持）：
 主模型 supports_vision → 原生传图用主模型；主模型不支持 + auxiliary.vision 显式配置 → 用视觉模型兜底。
 """
-import os
 import json, os, subprocess, threading, hmac
 from http.server import BaseHTTPRequestHandler
 import auth_api
@@ -21,10 +20,11 @@ try:
 except ImportError:
     _yaml = None
 
-# wechat-profile 的 config.yaml（宿主路径）
-_DEFAULT_CFG = os.environ.get("QL_CONFIG_YAML", "/data/profiles/wechat-profile/config.yaml")
-_FALLBACK_CFG = os.environ.get("QL_CONFIG_YAML_FALLBACK", "/data/profiles/wechat-profile/config.yaml")
-# v3.0.81：容器内 /volume1 可能不存在，fallback 到 /opt/data 路径
+# 2026-09-09：wechat-profile 已删除，微信通道由 default profile（主 config.yaml）服务。
+# 模型写入主 config.yaml 的 model 段，重启 default gateway 生效。
+# v3.0.83：QL_WECHAT_PROFILE_CFG env 已在 compose 中改指主 config.yaml（旧值指向已删 profile 会 500）。
+_DEFAULT_CFG = os.environ.get("QL_CONFIG_YAML", "/data/hermes_config.yaml")
+_FALLBACK_CFG = "/data/hermes_config.yaml"
 PROFILE_CFG = os.environ.get("QL_WECHAT_PROFILE_CFG") or (
     _DEFAULT_CFG if os.path.exists(_DEFAULT_CFG) else _FALLBACK_CFG
 )
@@ -42,6 +42,30 @@ VALID_PROVIDERS = {
 def _normalize_provider(provider):
     """App 端 provider 名 → wechat-profile providers 段实际名（local → ollama）"""
     return "ollama" if provider == "local" else provider
+
+
+def _config_provider_keys():
+    """2026-09-09：读主 config.yaml providers 段的一级 key（动态白名单，
+    防止硬编码集合漏掉 zai-coding 等实际存在的 provider 而误报 400）。"""
+    try:
+        with open(PROFILE_CFG, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except Exception:
+        return set()
+    keys = set()
+    in_providers = False
+    for ln in lines:
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        if not (ln[0] in " \t"):
+            in_providers = (s == "providers:")
+            continue
+        if in_providers and ln.startswith("  ") and not ln.startswith("   "):
+            k = s.split(":", 1)[0].strip()
+            if k:
+                keys.add(k)
+    return keys
 
 
 def _is_model_header(ln):
@@ -402,7 +426,7 @@ class Handler(BaseHTTPRequestHandler):
         if not model or not provider:
             self._send(400, {"error": "model and provider required"})
             return
-        if provider not in VALID_PROVIDERS:
+        if provider not in (VALID_PROVIDERS | _config_provider_keys()):
             self._send(400, {"error": "unsupported provider: %s" % provider})
             return
         with _lock:
@@ -431,7 +455,7 @@ class Handler(BaseHTTPRequestHandler):
         if not model or not provider:
             self._send(400, {"error": "model and provider required"})
             return
-        if provider not in VALID_PROVIDERS:
+        if provider not in (VALID_PROVIDERS | _config_provider_keys()):
             self._send(400, {"error": "unsupported provider: %s" % provider})
             return
         with _lock:

@@ -18,7 +18,6 @@ import importlib
 import sys
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-# ── 路由表：prefix -> (module_name, handler_class_name) ──
 ROUTE_TABLE = {
     "/api/ha":        ("ha_proxy",     "HAProxyHandler"),
     "/api/logs":      ("logs_api",     "LogsHandler"),
@@ -33,18 +32,36 @@ ROUTE_TABLE = {
     "/api/memory":    ("memory_api",   "MemoryHandler"),
     "/api/weather":   ("weather_api",  "WeatherHandler"),
     "/api/scenes":    ("scenes_api",   "Handler"),
-    "/api/asr":       ("asr_api",      "Handler"),
     "/api/agent":     ("agent_api",    "Handler"),
+    "/api/agent/tool": ("stream_api",  "StreamHandler"),
     "/api/automations": ("automation_api", "Handler"),
     "/api/push":      ("push_api",     "Handler"),
     "/api/local":     ("local_api",    "Handler"),
-    "/api/bots":      ("bots_api",     "Handler"),
     "/api/notes":     ("notes_api",    "Handler"),
+    "/api/inbox":     ("inbox_api",    "Handler"),
     "/api/channel":   ("channel_api",  "Handler"),
+    "/api/router":   ("router_api",  "Handler"),
+    "/api/mcp":      ("mcp_api",     "Handler"),
+    "/api/diag":     ("diag_api",    "DiagHandler"),
+    "/api/life":      ("life_api",    "LifeHandler"),
+    # v3.9.18 危险操作确认闸门：Hermes pre_tool_call 插件 ↔ 本后端 ↔ App 三方链路
+    # 2026-08-22 docker 化后补挂：App/WebUI 主链路（/api/nas、/api/stream）
+    # 此前 9127 直连这两个前缀 404，仅 nginx->9132 路径可用
+    "/api/nas":     ("stream_api",  "StreamHandler"),
+    "/api/stream":  ("stream_api",  "StreamHandler"),
+    "/api/tasks":   ("stream_api",  "StreamHandler"),
+    # v3.4.25: 16666(lucky) 别名（lucky 未放行 /api/tasks 前缀，借 /api/agent 前缀）
+    "/api/agent/tasks": ("stream_api", "StreamHandler"),
+    # v3.9.22（B3）TTS 能力探测：/api/agent/tts/probe（借 /api/agent 前缀，零 nginx/relay 改动）
+    "/api/agent/tts": ("stream_api", "StreamHandler"),
+    # v3.9.21（B2）用量统计：同样借 /api/agent 前缀（lucky 白名单 + relay 已含 /api/agent，
+    # 故 nginx 三份 conf 无需改动；/api/usage 仅供内网直连调试）
+    "/api/usage": ("stream_api", "StreamHandler"),
+    "/api/agent/usage": ("stream_api", "StreamHandler"),
 }
 
 # 缓存已导入的模块和 Handler 类
-_handler_cache = {}  # prefix -> handler_class
+_handler_cache = {}
 
 
 def _load_handler(prefix):
@@ -64,8 +81,8 @@ def _load_handler(prefix):
         return None
 
 
-def _resolve_handler_class(path):
-    """根据请求路径匹配路由表，返回 handler_class 或 None"""
+def _resolve_handler(path):
+    """根据请求路径匹配路由表（最长前缀优先）"""
     for prefix in sorted(ROUTE_TABLE.keys(), key=len, reverse=True):
         if path.startswith(prefix):
             return _load_handler(prefix)
@@ -138,19 +155,19 @@ class RouterHandler(BaseHTTPRequestHandler):
     """
 
     def do_GET(self):
-        handler_cls = _resolve_handler_class(self.path)
+        handler_cls = _resolve_handler(self.path)
         _delegate_to_handler(handler_cls, self)
 
     def do_POST(self):
-        handler_cls = _resolve_handler_class(self.path)
+        handler_cls = _resolve_handler(self.path)
         _delegate_to_handler(handler_cls, self)
 
     def do_PUT(self):
-        handler_cls = _resolve_handler_class(self.path)
+        handler_cls = _resolve_handler(self.path)
         _delegate_to_handler(handler_cls, self)
 
     def do_DELETE(self):
-        handler_cls = _resolve_handler_class(self.path)
+        handler_cls = _resolve_handler(self.path)
         _delegate_to_handler(handler_cls, self)
 
     def log_message(self, format, *args):

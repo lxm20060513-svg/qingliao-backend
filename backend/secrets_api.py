@@ -1,4 +1,3 @@
-import os
 import json, os, uuid, threading
 from cryptography.fernet import Fernet
 from http.server import BaseHTTPRequestHandler, HTTPServer

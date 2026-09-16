@@ -26,15 +26,34 @@
 | 9145 | agent | Agent 记忆规则管理（「以后XX都用agent」话术） |
 | 9146 | automation | 定时自动化（「X分钟后执行Y」延迟动作，到点自动执行后消失） |
 | 9147 | push | 微信推送队列（enqueue/pending/done + 推送开关，X-Push-Token 鉴权） |
+| — | inbox | 收件箱（外部 agent 出站消息，App 收件箱页轮询） |
+| — | life | 生活数据（备忘录/便签/生活记录） |
+| — | mcp | MCP 工具服务（App「MCP工具服务」配置写入 Hermes） |
+| — | channel | 渠道管理（微信通道模型路由） |
+| — | usage | 用量统计 |
+| — | media | MEDIA: 协议转换（AI 回复内图片/文件渲染） |
 
-## 🚀 快速开始
+## 🚀 快速开始（一键安装）
 
 ```bash
-git clone <本仓库>
+git clone https://github.com/lxm20060513-svg/qingliao-backend.git
+cd qingliao-backend
+bash install.sh
+```
+
+安装脚本会引导设置访问密码与上游 LLM 端点，生成 `.env`，构建并启动容器，最后做健康检查。
+
+<details>
+<summary>手动部署（不用脚本）</summary>
+
+```bash
+git clone https://github.com/lxm20060513-svg/qingliao-backend.git
 cd qingliao-backend
 # 编辑 docker-compose.yml 设置 QL_PASSWORD 等环境变量
 docker compose up -d
 ```
+
+</details>
 
 服务启动后，各 API 以 `/api/<模块>/` 前缀对外暴露（建议用 nginx 反代统一入口）。
 

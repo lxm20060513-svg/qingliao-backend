@@ -209,6 +209,51 @@ def query_siliconflow() -> dict:
                 "available": False, "error": str(e)[:150]}
 
 
+def query_zai_coding() -> dict:
+    """v3.4.18: 智谱 GLM Coding Plan 余量（官方 GET /api/monitor/usage/quota/limit）。
+    limits: 5小时窗口(unit=3,number=5) + 周窗口(unit=6,number=1)。
+    usage=总额度, currentValue=已用, remaining=剩余, percentage=已用百分比。
+    key 优先自定义 provider, 兜底 config.yaml。"""
+    p = _provider_cfg("zai-coding")
+    key = _custom_key("zai-coding") or p.get("api_key", "")
+    if not key:
+        return {"provider": "zai-coding", "name": "智谱 Coding Plan", "mode": "plan",
+                "available": False, "error": "未配置 api_key"}
+    try:
+        _, j = _get_json("https://open.bigmodel.cn/api/monitor/usage/quota/limit", key)
+        if not j.get("success"):
+            raise RuntimeError(str(j.get("msg"))[:100])
+        d = j.get("data") or {}
+        windows = []
+        for l in d.get("limits") or []:
+            total = l.get("usage") or 0
+            used = l.get("currentValue") or 0
+            remain = l.get("remaining")
+            if remain is None:
+                remain = max(total - used, 0)
+            if l.get("unit") == 3:
+                label = "5小时窗口"
+            elif l.get("unit") == 6:
+                label = "周窗口"
+            else:
+                label = str(l.get("type", ""))
+            windows.append({
+                "label": label,
+                "total": total, "used": used, "remaining": remain,
+                "used_pct": l.get("percentage"),
+                "next_reset": l.get("nextResetTime"),
+            })
+        return {
+            "provider": "zai-coding", "name": "智谱 Coding Plan", "mode": "plan",
+            "available": bool(windows),
+            "level": d.get("level"),
+            "windows": windows,
+        }
+    except Exception as e:
+        return {"provider": "zai-coding", "name": "智谱 Coding Plan", "mode": "plan",
+                "available": False, "error": str(e)[:150]}
+
+
 def collect_usage():
     """聚合全部可查询 provider；不可查询的标注 unsupported（App 显示控制台查看）
     v3.0.80：遍历 config providers 段——新增 provider 自动出现在看板，无需改代码。
@@ -222,7 +267,7 @@ def collect_usage():
             providers[pid] = cp
     DISPLAY = {"deepseek": "DeepSeek", "stepfun": "阶跃 StepFun",
                "opencode": "OpenCode", "opencode-apple": "OpenCode",
-               "xiaomi": "小米 MiMo", "sensenova": "商汤 SenseNova", "zai": "智谱 Z.ai",
+               "xiaomi": "小米 MiMo", "sensenova": "商汤 SenseNova", "zai": "智谱 Z.ai", "zai-coding": "智谱 Coding Plan",
                "siliconflow": "硅基流动"}
     out = []
     for pid in providers.keys():
@@ -232,6 +277,8 @@ def collect_usage():
             out.append(query_stepfun())
         elif pid in ("opencode", "opencode-apple"):
             out.append(query_opencode(pid))
+        elif pid in ("zai-coding", "zai"):
+            out.append(query_zai_coding())
         elif pid == "siliconflow":
             # v3.1.2：官方 /v1/user/info 已废弃(410 deprecated,2026-08实测)，无公开余额接口→降级 unsupported
             out.append({"provider": pid, "name": DISPLAY.get(pid, pid),

@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """微信推送队列（v2.0.113）：事件方（自动化执行/定时提醒/异常告警）入队，
-Hermes cron 脚本每分钟拉取并投递微信。
+Hermes cron 脚本每分钟拉取并投递微信（2026-08-22 延迟优化：入队后立即经
+Hermes 容器内 relay(9460) 投递，成功即标记 done；失败/relay 不可达时
+队列保留，由 cron 每分钟兜底重投）。
 
 存储：QL_DATA_DIR/push_queue.json  [{id, text, ts, status: pending|sending|done}]
 """
@@ -8,6 +10,7 @@ import json
 import os
 import threading
 import time
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler
 
@@ -17,7 +20,44 @@ QUEUE_FILE = os.path.join(DATA_DIR, "push_queue.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "push_settings.json")
 PUSH_TOKEN = os.environ.get("QL_PUSH_TOKEN", "ql-push-default")
 
-_lock = threading.RLock()  # RLock：enqueue 外层持锁内调 _save 也持锁（v3.0.28 review 嵌套导致 Lock 自死锁，2026-08-22 Phase 3 修复）
+_lock = threading.RLock()
+RELAY_GRACE = 10          # 入队后给 relay 即时投递的宽限秒数，期间 cron 不拉（防竞态重复）
+_RELAY_IP_CACHE = {"t": 0, "ip": None}   # docker 容器 IP 缓存（docker 重启后 IP 可能变）
+
+
+def _resolve_relay_url():
+    """解析 Hermes 容器内 relay 地址：docker inspect 动态查 IP（缓存 5 分钟），失败用默认"""
+    now = time.time()
+    if now - _RELAY_IP_CACHE["t"] > 300:
+        try:
+            out = os.popen("docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' " + os.environ.get("QL_HERMES_CONTAINER", "hermes-container") + " 2>/dev/null").read()
+            ip = (out.strip().split() or [None])[0]
+            if ip:
+                _RELAY_IP_CACHE["ip"] = ip
+                _RELAY_IP_CACHE["t"] = now
+        except Exception:
+            pass
+    if _RELAY_IP_CACHE["ip"]:
+        return "http://%s:9460" % _RELAY_IP_CACHE["ip"]
+    return os.environ.get("QL_RELAY_URL", "http://172.21.0.2:9460")
+
+
+def notify_relay(mid, text):
+    """入队后立即投递（延迟优化：不等 cron 每分钟轮询）。成功→mark_done；失败→留队列给 cron 兜底。"""
+    try:
+        req = urllib.request.Request(
+            _resolve_relay_url() + "/send",
+            data=json.dumps({"text": text}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-Push-Token": PUSH_TOKEN},
+            method="POST")
+        resp = json.loads(urllib.request.urlopen(req, timeout=10).read() or b"{}")
+        if resp.get("ok") or resp.get("success"):
+            mark_done(mid)
+            return True
+    except Exception:
+        pass
+    return False
+  # RLock：enqueue 外层持锁内调 _save 也持锁（v3.0.28 review 嵌套导致 Lock 自死锁，2026-08-22 Phase 3 修复）
 
 
 def _load_settings():
@@ -79,6 +119,9 @@ def enqueue(text):
         if len(items) > 50:
             items = items[-50:]
         _save(items)
+        new_id = items[-1]["id"]
+    # 2026-08-22 延迟优化：入队后立即通知 Hermes relay 投递（不阻塞响应；失败由 cron 兜底）
+    threading.Thread(target=notify_relay, args=(new_id, text), daemon=True).start()
     return True, "已入队"
 
 
@@ -89,7 +132,9 @@ def pending():
     picked = []
     rest = []
     for it in items:
-        if it.get("status") == "pending":
+        if it.get("status") == "pending" and now - (it.get("ts") or 0) < RELAY_GRACE:
+            rest.append(it)  # 入队 <10s：relay 即时投递窗口内，cron 不拉（防竞态重复）
+        elif it.get("status") == "pending":
             it["status"] = "sending"
             picked.append(it)
         else:

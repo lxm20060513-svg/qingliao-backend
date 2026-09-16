@@ -39,12 +39,12 @@ def _expire_chunks(now):
                 pass
 
 # 安全根目录：轻聊数据目录（前端只允许浏览这里）
-ROOT = os.environ.get('QL_DATA_DIR', '/data')
+ROOT = 'os.environ.get("QL_DATA_DIR", "/data")'
 # 额外允许浏览的目录（只读列表，不在此列表的根不可访问）
-# 注意：不包含配置根目录（其下有配置等敏感文件）
+# 注意：不包含 hermes-data 根（其下有 config.yaml 等敏感文件）
 ALLOWED_ROOTS = [ROOT]
 # 上传目标目录
-UPLOAD_DIR = os.environ.get('QL_UPLOAD_DIR', '/data/uploads')
+UPLOAD_DIR = os.environ.get('QL_UPLOAD_DIR', os.path.join(DATA_DIR_FALLBACK(), 'uploads'))
 
 
 def resolve_path(p):
@@ -71,6 +71,31 @@ def resolve_path(p):
             continue
     return None, None
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v3.9.19：下载/预览门禁。原先 is_visible 只在 list_dir 生效 → download/preview
+# 可直连取到数据目录下的隐藏文件（实测 data/.secrets_key 可被带 token 下载）。
+# 沙箱根本来已限死（data/ + uploads/）且需要鉴权，故严重度为低；但补这一层零成本。
+# ─────────────────────────────────────────────────────────────────────────────
+_BLOCKED_NAMES = {'.env', '.env.local', '.secrets_key', 'auth.json', 'auth_tokens.json',
+                  'secrets.json', '.inbox_token', '.nas_cred', 'credentials.json'}
+_BLOCKED_SUFFIX = ('.key', '.pem', '.p12', '.pfx')
+_BLOCKED_PREFIX = ('id_rsa', 'id_ed25519')
+
+
+def is_downloadable(abs_path):
+    """download/preview 前的门禁：隐藏文件、敏感文件名、密钥类后缀一律不放行。"""
+    name = os.path.basename(abs_path or '')
+    if not name or not is_visible(name):
+        return False
+    low = name.lower()
+    if low in _BLOCKED_NAMES or low.endswith(_BLOCKED_SUFFIX) or low.startswith(_BLOCKED_PREFIX):
+        return False
+    return True
+
+
+# 限额集中定义（原先散落各处，改之前先看这里）
+MAX_PREVIEW_BYTES = 200000          # /api/files/preview 文本预览截断
 
 def is_visible(name):
     """过滤隐藏文件/系统文件"""
@@ -118,6 +143,10 @@ class FilesHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Files-Password, X-Auth-Token")
 
     def _check_auth(self):
+        # v3.0.74: pin endpoints skip FILES_PASSWORD (auth via main proxy)
+        parsed_ck = urllib.parse.urlparse(self.path)
+        if parsed_ck.path.startswith('/api/files/pin_'):
+            return True
         import auth_api
         return auth_api.check_auth(self.headers, 'X-Files-Password', FILES_PASSWORD)
 
@@ -198,6 +227,10 @@ class FilesHandler(http.server.BaseHTTPRequestHandler):
             if not abs_path or not os.path.isfile(abs_path):
                 self.send_error(404)
                 return
+            # v3.9.19：敏感/隐藏文件不放行（原先只过滤了列目录）
+            if not is_downloadable(abs_path):
+                self._send_json(403, {"error": "该文件不允许下载"})
+                return
             name = os.path.basename(abs_path)
             size = os.path.getsize(abs_path)
             self.send_response(200)
@@ -221,6 +254,10 @@ class FilesHandler(http.server.BaseHTTPRequestHandler):
             abs_path, _ = resolve_path(path_param)
             if not abs_path or not os.path.isfile(abs_path):
                 self.send_error(404)
+                return
+            # v3.9.19：敏感/隐藏文件不放行（与 download 同一门禁）
+            if not is_downloadable(abs_path):
+                self._send_json(403, {"error": "该文件不允许预览"})
                 return
             ext = os.path.splitext(abs_path)[1].lower()
             # 图片直接返回（浏览器可预览），文本转码
@@ -249,7 +286,7 @@ class FilesHandler(http.server.BaseHTTPRequestHandler):
             if ext in ('.txt', '.md', '.json', '.log', '.html', '.htm', '.css', '.js', '.py', '.yml', '.yaml', '.conf', '.ini', '.csv', '.xml'):
                 try:
                     with open(abs_path, 'rb') as f:
-                        data = f.read(200000)
+                        data = f.read(MAX_PREVIEW_BYTES)
                     text = data.decode('utf-8', errors='replace')
                 except OSError as e:
                     body = json.dumps({"error": str(e)}).encode()
@@ -260,7 +297,7 @@ class FilesHandler(http.server.BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(body)
                     return
-                body = json.dumps({"text": text, "truncated": os.path.getsize(abs_path) > 200000}).encode()
+                body = json.dumps({"text": text, "truncated": os.path.getsize(abs_path) > MAX_PREVIEW_BYTES}).encode()
                 self.send_response(200)
                 self._cors()
                 self.send_header("Content-Type", "application/json")
@@ -278,6 +315,25 @@ class FilesHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+
+        # v3.0.74: pin read (NAS file -> base64)
+        if parsed.path.startswith('/api/files/pin_read'):
+            pin_path = params.get('path', [''])[0]
+            if not pin_path:
+                self._send_json(400, {"error": "missing path"})
+                return
+            if not pin_path.endswith('.json'):
+                self._send_json(403, {"error": "only .json allowed"})
+                return
+            try:
+                with open(pin_path, 'rb') as f:
+                    d = f.read()
+                self._send_json(200, {"data": base64.b64encode(d).decode()})
+            except FileNotFoundError:
+                self._send_json(200, {"data": None})
+            except OSError as e:
+                self._send_json(500, {"error": str(e)[:150]})
+            return
         self.send_error(404)
 
     def do_POST(self):
@@ -515,6 +571,26 @@ class FilesHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+
+        # v3.0.74: pin write (base64 -> NAS file)
+        if parsed.path.startswith('/api/files/pin_write'):
+            body = self._read_json()
+            if not body or 'path' not in body or 'data' not in body:
+                self._send_json(400, {"error": "missing path/data"})
+                return
+            pin_path = body['path']
+            if not pin_path.endswith('.json'):
+                self._send_json(403, {"error": "only .json allowed"})
+                return
+            try:
+                os.makedirs(os.path.dirname(pin_path), exist_ok=True)
+                d = base64.b64decode(body['data'])
+                with open(pin_path, 'wb') as f:
+                    f.write(d)
+                self._send_json(200, {"ok": True, "size": len(d)})
+            except Exception as e:
+                self._send_json(500, {"error": str(e)[:150]})
+            return
         self.send_error(404)
 
     def log_message(self, fmt, *args):

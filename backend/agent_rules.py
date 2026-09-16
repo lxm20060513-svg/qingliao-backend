@@ -11,7 +11,7 @@ import re
 import time
 import uuid
 
-DATA_DIR = os.environ.get("QL_DATA_DIR", os.environ.get("QL_DATA_DIR", "/data"))
+DATA_DIR = os.environ.get("QL_DATA_DIR", "/data")
 RULES_PATH = os.path.join(DATA_DIR, "agent_rules.json")
 MAX_RULES = 20
 

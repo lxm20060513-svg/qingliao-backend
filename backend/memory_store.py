@@ -10,8 +10,9 @@ import os
 import re
 import tempfile
 import threading
+import time
 
-MEMORY_PATH = os.environ.get("QL_MEMORY_PATH", "/data/memory.json")
+MEMORY_PATH = os.environ.get("QL_DATA_DIR", "/data") + "/memory.json"
 MAX_ENTRIES = 50
 
 # v3.0.6 review fix：记忆 JSON 高并发读写（每条流式消息 inject→add_entry），
@@ -20,14 +21,29 @@ _lock = threading.Lock()
 
 
 def _load():
+    """读记忆条目。v3.9.14：解析失败不再静默返回空——先把损坏文件改名留档。
+
+    原来 `except Exception: return []` 会把「文件损坏」表现成「用户没有记忆」，而调用方
+    紧接着 `_save()` 就用这个空列表覆盖真文件 → 记忆永久丢失、日志里也查不到任何线索。
+    """
     try:
         with open(MEMORY_PATH, encoding="utf-8") as f:
             return json.load(f).get("entries", [])
-    except Exception:
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        try:
+            bad = MEMORY_PATH + ".corrupt-" + time.strftime("%Y%m%d%H%M%S")
+            os.replace(MEMORY_PATH, bad)
+            print("[memory] 记忆文件解析失败，已留档为 %s：%s" % (bad, e), flush=True)
+        except Exception:
+            pass
         return []
 
 
 def _save(entries):
+    """原子写记忆文件（v3.0.6 起就是 mkstemp+fsync+replace；v3.9.14 让失败可见）。"""
+    tmp = None
     try:
         os.makedirs(os.path.dirname(MEMORY_PATH), exist_ok=True)
         # v3.0.6 review fix：tmp + write + flush + fsync + os.replace 原子落盘
@@ -37,12 +53,16 @@ def _save(entries):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, MEMORY_PATH)
-    except Exception:
+        return True
+    except Exception as e:
+        # v3.9.14：原来是静默 pass —— 磁盘满/权限问题导致写失败时，App 仍显示「已记住」。
+        print("[memory] 记忆保存失败：%s" % e, flush=True)
         try:
-            if os.path.exists(tmp):
+            if tmp and os.path.exists(tmp):
                 os.unlink(tmp)
         except Exception:
             pass
+        return False
 
 
 def list_entries():
@@ -59,8 +79,8 @@ def add_entry(text):
         entries = _load()
         if t not in entries:
             entries.append(t)
-            _save(entries)
-            return True
+            # v3.9.14：如实返回落盘结果（原来无论 _save 成败都 return True）
+            return _save(entries)
         return False
 
 
