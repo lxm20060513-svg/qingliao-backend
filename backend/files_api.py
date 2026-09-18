@@ -143,10 +143,13 @@ class FilesHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Files-Password, X-Auth-Token")
 
     def _check_auth(self):
-        # v3.0.74: pin endpoints skip FILES_PASSWORD (auth via main proxy)
-        parsed_ck = urllib.parse.urlparse(self.path)
-        if parsed_ck.path.startswith('/api/files/pin_'):
-            return True
+        # v3.9.39 安全修复：原先 '/api/files/pin_' 直接 return True 放行，而 pin_read/pin_write
+        # 的 path 参数是绝对路径且不经过 resolve_path 沙箱（只校验 .json 后缀）——
+        # 未鉴权即可 GET /api/files/pin_read?path=/data/auth_tokens.json 读出 token 摘要表，
+        # 再 pin_write 一枚自铸摘要，即可通过所有模块的 check_auth（= 全后端鉴权绕过）。
+        # 同时这层豁免还绕开了 is_downloadable 的 _BLOCKED_NAMES 黑名单（该黑名单只对 download 生效）。
+        # App 侧三个 store（PinStore/MemoStore/TodoStore）本就经 auth.json 统一带 X-Auth-Token，
+        # 去掉豁免对客户端零改动。
         import auth_api
         return auth_api.check_auth(self.headers, 'X-Files-Password', FILES_PASSWORD)
 
