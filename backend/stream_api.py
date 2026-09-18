@@ -2526,14 +2526,21 @@ def _relay_query(self):
             return
         # 蜂窝 relay 白名单（v3.0.6 security review：原允许任意 /api/* 造成认证绕过链。
         # 收窄到 App 蜂窝真正会用到的接口；每个接口仍独立校验 X-Auth-Token（下游鉴权不降级））
+        # v3.9.39 A8：按 App 实际发出的 28 个 /api/* 前缀逐条对过，此前缺 nas/hw/inbox/channel/
+        # history/tts 六条，且 "/api/weather/" 带尾斜杠而 App 发 "/api/weather?city=…"（startswith
+        # 不匹配）→ 蜂窝下看板/收件箱/模型切换/执行历史/朗读整片 403，只有聊天能用。
+        # 下游鉴权逐条核实过：StreamHandler do_GET:2180、do_POST:1991 各有 _auth 闸门，
+        # hw_api/inbox_api/channel_api/automation_api/weather_api 均调 auth_api.check_auth。
         ALLOWED_RELAY = (
             "/api/stream/", "/api/auth/", "/api/sessions/",
-            "/api/local/", "/api/weather/", "/api/push/", "/api/scenes",
+            "/api/local/", "/api/weather", "/api/push/", "/api/scenes",
             "/api/automation", "/api/memory", "/api/kb", "/api/docker",
             "/api/secrets", "/api/ha/", "/api/cron", "/api/files", "/api/logs",
             "/api/router/", "/api/agent", "/api/tasks", "/api/mcp",
             "/api/diag",
             "/api/life",
+            "/api/nas/", "/api/hw/", "/api/channel/",
+            "/api/inbox", "/api/history", "/api/tts",
         )
         if not (path.startswith(ALLOWED_RELAY) or path.startswith("/r/")):
             _relay_reply(self, 403, "forbidden")
