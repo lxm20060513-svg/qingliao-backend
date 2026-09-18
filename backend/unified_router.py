@@ -166,6 +166,14 @@ class RouterHandler(BaseHTTPRequestHandler):
         handler_cls = _resolve_handler(self.path)
         _delegate_to_handler(handler_cls, self)
 
+    def do_PATCH(self):
+        # v3.9.40（#17 前置）：原先**没有**这个 handler —— BaseHTTPRequestHandler 对未定义的
+        # 方法直接回 "501 Unsupported method ('PATCH')"，请求根本到不了 cron_api。
+        # cron_api.do_PATCH 一直是完整实现的（代理到 Hermes /api/jobs/{id}），所以 501 的根因
+        # 在这里，不在 cron_api。补上即恢复定时任务的「编辑」能力。
+        handler_cls = _resolve_handler(self.path)
+        _delegate_to_handler(handler_cls, self)
+
     def do_DELETE(self):
         handler_cls = _resolve_handler(self.path)
         _delegate_to_handler(handler_cls, self)

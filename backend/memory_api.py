@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""AI 记忆 API：GET /api/memory/list、POST /api/memory/add、POST /api/memory/delete"""
+"""AI 记忆 API：GET /api/memory/list、POST /api/memory/add|delete|update"""
 import json
 import os
 from http.server import BaseHTTPRequestHandler
@@ -67,6 +67,19 @@ class MemoryHandler(BaseHTTPRequestHandler):
             text = (body.get("text") or "").strip()
             memory_store.delete_entry(text)
             self._send(200, {"ok": True, "message": "已删除", "entries": memory_store.list_entries()})
+            return
+        if parsed.path.startswith("/api/memory/update"):
+            # v3.9.40（#19）：App 记忆面板就地编辑
+            old = (body.get("old") or "").strip()
+            new = (body.get("text") or "").strip()
+            if not new or len(new) < 2:
+                self._send(200, {"ok": False, "message": "内容不能为空",
+                                 "entries": memory_store.list_entries()})
+                return
+            ok = memory_store.update_entry(old, new)
+            self._send(200, {"ok": ok,
+                             "message": "已更新" if ok else "更新失败（原条目不存在或写入出错）",
+                             "entries": memory_store.list_entries()})
             return
         self._send(404, {"error": "Not Found"})
 

@@ -143,7 +143,13 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 n = int(self.headers.get("Content-Length") or 0)
                 d = json.loads(self.rfile.read(n) or b"{}")
-                ok, msg = agent_rules.add_rule(d.get("pattern", ""))
+                # v3.9.40（#19）：带 id = 改现有规则，不带 = 新增。
+                # 走 POST 而不是新加 do_PATCH：/api/agent 已在 ROUTE_TABLE，relay/nginx/lucky
+                # 白名单也只认既有方法，PATCH 要动的东西比这条功能本身多得多（见 cron PATCH 501）。
+                if d.get("id"):
+                    ok, msg = agent_rules.update_rule(d["id"], d.get("pattern", ""))
+                else:
+                    ok, msg = agent_rules.add_rule(d.get("pattern", ""))
                 self._send(200, {"ok": ok, "message": msg, "rules": agent_rules.list_rules()})
             except Exception as e:
                 self._send(400, {"ok": False, "error": str(e)[:200]})

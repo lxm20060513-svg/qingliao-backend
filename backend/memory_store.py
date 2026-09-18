@@ -3,7 +3,7 @@
 
 写入：用户消息含"记住/我是/我喜欢/别忘了"等 → 自动提取存入（去重，上限 50 条）
 注入：entries 非空时作为 system 消息（"关于用户的信息"）
-API：/api/memory/list|add|delete（memory_api.py）
+API：/api/memory/list|add|delete|update（memory_api.py）
 """
 import json
 import os
@@ -93,6 +93,31 @@ def delete_entry(text):
             _save(entries)
             return True
         return False
+
+
+def update_entry(old, new):
+    """就地改写一条记忆（v3.9.40 #19：App 端「编辑」），保持它在列表里的位置不变。
+
+    为什么不做成 delete + add：add_entry 是 append，改完的条目会跳到末尾；而注入 system 时
+    是 "；".join(entries)，条目顺序就是模型读到记忆的次序，位置不该被一次编辑打乱。
+    """
+    o = (old or "").strip()
+    n = (new or "").strip()
+    if not n or len(n) < 2:
+        return False
+    with _lock:
+        entries = _load()
+        if o not in entries:
+            return False
+        i = entries.index(o)
+        if n == o:
+            return True
+        if n in entries:
+            # 改后的内容已存在 → 直接去掉这条，避免记忆里留两份重复
+            entries.pop(i)
+            return _save(entries)
+        entries[i] = n
+        return _save(entries)
 
 
 # 记忆意图检测（记住/我是/我喜欢/别忘了…）

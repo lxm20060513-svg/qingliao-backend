@@ -3,7 +3,7 @@
 
 写入：用户消息含「以后/下次/之后/记住 + XX + agent/工具/直接」→ 提取功能词存规则
 匹配：新请求的最后一条用户消息命中任一规则子串 → 强制走 agent（stream_api._worker 调用）
-管理：/api/agent/rules (list|add|delete)（agent_api.py）
+管理：/api/agent/rules (list|add|delete|update)（agent_api.py）
 """
 import json
 import os
@@ -74,6 +74,25 @@ def delete_rule(rid):
     rules = [r for r in _load() if r.get("id") != rid]
     _save(rules)
     return True, "规则已删除"
+
+
+def update_rule(rid, pattern):
+    """改一条规则的 pattern（v3.9.40 #19：App 端就地编辑）；id / created 保持不变。"""
+    p = (pattern or "").strip()
+    if not p or len(p) < 2 or len(p) > 40:
+        return False, "规则内容太短或太长"
+    rules = _load()
+    target = None
+    for r in rules:
+        if r.get("id") == rid:
+            target = r
+        elif r.get("pattern") == p:
+            return False, f"规则「{p}」已存在"
+    if target is None:
+        return False, "规则不存在"
+    target["pattern"] = p
+    _save(rules)
+    return True, f"已更新：以后「{p}」直接交给 Agent 处理"
 
 
 def extract_from_text(text):
