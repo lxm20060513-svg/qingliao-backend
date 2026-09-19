@@ -16,10 +16,41 @@ import os
 import re
 
 # 容器路径前缀 → 宿主真实路径（按 docker-compose 挂载）
+# BE1 收尾：compose 给的是 QL_HERMES_ROOT_DIR，这里原先读 QL_HERMES_ROOT（没人设过）
+# → 一直吃默认值。两个名字都读，以 compose 那个为准；默认值保持 /data/hermes 不变。
+_HERMES_DATA = os.environ.get("QL_HERMES_DATA_DIR", "/data/hermes")
+_HERMES_ROOT = (os.environ.get("QL_HERMES_ROOT_DIR")
+                or os.environ.get("QL_HERMES_ROOT") or "/data/hermes")
+
 _PREFIX_MAP = [
-    ("/opt/data", os.environ.get("QL_HERMES_DATA_DIR", "/data/hermes")),
-    ("/opt/hermes_host", os.environ.get("QL_HERMES_ROOT", "/data/hermes")),
+    ("/opt/data", _HERMES_DATA),
+    ("/opt/hermes_host", _HERMES_ROOT),
 ]
+
+
+def media_roots():
+    """免鉴权媒体端点（/api/stream/media）允许读取的宿主目录——**唯一出处**。
+    BE1：这里与 stream_api 各自列一份白名单会分叉（改一侧忘另一侧 = 图片全 403 或
+    该挡的没挡），所以映射表里真实用到的宿主目录 + 上传目录都从此函数出。
+
+    刻意不含 QL_DATA_DIR 根部与 sessions/、streams/、kb/：initial_password.txt /
+    auth_config.json / auth_tokens.json 就在那一层。生成物确实会落在 DATA_DIR/files
+    （AI 出图、报告、CSV…），所以**只显式放行 files 子目录**。
+    部署注意：QL_HERMES_HOST_DIR 若指向包含凭据的父目录（例如整个 docker 根），
+    等于把这条收窄作废——按实际语义给到媒体目录本身。
+    """
+    roots = [host for _, host in _PREFIX_MAP]
+    roots += [_HERMES_DATA, _HERMES_ROOT,
+              os.environ.get("QL_HERMES_HOST_DIR", "/data/hermes_host"),
+              os.environ.get("QL_UPLOAD_DIR", "/data/uploads"),
+              os.path.join(os.environ.get("QL_DATA_DIR", "/data"), "files")]
+    out, seen = [], set()
+    for r in roots:
+        if r and r not in seen:
+            seen.add(r)
+            out.append(r)
+    return out
+
 
 # 图片扩展名 → MIME
 _MIME = {
