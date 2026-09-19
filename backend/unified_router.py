@@ -59,11 +59,16 @@ ROUTE_TABLE = {
     "/api/usage": ("stream_api", "StreamHandler"),
     "/api/agent/usage": ("stream_api", "StreamHandler"),
     # v3.9.41（修 bug 清单 C 的另一半）：这两个前缀 App 一直在调、蜂窝 relay 白名单
-    # （stream_api.ALLOWED_RELAY）也已放行，但 9127 这里没有路由 → 蜂窝下必 404
-    # （Wi-Fi 走 nginx 那条链才通）。
-    # 实现本来就在下面这两个模块里，且各自 do_* 开头已有 _auth 闸门，故只需补挂前缀：
-    #   /api/history → automation_api（do_GET 列历史 / do_DELETE 清空或按 ids 删）
-    #   /api/tts     → stream_api.do_POST（云端神经 TTS，按 provider 分发）
+    # （stream_api.ALLOWED_RELAY）也已放行，但 9127 这里没有路由。
+    # ⚠️ 2026-09-19 拿 NAS 的 nginx 实配校正过归因（原先写成「补表 → 蜂窝修好」，只对一半）：
+    #   /api/history → nginx 16668 特化到 **9127**，真的经本表 → 补表是有效修法（此前 404）。
+    #     实现在 automation_api（do_GET:305 列历史 / do_DELETE 分支清空或按 ids 删，开头有 _auth）。
+    #   /api/tts     → nginx 16668 特化到 **9132**（stream_api 自己），**绕过 9127** → 本表这条
+    #     对真实流量不生效（只在内网直连 9127 调试时有用）。蜂窝下 TTS 此前不通是被
+    #     ALLOWED_RELAY 缺这个前缀挡住的（A8 已修），TTS 分支本身在 stream_api.do_POST
+    #     `_auth(self)` 闸门之后（约 :1994/:2079）。
+    #   ⇒ 若将来出现「某前缀蜂窝/Wi-Fi 单侧不通」，先查 nginx 那份 location 打到哪个端口，
+    #     再决定是补本表还是补 relay 白名单/nginx。
     "/api/history": ("automation_api", "Handler"),
     "/api/tts":     ("stream_api",     "StreamHandler"),
 }
