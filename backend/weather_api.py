@@ -7,6 +7,8 @@ GET /api/weather → {"ok": true, "temp": 28.1, "code": 2, "city": "上海"}
 
 v3.9.25：新增 daily（今天 + 未来 5 天 = forecast_days=6），供 App 天气弹窗第 2 页使用。
 仅**加字段**，temp/code/city 结构与语义不变（旧客户端忽略 daily 即可，向后兼容）。
+v3.9.30：新增 apparent/humidity/wind + hourly（未来 12 小时逐时），供弹窗第 1 页「展开更多」折叠区；
+同样只加字段，向后兼容。
 """
 import json
 import os
@@ -25,6 +27,35 @@ def _fetch(url, timeout=8):
     req = urllib.request.Request(url, headers={"User-Agent": "qingliao/2.0"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode() or "{}")
+
+
+def _hourly(w):
+    """Open-Meteo hourly 列 → 未来 12 小时逐时 [{\"time\",\"temp\",\"code\",\"pop\"}]（安全降级）
+
+    v3.9.30：天气弹窗「展开更多」折叠区。只取当前小时起的 12 条（弹窗折叠区不放全 168 列）。
+    time 是 ISO 字符串（"2026-09-17T09:00"），App 侧只显示 HH 时。
+    pop = precipitation_probability（降水概率 %，可缺失 → None）。
+    """
+    h = w.get("hourly") or {}
+    times = h.get("time") or []
+    temps = h.get("temperature_2m") or []
+    codes = h.get("weather_code") or []
+    pops = h.get("precipitation_probability") or []
+    # 只留当前整点及以后（ISO 字符串可直接字典序比较）
+    now = time.strftime("%Y-%m-%dT%H:00")
+    out = []
+    for i, t in enumerate(times):
+        if t < now:
+            continue
+        out.append({
+            "time": t,
+            "temp": temps[i] if i < len(temps) else None,
+            "code": codes[i] if i < len(codes) else None,
+            "pop": pops[i] if i < len(pops) else None,
+        })
+        if len(out) >= 12:
+            break
+    return out
 
 
 def _daily(w):
@@ -69,7 +100,9 @@ def _get_weather(lat=None, lon=None, city=None):
                 cached = json.load(f)
                 # v3.9.19：null 结果不参与命中——失败缓存会让徽章空半小时（用户报"天气失效"）
                 # v3.9.25：旧缓存（无 daily）也不命中——否则升级后头 30 分钟弹窗第 2 页空白
-                if cached.get("_key") == cache_key and cached.get("temp") is not None and cached.get("daily"):
+                # v3.9.30：旧缓存（无 hourly）也不命中——同上，「展开更多」折叠区空白半小时
+                if cached.get("_key") == cache_key and cached.get("temp") is not None \
+                        and cached.get("daily") and cached.get("hourly"):
                     return cached
     except Exception:
         pass
@@ -110,15 +143,21 @@ def _get_weather(lat=None, lon=None, city=None):
         lat, lon = DEFAULT_LAT, DEFAULT_LON
     try:
         w = _fetch("https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
-                   "&current=temperature_2m,weather_code"
+                   "&current=temperature_2m,weather_code,apparent_temperature,relative_humidity_2m,wind_speed_10m"
                    "&daily=weather_code,temperature_2m_max,temperature_2m_min"
-                   "&timezone=Asia%%2FShanghai&forecast_days=6" % (lat, lon), timeout=8)
+                   "&hourly=temperature_2m,weather_code,precipitation_probability"
+                   "&timezone=Asia%%2FShanghai&forecast_days=6&forecast_hours=24" % (lat, lon), timeout=8)
         cur = w.get("current", {})
         data = {"temp": cur.get("temperature_2m"), "code": cur.get("weather_code"),
-                "daily": _daily(w),
+                "daily": _daily(w), "hourly": _hourly(w),
+                "apparent": cur.get("apparent_temperature"),
+                "humidity": cur.get("relative_humidity_2m"),
+                "wind": cur.get("wind_speed_10m"),
                 "city": city, "lat": lat, "lon": lon, "_key": cache_key}
     except Exception:
-        data = {"temp": None, "code": None, "daily": [], "city": city, "_key": cache_key}
+        data = {"temp": None, "code": None, "daily": [], "hourly": [],
+                "apparent": None, "humidity": None, "wind": None,
+                "city": city, "_key": cache_key}
     # v3.9.19：上游失败（temp=None）不写缓存，并回落上一次有效值——
     # 原来失败结果也会写进 30 分钟 TTL 缓存，一次网络抖动就让天气"失效"半小时且不重试
     if data.get("temp") is not None:

@@ -7,7 +7,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ROUTER_DEFAULT = {'host': os.environ.get("QL_ROUTER_HOST", ""), 'port': 22, 'username': os.environ.get("QL_ROUTER_USER", "root"), 'password': os.environ.get("QL_ROUTER_PASS", "")}
 CONTAINER = os.environ.get('QL_HERMES_CONTAINER', 'hermes-container')
-PY = sys.executable
+# hermes 容器内的解释器：qingliao 容器里 sys.executable 指向的路径在目标容器不存在，须显式指定
+PY = os.environ.get('QL_HERMES_PYTHON', sys.executable)
+# paramiko 所在的 site-packages（宿主没装时用 QL_PARAMIKO_PATH 指过去；留空则不注入 PYTHONPATH）
+PARAMIKO_PATH = os.environ.get('QL_PARAMIKO_PATH', '')
 
 def _router_cred():
     try:
@@ -54,9 +57,11 @@ def _router_exec(cmds, pty=False, timeout=45):
     script = _SCRIPT_TMPL.format(host=cred['host'], port=cred['port'],
                                  user=cred['username'], pw=cred['password'])
     payload = base64.b64encode(json.dumps(cmds).encode()).decode()
-    r = subprocess.run(
-        ['docker', 'exec', CONTAINER, PY, '-c', script, payload, '1' if pty else '0'],
-        capture_output=True, text=True, timeout=timeout)
+    cmd = ['docker', 'exec', CONTAINER]
+    if PARAMIKO_PATH:
+        cmd += ['env', 'PYTHONPATH=' + PARAMIKO_PATH]
+    cmd += [PY, '-c', script, payload, '1' if pty else '0']
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
         # v2.0.93f：PTY 下 recv_exit_status 遇命令退出码非 0 时 paramiko 可能抛异常，
         # 但输出已写入 stdout——有输出时按输出处理

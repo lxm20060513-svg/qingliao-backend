@@ -39,12 +39,12 @@ def _expire_chunks(now):
                 pass
 
 # 安全根目录：轻聊数据目录（前端只允许浏览这里）
-ROOT = 'os.environ.get("QL_DATA_DIR", "/data")'
+ROOT = os.environ.get("QL_DATA_DIR", "/data")
 # 额外允许浏览的目录（只读列表，不在此列表的根不可访问）
 # 注意：不包含 hermes-data 根（其下有 config.yaml 等敏感文件）
 ALLOWED_ROOTS = [ROOT]
 # 上传目标目录
-UPLOAD_DIR = os.environ.get('QL_UPLOAD_DIR', os.path.join(DATA_DIR_FALLBACK(), 'uploads'))
+UPLOAD_DIR = os.environ.get("QL_UPLOAD_DIR", "/data/uploads")
 
 
 def resolve_path(p):
@@ -143,13 +143,10 @@ class FilesHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Files-Password, X-Auth-Token")
 
     def _check_auth(self):
-        # v3.9.39 安全修复：原先 '/api/files/pin_' 直接 return True 放行，而 pin_read/pin_write
-        # 的 path 参数是绝对路径且不经过 resolve_path 沙箱（只校验 .json 后缀）——
-        # 未鉴权即可 GET /api/files/pin_read?path=/data/auth_tokens.json 读出 token 摘要表，
-        # 再 pin_write 一枚自铸摘要，即可通过所有模块的 check_auth（= 全后端鉴权绕过）。
-        # 同时这层豁免还绕开了 is_downloadable 的 _BLOCKED_NAMES 黑名单（该黑名单只对 download 生效）。
-        # App 侧三个 store（PinStore/MemoStore/TodoStore）本就经 auth.json 统一带 X-Auth-Token，
-        # 去掉豁免对客户端零改动。
+        # v3.9.39 安全修复：撤掉 '/api/files/pin_' 免鉴权豁免（commit 5b84d57）。
+        # 原 pin_read/pin_write 的 path 是绝对路径且不过 resolve_path 沙箱（只校验 .json 后缀），
+        # 未鉴权即可读 auth_tokens.json 摘要表、再 pin_write 自铸摘要 = 全后端鉴权绕过。
+        # App 侧 PinStore/MemoStore/TodoStore 均经 auth.json 带 X-Auth-Token，零客户端改动。
         import auth_api
         return auth_api.check_auth(self.headers, 'X-Files-Password', FILES_PASSWORD)
 

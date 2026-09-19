@@ -132,3 +132,117 @@ def fetch_models_from_endpoint(base_url: str, api_key: str) -> dict:
         return {"ok": True, "models": ids}
     except Exception as e:
         return {"ok": False, "error": str(e)[:150]}
+
+
+# ==== v3.9.32：自定义 provider CRUD + HTTP 分发 ====
+# 背景：本模块自 v3.0.82 起随包部署，却**从未被任何模块 import** →
+#       /api/stream/{builtin-providers,custom-providers,fetch-models} 三个端点一律 404，
+#       App「模型管理」里删除内置 provider / 自定义 provider / 拉取模型三处入口全是死路。
+#       这里补上唯一入口，由 stream_api 在 /api/stream 前缀下调用（鉴权在 stream_api 侧已完成）。
+
+CUSTOM_JSON_CANDIDATES = [
+    # 与其它 App 数据同处（容器同名挂载；宿主可直接查看/备份）
+    os.environ.get("QL_DATA_DIR", "/data") + "/custom_providers.json",
+    # 兜底：容器 /data（NAS /data）
+    "/data/custom_providers.json",
+]
+
+
+def _custom_path() -> str:
+    for p_ in CUSTOM_JSON_CANDIDATES:
+        if os.path.exists(p_):
+            return p_
+    return CUSTOM_JSON_CANDIDATES[0]
+
+
+def load_custom_providers() -> list:
+    try:
+        with open(_custom_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_custom_providers(items: list) -> bool:
+    p_ = _custom_path()
+    try:
+        d = os.path.dirname(p_)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = p_ + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+        os.chmod(tmp, 0o600)   # 含 api_key，别给全局可读
+        os.replace(tmp, p_)
+        return True
+    except Exception:
+        return False
+
+
+def custom_list() -> dict:
+    return {"ok": True, "providers": load_custom_providers()}
+
+
+def custom_add(provider: dict) -> dict:
+    pid = str((provider or {}).get("id") or "").strip()
+    if not pid:
+        return {"ok": False, "error": "provider.id 必填"}
+    items = [x for x in load_custom_providers() if x.get("id") != pid]
+    items.append(provider)
+    if not _save_custom_providers(items):
+        return {"ok": False, "error": "写入 custom_providers.json 失败"}
+    return {"ok": True, "id": pid, "count": len(items)}
+
+
+def custom_delete(pid: str) -> dict:
+    pid = (pid or "").strip()
+    items = load_custom_providers()
+    left = [x for x in items if x.get("id") != pid]
+    if len(left) == len(items):
+        return {"ok": False, "error": "未找到该自定义 provider"}
+    if not _save_custom_providers(left):
+        return {"ok": False, "error": "写入 custom_providers.json 失败"}
+    return {"ok": True, "count": len(left)}
+
+
+def custom_refresh_models(pid: str) -> dict:
+    """v3.9.34：重新拉取自定义 provider 的模型列表（用存好的 base_url+api_key 调 /models，成功写回 JSON）"""
+    items = load_custom_providers()
+    p = next((x for x in items if x.get("id") == pid), None)
+    if p is None:
+        return {"ok": False, "error": "未找到该自定义 provider"}
+    r = fetch_models_from_endpoint(str(p.get("base_url") or ""), str(p.get("api_key") or ""))
+    if not r.get("ok"):
+        return r
+    items = [dict(x, models=r["models"]) if x.get("id") == pid else x for x in items]
+    if not _save_custom_providers(items):
+        return {"ok": False, "error": "写入 custom_providers.json 失败"}
+    return {"ok": True, "id": pid, "models": r["models"]}
+
+
+def handle_post(path: str, body: dict):
+    """只处理模型管理三端点，返回 (http_code, payload)；其它路径返回 (404, ...)。"""
+    body = body or {}
+    if path == "/api/stream/builtin-providers":
+        if (body.get("action") or "") != "delete":
+            return 400, {"ok": False, "error": "action 仅支持 delete"}
+        r = delete_builtin_provider(str(body.get("id") or ""))
+        return (200 if r.get("ok") else 400), r
+    if path == "/api/stream/fetch-models":
+        r = fetch_models_from_endpoint(str(body.get("base_url") or ""),
+                                       str(body.get("api_key") or ""))
+        return (200 if r.get("ok") else 400), r
+    if path == "/api/stream/custom-providers":
+        act = (body.get("action") or "").strip()
+        if act == "add":
+            r = custom_add(body.get("provider") or {})
+        elif act == "delete":
+            r = custom_delete(str(body.get("id") or ""))
+        elif act == "refresh":
+            # v3.9.34：按 key 重新拉取模型列表（App 模型管理每个分组一行）
+            r = custom_refresh_models(str(body.get("id") or ""))
+        else:
+            r = {"ok": False, "error": "action 仅支持 add/delete/refresh"}
+        return (200 if r.get("ok") else 400), r
+    return 404, {"ok": False, "error": "not found"}

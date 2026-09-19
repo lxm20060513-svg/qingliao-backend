@@ -60,13 +60,20 @@ def _get_json(url, key, timeout=12):
 
 def _load_custom() -> list:
     """v3.1.1：自定义 provider（App 新增 API 入口，custom_providers.json，不入 config.yaml）"""
-    try:
-        with open("/data/streams_data/custom_providers.json", encoding="utf-8") as f:
-            import json as _j
-            data = _j.load(f)
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    # v3.9.32：路径对齐 —— 原写死 /data/streams_data/custom_providers.json，该目录在容器里并不存在，
+    # 于是「App 新增的 API」永远加载不到（自建 provider 的 key 也就永远不生效）。
+    # 现在与 provider_admin 共用同一份文件，逐候选路径回退。
+    import json as _j
+    for _p in (os.environ.get("QL_DATA_DIR", "/data") + "/custom_providers.json",
+               "/data/custom_providers.json",
+               "/data/streams_data/custom_providers.json"):
+        try:
+            with open(_p, encoding="utf-8") as f:
+                data = _j.load(f)
+            return data if isinstance(data, list) else []
+        except Exception:
+            continue
+    return []
 
 
 def _custom_key(pid: str) -> str:

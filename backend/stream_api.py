@@ -238,7 +238,6 @@ SYNC_ENDPOINTS = {
     "deepseek": ("https://api.deepseek.com/v1/models", ["providers", "deepseek", "api_key"]),
     "xiaomi": ("https://token-plan-cn.xiaomimimo.com/v1/models", ["providers", "xiaomi", "api_key"]),
     "sensenova": ("https://token.sensenova.cn/v1/models", ["providers", "sensenova", "api_key"]),
-    "zai": ("https://open.bigmodel.cn/api/paas/v4/models", ["providers", "zai", "api_key"]),
     "zai-coding": ("https://api.z.ai/api/coding/paas/v4/models", ["providers", "zai-coding", "api_key"]),
 }
 
@@ -1046,6 +1045,7 @@ def _agent_loop(messages, task=None, model=None, provider=None):
         # v3.2.4：全量压缩超长 assistant（Agent 全量历史 = 最多长文素材，只压 1 条无效）
         msgs = _compress_long_assistants(msgs)
         msgs = _break_repeat_seed(msgs)
+        sys_content += QCARD_PROMPT   # v3.9.31 ql-card 协议
         sys_p = {"role": "system", "content": sys_content}
         msgs = [sys_p] + msgs
         _log_sent_messages("agent", msgs)
@@ -1284,6 +1284,18 @@ def _is_strong_model(provider="", model=""):
             or m.startswith("gpt-5") or m.startswith("claude") or m.startswith("glm-5"))
 
 
+# v3.9.31：ql-card 结果卡片协议（App 端 v3.5.0 起 AgentCardParser 已解析渲染）。
+# 注入 5 处 system prompt 组装点；纪律段防滥用：仅结构化结果类回复收尾用，闲聊禁用。
+QCARD_PROMPT = (
+    "\n\n【结果卡片协议（可选）】当回复属于结构化结果类（体检/诊断/巡检/任务清单/对比表格/多步骤结果汇报），"
+    "在文字总结之后追加一个 ```ql-card 代码围栏，围栏内是单个 JSON 对象（不要多对象）。字段（全部可选，有什么写什么）："
+    'type(result|metrics|list|table|status)/title/subtitle/status({text,tone:ok|warn|error|info})/'
+    'fields([{key,value}])/metrics([{label,value,unit?,tone?}])/list([{title,subtitle?,status?,tone?}])/'
+    'table({columns,rows})/footer。'
+    "围栏独占一行、必须闭合；围栏外文字照常写。纪律：闲聊/解释/短回复一律不要用卡片；"
+    "一张卡片讲完当前这轮结果，不要多卡堆叠；JSON 必须合法（客户端解析失败会原样显示文本，不会报错）。"
+)
+
 def _log_sent_messages(tag, msgs):
     """诊断：记录实际发给模型的消息（角色+摘要+条数），用于验证防复读是否生效。
     v3.2.1 恢复写点（v3.1.12 曾删除该日志导致无法观察部署后发给模型的内容）。"""
@@ -1325,6 +1337,7 @@ def _build_messages(st):
                  "content": "你是轻聊的 AI 助手，用中文简洁友好地回答用户的问题。"
                             "每次回复只针对用户最新一条消息：先理解它问的是什么，再给出有针对性的回答。"
                             "不要重复、复述或续写对话历史中你已经回答过的内容。"}]
+    base_sys[0]["content"] += QCARD_PROMPT   # v3.9.31 ql-card 协议
     final = base_sys + kb_inject.inject(msgs)
     _log_sent_messages("normal", final)
     return final
@@ -1361,6 +1374,8 @@ def _build_hermes_agent_prompt(st, last_user):
                    "工具结果如实转达用户；失败要说明原因和建议。"
                    "回答简洁中文，用 emoji 点缀。"
                    "每次回复只针对用户最新一条消息，不要重复历史中已回答过的内容。")
+    # v3.9.31 ql-card 协议
+    sys_content += QCARD_PROMPT
     # v3.3.1：多模态 content 原样透传
     user_content = last_user if isinstance(last_user, list) else str(last_user or "")
     return [{"role": "system", "content": sys_content},
@@ -1414,11 +1429,13 @@ def _build_hermes_messages(st, last_user, is_agent):
                        "下面 messages 是会话历史（assistant 回复已压缩为占位符），仅作背景参考。"
                        "【关键】只回答最新一条 user 消息。绝对不要续写、复述、照抄历史上任何一条 "
                        "assistant 回复的内容或任何工具调用/结果——这会重复回答，务必直接给出新答案。")
+        sys_content += QCARD_PROMPT   # v3.9.31 ql-card 协议
     else:
         sys_content = ("你是轻聊的 AI 助手，用中文简洁友好地回答用户的问题。"
                        "下面 messages 是会话历史（assistant 回复已压缩为占位符），仅作背景参考。"
                        "【关键】只回答最新一条 user 消息：先理解它问什么，再给有针对性的回答。"
                        "不要复述、续写或照抄历史里你已经回答过的内容。")
+    sys_content += QCARD_PROMPT   # v3.9.31 ql-card 协议
     return [{"role": "system", "content": sys_content}] + sanitized
 
 
@@ -1934,6 +1951,21 @@ class StreamHandler(BaseHTTPRequestHandler):
             return
             return
         self.path = _relay_alias(self.path)
+        # v3.9.32：模型管理三端点（provider_admin 模块一直随包部署，却从未被 import →
+        #          App 的「删除内置 provider / 自定义 provider / 拉取模型」三处入口必然 404）
+        if self.path.split("?", 1)[0] in ("/api/stream/builtin-providers",
+                                          "/api/stream/custom-providers",
+                                          "/api/stream/fetch-models"):
+            if not _auth(self):
+                return self._send(401, {"error": "unauthorized"})
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+                dat = json.loads(self.rfile.read(n) or b"{}")
+            except Exception:
+                return self._send(400, {"error": "bad json"})
+            import provider_admin as _pa
+            _code, _obj = _pa.handle_post(self.path.split("?", 1)[0], dat)
+            return self._send(_code, _obj)
         # /api/stream/ingest: 内部流式帧回传（Hermes qingliao native streaming → 写 task 增量）
         if self.path == "/api/stream/ingest":
             try:
@@ -1942,10 +1974,8 @@ class StreamHandler(BaseHTTPRequestHandler):
             except Exception:
                 return self._send(400, {"error": "bad json"})
             tk = (self.headers.get("X-Inbox-Token") or "").strip()
-            # v3.9.41（B3）原来是 `if not tk` —— 只判「非空」，任意垃圾 token 都能过。
-            # 这条分支写的是**别人会话里的流式正文**（下面按 chat_id 找到 _ql_stream_task
-            # 对应的 task 直接追加 delta / 置 status=done），所以未鉴权即可注入他人回复。
-            # 同文件紧接其后的 /api/tasks/bg 一直用的是 compare_digest，这里补齐同一口径。
+            # v3.9.41（B3）原来只判非空，垃圾 token 都能过；该分支写别人会话的流式正文。
+            # 同文件 /api/tasks/bg 用的是 compare_digest，这里补齐同一口径。
             if not tk or not hmac.compare_digest(tk, INBOX_TOKEN_ENV):
                 return self._send(401, {"error": "unauthorized"})
             chat_id = str(dat.get("chat_id", ""))
@@ -2173,7 +2203,7 @@ class StreamHandler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "not found"})
 
     def do_GET(self):
-        # v2.0.130：免鉴权 AI 图片端点（App 渲染 MEDIA: 路径时加载）——只允许 Hermes 数据映射目录下图片
+        # v2.0.130：免鉴权 AI 图片端点（App 渲染 MEDIA: 路径时加载）——只允许 /data/hermes(hermes-data) 下图片
         if self.path.startswith("/api/stream/media"):
             _serve_media(self)
             return
@@ -2183,6 +2213,10 @@ class StreamHandler(BaseHTTPRequestHandler):
         self.path = _relay_alias(self.path)
         if not _auth(self):
             return self._send(401, {"error": "unauthorized"})
+        # v3.9.32：自定义 provider 列表（App「新增 API」入口读这个）
+        if self.path.split("?", 1)[0] == "/api/stream/custom-providers":
+            import provider_admin as _pa
+            return self._send(200, _pa.custom_list())
         # v3.4.23 任务中心：进行中任务列表（流式任务 streaming 中 + 登记的后台作业）
         if self.path.startswith("/api/tasks/active") or self.path.startswith("/api/agent/tasks/active"):
             return self._send(200, _collect_active_tasks())
@@ -2432,7 +2466,7 @@ class StreamHandler(BaseHTTPRequestHandler):
 def _serve_media(self):
     """v2.0.130：免鉴权图片服务——MEDIA:路径 → 图片字节。
     v3.0.28 security note：免鉴权设计（App 本地 localhost 调用），白名单限制只读允许目录下的图片扩展名。
-    query: p=<base64url(宿主绝对路径)>；仅允许图片扩展名 + Hermes 数据映射目录。
+    query: p=<base64url(宿主绝对路径)>；仅允许图片扩展名 + 容器 /data/hermes 映射目录。
     """
     import urllib.parse as _up
     q = _up.parse_qs(_up.urlparse(self.path).query)
@@ -2455,8 +2489,8 @@ def _serve_media(self):
         if path == _pre or path.startswith(_pre + "/"):
             path = _host + path[len(_pre):]
             break
-    # 只允许 Hermes 数据目录与轻聊 data 目录下的图片（防任意文件读取）
-    allowed = [os.environ.get("QL_HERMES_DATA_DIR", "/data/hermes"), os.environ.get("QL_DATA_DIR", "/data")]
+    # 只允许 hermes-data(/data/hermes) 与轻聊 data 目录下的图片（防任意文件读取）
+    allowed = [os.environ.get("QL_HERMES_DATA", "/data/hermes"), os.environ.get("QL_DATA_DIR", "/data")]
     if not any(path.startswith(a) for a in allowed):
         self._send(403, {"error": "forbidden path"})
         return
@@ -2530,11 +2564,6 @@ def _relay_query(self):
             return
         # 蜂窝 relay 白名单（v3.0.6 security review：原允许任意 /api/* 造成认证绕过链。
         # 收窄到 App 蜂窝真正会用到的接口；每个接口仍独立校验 X-Auth-Token（下游鉴权不降级））
-        # v3.9.39 A8：按 App 实际发出的 28 个 /api/* 前缀逐条对过，此前缺 nas/hw/inbox/channel/
-        # history/tts 六条，且 "/api/weather/" 带尾斜杠而 App 发 "/api/weather?city=…"（startswith
-        # 不匹配）→ 蜂窝下看板/收件箱/模型切换/执行历史/朗读整片 403，只有聊天能用。
-        # 下游鉴权逐条核实过：StreamHandler do_GET:2180、do_POST:1991 各有 _auth 闸门，
-        # hw_api/inbox_api/channel_api/automation_api/weather_api 均调 auth_api.check_auth。
         ALLOWED_RELAY = (
             "/api/stream/", "/api/auth/", "/api/sessions/",
             "/api/local/", "/api/weather", "/api/push/", "/api/scenes",
@@ -2646,3 +2675,4 @@ if __name__ == "__main__":
     srv = ThreadingHTTPServer(("0.0.0.0", 9132), StreamHandler)
     print("[stream] listening on 9132, dir:", STREAM_DIR, flush=True)
     srv.serve_forever()
+

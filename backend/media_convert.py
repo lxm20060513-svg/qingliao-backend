@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """MEDIA 协议 → data URL 图片转换（v2.0.130 + 2026-08-17）
 
-问题：Hermes Agent 回复图片时输出 MEDIA:/路径 协议（如 MEDIA:/路径（容器内绝对路径）），
+问题：Hermes Agent 回复图片时输出 MEDIA:/路径 协议（如 MEDIA:/data/hermes/random_image.jpg），
 App 端只认 markdown 图片语法 ![alt](url)，导致图片显示成一行路径文本（用户实测反馈）。
 
 方案：写入侧把 MEDIA: 路径转成 data:image base64 URL（App v2.0.128 已支持 data URL 本地解码），
 零 App 改动、免鉴权、蜂窝环境最稳。只在非流式写入/全量读取处转换（流式增量轮询按 offset
 推进，中途变长会错位——Agent 路径是一次性写入，安全）。
 
-路径映射：容器内路径前缀 ↔ 宿主映射目录（QL_HERMES_DATA_DIR 等）
+路径映射：Hermes 容器 /data/hermes = NAS 宿主 /data/hermes
 （qingliao 后端跑在宿主 systemd，读宿主路径）。
 """
 import base64
