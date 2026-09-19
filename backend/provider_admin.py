@@ -11,6 +11,7 @@
 import json
 import os
 import re
+import tempfile
 import urllib.request
 
 try:
@@ -18,7 +19,46 @@ try:
 except Exception:
     _yaml = None
 
-HERMES_CFG = os.environ.get("QL_HERMES_CONFIG", "/data/hermes_config.yaml")
+# BE20 附注（BE23）：compose 只给了 QL_CONFIG_YAML，从来没给 QL_HERMES_CONFIG，
+# 于是净部署时这几个模块都读默认路径、功能成死路。按候选顺序取第一个真实存在的文件。
+# 全后端统一由此函数出（stream_api / usage_api / mcp_api 都调它），避免各模块
+# 解析到不同文件——那会比「都读不到」更难查。
+_cfg_candidates = [os.environ.get("QL_HERMES_CONFIG", ""),
+                   os.environ.get("QL_CONFIG_YAML", ""),
+                   "/data/hermes_config.yaml"]
+
+
+def hermes_cfg_path() -> str:
+    return next((p for p in _cfg_candidates if p and os.path.exists(p)),
+                _cfg_candidates[0] or "/data/hermes_config.yaml")
+
+
+HERMES_CFG = hermes_cfg_path()
+
+
+def _write_cfg(text: str):
+    """原子替换 Hermes config.yaml（BE20：原 `open(path,"w")` 截断写——进程被杀/容器重启
+    会留下半截 YAML，Hermes 下次启动直接读到坏配置）。权限沿用原文件：config.yaml 由 Hermes
+    侧读取，这里既不擅自收紧（0600 可能让 Hermes 读不到），也不放宽。"""
+    try:
+        _mode = os.stat(HERMES_CFG).st_mode & 0o777
+    except OSError:
+        _mode = 0o644
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(HERMES_CFG) or ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, _mode)
+        os.replace(tmp, HERMES_CFG)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except Exception:
+            pass
+        raise
 
 
 def _cfg_providers_block_lines():
@@ -90,20 +130,14 @@ def delete_builtin_provider(pid: str) -> dict:
             raise ValueError("删除后 YAML 解析失败")
         if pid in (cfg.get("providers") or {}):
             raise ValueError("删除后 provider 仍存在")
-        with open(HERMES_CFG, "w", encoding="utf-8") as f:
-            f.write(new_content)
-        try:
-            os.chmod(HERMES_CFG, 0o644)
-        except Exception:
-            pass
+        # BE20：原子替换，不再截断写
+        _write_cfg(new_content)
         return {"ok": True, "deleted": pid}
     except Exception as e:
         try:
             if os.path.exists(bak):
                 with open(bak, encoding="utf-8") as f:
-                    good = f.read()
-                with open(HERMES_CFG, "w", encoding="utf-8") as f:
-                    f.write(good)
+                    _write_cfg(f.read())   # BE20：回滚也走原子替换
         except Exception:
             pass
         return {"ok": False, "error": str(e)[:200]}

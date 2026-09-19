@@ -18,7 +18,8 @@ import media_convert  # v2.0.130: 历史消息 MEDIA:路径→data URL 图片
 _save_lock = threading.Lock()
 
 # 访问密码（与 files_api.py 保持一致）
-SESSIONS_PASSWORD = os.environ.get("QL_PASSWORD", "change-me")
+# BE4：默认改空串——"change-me" 是公开仓库里的常量（密码兜底本身默认关闭，不留弱口令）
+SESSIONS_PASSWORD = os.environ.get("QL_PASSWORD", "")
 
 # 数据目录（root 运行，可写）：默认路径，可用 POST /api/sessions/location 修改（持久化到 LOC_FILE）
 LOC_FILE = os.path.join(DATA_DIR, "sessions_loc.json")

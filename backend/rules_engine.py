@@ -28,6 +28,7 @@
 """
 import json
 import os
+import tempfile
 import threading
 import time
 import urllib.request
@@ -43,17 +44,19 @@ HA_CACHE_TTL = 5          # HA 状态缓存，避免条件求值把 HA 打爆
 
 
 def ha_creds():
-    """凭据与 ha_proxy 同源：优先 data/ha_config.json 的 address/token，其次环境变量。
+    """全后端 HA 凭证的唯一入口（BE7）：优先 data/ha_config.json 的 address/token，其次环境变量。
 
     ⚠️ 实测：容器里的 QL_HA_TOKEN 调 HA 会 **401**（旧 token），而 ha_config.json 里的有效
     —— 必须跟 ha_proxy 走同一份，否则条件永远读不到状态、规则永不触发。
+    BE7：原先只有本模块 :199 一处调用，automation/scenes/suggest/tool_executor 仍读 env，
+    表现为「面板改了 HA token 后一部分自动化好用、一部分永久 401」。现统一由此函数出。
     """
     try:
         with open(os.path.join(DATA_DIR, "ha_config.json"), encoding="utf-8") as f:
             c = json.load(f)
-        return (c.get("address") or HA_URL), (c.get("token") or HA_TOKEN)
+        return (c.get("address") or HA_URL).rstrip("/"), (c.get("token") or HA_TOKEN)
     except Exception:
-        return HA_URL, HA_TOKEN
+        return HA_URL.rstrip("/"), HA_TOKEN
 DEFAULT_COOLDOWN = 900
 DEFAULT_MAX_PER_HOUR = 6
 EVENT_KEEP = 200
@@ -72,14 +75,25 @@ def _read(path, default):
 
 
 def _write(path, data):
+    """BE12：tmp 文件名唯一化（原固定 path+".tmp"，调度线程与 HTTP 线程同时写会互相踩
+    同名临时文件，出现 A 的 tmp 被 B replace 走 → 内容错乱/写失败）。"""
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
+        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            except Exception:
+                pass
+            raise
     except Exception:
-        pass
+        return False
+    return True
 
 
 # ---------------- 规则 CRUD ----------------
@@ -89,7 +103,7 @@ def load_rules():
 
 
 def save_rules(rules):
-    _write(RULES_FILE, rules)
+    return _write(RULES_FILE, rules)
 
 
 def list_rules():
@@ -340,7 +354,14 @@ def tick(executor, now=None):
     now = now or time.time()
     events = load_events()
     rules = load_rules()
-    dirty = False
+    # BE12：原来整段读-改-写不带锁，且把整个 tick（含十几秒的 HA 调用）算进去：
+    # ① 与设置页的增删改互相覆盖丢规则；② 直接全程持锁又会把 HTTP 线程卡住。
+    # 折中：执行期间只记「哪条规则的哪些运行时字段变了」，最后按 id 合并到最新盘面再写。
+    changes = {}
+
+    def _mark(r, key, val):
+        changes.setdefault(r.get("id"), {})[key] = val
+
     fired = []
     for r in rules:
         if not r.get("enabled", True):
@@ -354,7 +375,7 @@ def tick(executor, now=None):
         prev = bool(r.get("last_matched"))
         if matched != prev:
             r["last_matched"] = matched
-            dirty = True
+            _mark(r, "last_matched", matched)
         if not (matched and not prev):     # 只认上升沿
             continue
         tr = r.get("trigger") or {}
@@ -364,7 +385,8 @@ def tick(executor, now=None):
         cap = int(tr.get("max_per_hour") or DEFAULT_MAX_PER_HOUR)
         if now - (r.get("hour_start") or 0) > 3600:
             r["hour_start"], r["hour_count"] = now, 0
-            dirty = True
+            _mark(r, "hour_start", now)
+            _mark(r, "hour_count", 0)
         if (r.get("hour_count") or 0) >= cap:
             continue
         try:
@@ -374,8 +396,16 @@ def tick(executor, now=None):
         r["last_run"] = now
         r["hour_count"] = (r.get("hour_count") or 0) + 1
         r["run_count"] = (r.get("run_count") or 0) + 1
-        dirty = True
+        _mark(r, "last_run", now)
+        _mark(r, "hour_count", r["hour_count"])
+        _mark(r, "run_count", r["run_count"])
         fired.append({"id": r.get("id"), "name": r.get("name"), "ok": ok, "message": msg})
-    if dirty:
-        save_rules(rules)
+    if changes:
+        with _lock:
+            latest = load_rules()
+            for rr in latest:
+                ch = changes.get(rr.get("id"))
+                if ch:
+                    rr.update(ch)
+            save_rules(latest)
     return fired

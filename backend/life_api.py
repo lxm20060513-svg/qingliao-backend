@@ -49,7 +49,15 @@ from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ---------------------------------------------------------------- 路径与参数
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "life_config.json")
+# BE5：看板配置存代码目录会在每次重建镜像时丢失，改存持久化的 QL_DATA_DIR
+CONFIG_PATH = os.path.join(os.environ.get("QL_DATA_DIR", "/data"), "life_config.json")
+_legacy = os.path.join(os.path.dirname(os.path.abspath(__file__)), "life_config.json")
+if not os.path.exists(CONFIG_PATH) and os.path.exists(_legacy):
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        os.replace(_legacy, CONFIG_PATH)   # BE5：升级当次把旧配置搬过来，不丢看板设置
+    except Exception:
+        pass
 
 HTTP_TIMEOUT = 5          # 单个上游请求超时（秒）
 COLLECT_SLACK = 2         # 整体收集相对单个超时的宽限（秒）

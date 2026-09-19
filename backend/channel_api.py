@@ -12,7 +12,7 @@ wechat-profile = Hermes 独立 profile，微信通道经 profile_routes 路由�
 视觉模型逻辑（Hermes agent.image_input_mode: auto 原生支持）：
 主模型 supports_vision → 原生传图用主模型；主模型不支持 + auxiliary.vision 显式配置 → 用视觉模型兜底。
 """
-import json, os, subprocess, threading, hmac
+import json, os, subprocess, tempfile, threading, hmac
 from http.server import BaseHTTPRequestHandler
 import auth_api
 try:
@@ -30,6 +30,32 @@ PROFILE_CFG = os.environ.get("QL_WECHAT_PROFILE_CFG") or (
 )
 
 _lock = threading.Lock()
+
+
+def _write_lines(out):
+    """BE20：原子替换主 config.yaml（原来 3 处 `open(PROFILE_CFG,"w")` 是截断写——
+    写到一半进程被杀/容器重启就留下半截 YAML，而函数照样 return True，坏文件要到
+    Hermes 下次启动才暴露）。权限沿用原文件：Hermes 侧要能读，这里不擅自改。"""
+    text = "\n".join(out) + "\n"
+    try:
+        _mode = os.stat(PROFILE_CFG).st_mode & 0o777
+    except OSError:
+        _mode = 0o644
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(PROFILE_CFG) or ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, _mode)
+        os.replace(tmp, PROFILE_CFG)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except Exception:
+            pass
+        raise
 
 # 支持的 provider（与主 config providers 段对齐，防止写死错误 provider）
 VALID_PROVIDERS = {
@@ -139,8 +165,7 @@ def _write_model(model, provider):
         out.insert(0, "  provider: %s" % provider)
         out.insert(0, "  default: %s" % model)
         out.insert(0, "model:")
-    with open(PROFILE_CFG, "w", encoding="utf-8") as f:
-        f.write("\n".join(out) + "\n")
+    _write_lines(out)
     return True
 
 
@@ -306,8 +331,7 @@ def _write_vision(provider, model):
             else:
                 kept.append(ln)
         out = lines[:aux_start + 1] + new_block + kept + lines[aux_end:]
-    with open(PROFILE_CFG, "w", encoding="utf-8") as f:
-        f.write("\n".join(out) + "\n")
+    _write_lines(out)
     return True
 
 
@@ -338,8 +362,7 @@ def _clear_vision():
         out = lines[:aux_start] + lines[aux_end:]
     else:
         out = lines[:aux_start + 1] + kept + lines[aux_end:]
-    with open(PROFILE_CFG, "w", encoding="utf-8") as f:
-        f.write("\n".join(out) + "\n")
+    _write_lines(out)
     return True
 
 

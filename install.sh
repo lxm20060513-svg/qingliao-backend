@@ -11,16 +11,35 @@ echo "=============================="
 command -v docker >/dev/null 2>&1 || { echo "❌ 未安装 docker，请先安装"; exit 1; }
 docker compose version >/dev/null 2>&1 || { echo "❌ 未安装 docker compose 插件"; exit 1; }
 
+# BE3：服务间 token 不再有公开默认值，缺失=对应接口拒绝服务，必须随机生成
+_rand_hex() {
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex 16
+    else
+        head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'
+    fi
+}
+
 if [ -f .env ] && grep -q "^QL_PASSWORD=" .env && ! grep -q "^QL_PASSWORD=changeme$" .env; then
     echo "✅ 已有 .env 配置，跳过初始化"
 else
-    read -r -p "设置访问密码（所有 API 鉴权用，直接回车=changeme）: " PW
-    PW="${PW:-changeme}"
+    read -r -p "设置访问密码（所有 API 鉴权用，直接回车=随机生成）: " PW
+    PW="${PW:-$(_rand_hex)}"
     cat > .env <<EOF
 QL_PASSWORD=${PW}
 EOF
     echo "✅ .env 已生成"
 fi
+
+# BE3：老 .env 里没有这两个变量 → 补随机值并打印（需同步到 Hermes 插件/cron 配置）
+for _v in QL_INBOX_TOKEN QL_PUSH_TOKEN; do
+    if ! grep -q "^${_v}=." .env; then
+        sed -i "/^${_v}=/d" .env 2>/dev/null || true
+        _tv=$(_rand_hex)
+        echo "${_v}=${_tv}" >> .env
+        echo "→ 已生成 ${_v}=${_tv}（请同步到 Hermes 侧使用同一值）"
+    fi
+done
 
 read -r -p "上游 LLM 端点（OpenAI 兼容，回车=host.docker.internal:9123）: " LLM
 if [ -n "$LLM" ]; then

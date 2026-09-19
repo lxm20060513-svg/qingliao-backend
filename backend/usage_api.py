@@ -27,7 +27,12 @@ def _cfg() -> dict:
     if _yaml is None:
         return {}
     try:
-        with open(os.environ.get("QL_HERMES_CONFIG", "/data/hermes_config.yaml"), encoding="utf-8") as f:
+        import provider_admin
+        path = provider_admin.hermes_cfg_path()   # BE23：与 provider_admin/stream_api 同一份路径
+    except Exception:
+        path = os.environ.get("QL_HERMES_CONFIG", "/data/hermes_config.yaml")
+    try:
+        with open(path, encoding="utf-8") as f:
             cfg = _yaml.safe_load(f)
         return cfg or {}
     except Exception:

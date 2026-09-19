@@ -7,6 +7,7 @@ Hermes 容器内 relay(9460) 投递，成功即标记 done；失败/relay 不可
 存储：QL_DATA_DIR/push_queue.json  [{id, text, ts, status: pending|sending|done}]
 """
 import json
+import hmac
 import os
 import threading
 import time
@@ -18,7 +19,9 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("QL_DATA_DIR", os.path.join(os.path.dirname(BASE), "data"))
 QUEUE_FILE = os.path.join(DATA_DIR, "push_queue.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "push_settings.json")
-PUSH_TOKEN = os.environ.get("QL_PUSH_TOKEN", "ql-push-default")
+# BE3：公开仓库里的默认值等于没有密码，改为空=服务拒绝放行（fail-closed）。
+# 部署时必须在 .env 注入 QL_PUSH_TOKEN，并让 Hermes 侧 cron 用同一个值。
+PUSH_TOKEN = os.environ.get("QL_PUSH_TOKEN", "")
 
 _lock = threading.RLock()
 RELAY_GRACE = 10          # 入队后给 relay 即时投递的宽限秒数，期间 cron 不拉（防竞态重复）
@@ -178,7 +181,10 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _auth(self):
-        return self.headers.get("X-Push-Token") == PUSH_TOKEN
+        # BE3：未配置 QL_PUSH_TOKEN 时一律拒绝（旧写法 `header == ""` 会让空头通过）
+        if not PUSH_TOKEN:
+            return False
+        return hmac.compare_digest(self.headers.get("X-Push-Token", ""), PUSH_TOKEN)
 
     # v3.0.6 security review：settings 接口需鉴权，但要兼容两种调用方——
     # App 设置页带 X-Auth-Token（登录 token）、微信推送 cron 带 X-Push-Token

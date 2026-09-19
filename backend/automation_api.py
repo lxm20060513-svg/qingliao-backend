@@ -6,6 +6,7 @@
 """
 import json
 import os
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -20,32 +21,40 @@ AUTO_FILE = os.path.join(DATA_DIR, "automations.json")
 LOG_FILE = os.path.join(DATA_DIR, "automations.log")
 HISTORY_FILE = os.path.join(DATA_DIR, "execution_history.json")   # v2.0.116：执行历史（自动化+场景）
 MAX_HISTORY = 200
+# BE12：执行历史是「读-改-写」，写入方有 3s 调度线程、HTTP 线程（场景执行）与删除/清空接口，
+# 原来完全无锁 → 并发时后写覆盖前写、丢条目；且固定 .tmp 文件名会被两个写者互相踩。
+_hist_lock = threading.RLock()
 
 
 def append_history(htype, name, ok, detail=""):
     """记录执行历史（自动化 scheduler / 场景执行 共用）"""
     try:
-        items = []
-        try:
-            with open(HISTORY_FILE, encoding="utf-8") as f:
-                items = json.load(f)
-        except Exception:
-            pass
-        items.append({"id": f"{time.strftime('%m%d%H%M%S')}-{len(items)}",
-                      "ts": time.strftime("%m-%d %H:%M:%S"),
-                      "type": htype, "name": name,
-                      "ok": bool(ok), "detail": (detail or "")[:120]})
-        items = items[-MAX_HISTORY:]
-        _write_history(items)
+        with _hist_lock:
+            items = load_history()
+            items.append({"id": f"{time.strftime('%m%d%H%M%S')}-{len(items)}",
+                          "ts": time.strftime("%m-%d %H:%M:%S"),
+                          "type": htype, "name": name,
+                          "ok": bool(ok), "detail": (detail or "")[:120]})
+            items = items[-MAX_HISTORY:]
+            _write_history(items)
     except Exception:
         pass
 
 
 def _write_history(items):
-    tmp = HISTORY_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(items, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, HISTORY_FILE)
+    os.makedirs(DATA_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, HISTORY_FILE)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except Exception:
+            pass
+        raise
 
 
 def load_history():
@@ -64,18 +73,17 @@ def load_history():
 def delete_history(ids):
     """按 id 列表删除单条/多条，返回剩余列表"""
     ids = set(ids)
-    items = [h for h in load_history() if h.get("id") not in ids]
-    _write_history(items)
+    with _hist_lock:
+        items = [h for h in load_history() if h.get("id") not in ids]
+        _write_history(items)
     return items
 
 
 def clear_history():
     """清空全部历史"""
-    _write_history([])
+    with _hist_lock:
+        _write_history([])
     return []
-
-HA_URL = os.environ.get("QL_HA_URL", "http://localhost:8123")
-HA_TOKEN = os.environ.get("QL_HA_TOKEN", "")
 
 _lock = threading.Lock()
 _scheduler_started = False
@@ -154,9 +162,10 @@ def exec_actions(actions):
         try:
             domain, _, svc = service.partition(".")
             svc_path = svc or domain
+            ha_url, ha_token = rules_engine.ha_creds()   # BE7：与 ha_proxy/rules_engine 同源
             body = json.dumps({"entity_id": entity, **data}).encode()
-            req = urllib.request.Request(f"{HA_URL}/api/services/{domain}/{svc_path}", data=body,
-                                         headers={"Authorization": "Bearer " + HA_TOKEN,
+            req = urllib.request.Request(f"{ha_url}/api/services/{domain}/{svc_path}", data=body,
+                                         headers={"Authorization": "Bearer " + ha_token,
                                                   "Content-Type": "application/json"}, method="POST")
             with urllib.request.urlopen(req, timeout=15):
                 ok += 1

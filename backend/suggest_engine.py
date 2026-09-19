@@ -18,8 +18,6 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("QL_DATA_DIR", os.path.join(os.path.dirname(BASE), "data"))
 STATE_FILE = os.path.join(DATA_DIR, "active_suggestions.json")
 
-HA_URL = os.environ.get("QL_HA_URL", "http://localhost:8123")
-HA_TOKEN = os.environ.get("QL_HA_TOKEN", "")
 WEATHER_URL = os.environ.get("QL_WEATHER_URL", "http://127.0.0.1:9127")
 
 CHECK_INTERVAL = 1800   # 30 分钟
@@ -72,8 +70,10 @@ def _weather():
 
 def _ha_states():
     try:
-        req = urllib.request.Request(f"{HA_URL}/api/states",
-                                     headers={"Authorization": f"Bearer {HA_TOKEN}"})
+        import rules_engine
+        ha_url, ha_token = rules_engine.ha_creds()      # BE7：与 ha_proxy/rules_engine 同源
+        req = urllib.request.Request(f"{ha_url}/api/states",
+                                     headers={"Authorization": f"Bearer {ha_token}"})
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read())
     except Exception:

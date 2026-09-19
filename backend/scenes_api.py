@@ -5,7 +5,6 @@
 - 执行：逐条调用 Home Assistant，汇总结果
 端口 9142。"""
 import json
-import hmac
 import os
 import tempfile
 import urllib.request
@@ -13,8 +12,6 @@ from http.server import BaseHTTPRequestHandler
 
 DATA_DIR = os.environ.get("QL_DATA_DIR", "/data")
 SCENES_FILE = os.path.join(DATA_DIR, "scenes.json")
-HA_URL = os.environ.get("QL_HA_URL", "http://localhost:8123")
-HA_TOKEN = os.environ.get("QL_HA_TOKEN", "")
 LOCK = __import__("threading").Lock()
 
 
@@ -75,9 +72,11 @@ def run_scene(name):
             # v2.0.102c：service 可能是 "climate.turn_off"（点分隔）——HA API 路径是 /api/services/climate/turn_off（斜杠）
             domain, _, svc = service.partition(".")
             svc_path = svc or domain
+            import rules_engine
+            ha_url, ha_token = rules_engine.ha_creds()   # BE7：与 ha_proxy/rules_engine 同源
             body = json.dumps({"entity_id": entity, **data}).encode()
-            req = urllib.request.Request(f"{HA_URL}/api/services/{domain}/{svc_path}", data=body,
-                                         headers={"Authorization": "Bearer " + HA_TOKEN,
+            req = urllib.request.Request(f"{ha_url}/api/services/{domain}/{svc_path}", data=body,
+                                         headers={"Authorization": "Bearer " + ha_token,
                                                   "Content-Type": "application/json"}, method="POST")
             with urllib.request.urlopen(req, timeout=15) as r:
                 ok_count += 1
@@ -115,14 +114,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _auth(self):
         # v2.0.116 review：修复任意非空 X-Auth-Token 即放行——token 必须真实有效
-        pw = os.environ.get("QL_PASSWORD", "change-me")
-        tok = self.headers.get("X-Auth-Token", "")
-        if tok:
-            import auth_api
-            if auth_api.check_auth(self.headers, "X-Scenes-Password", pw):
-                return True
-        return bool(self.headers.get("X-Scenes-Password")) and \
-            hmac.compare_digest(self.headers.get("X-Scenes-Password", ""), pw)
+        # BE4：删掉尾部「带 X-Scenes-Password 即放行」的无条件旁路（v2.0.116 已刻意关闭
+        # 密码兜底，只有本模块一直留着；且 QL_PASSWORD 未配置时它比的是公开常量 change-me）。
+        # 密码兜底统一交回 auth_api 的 QINGLIAO_ALLOW_PW_FALLBACK 开关。
+        import auth_api
+        return auth_api.check_auth(self.headers, "X-Scenes-Password",
+                                   os.environ.get("QL_PASSWORD", ""))
 
     def do_OPTIONS(self):
         self.send_response(204)

@@ -7,7 +7,14 @@ services:
       - "9125-9150:9125-9150"
     environment:
       # 必填：统一访问密码（所有 API 的密码鉴权）
-      QL_PASSWORD: ${QL_PASSWORD:-changeme}
+      # BE4：默认值 "changeme" 与代码里的 "change-me" 都是公开常量，去掉——
+      # 留空时 auth_api 自动生成随机密码写入 /data/initial_password.txt
+      QL_PASSWORD: ${QL_PASSWORD:-}
+
+      # === 服务间 token（BE3：刻意不给默认值；留空 = 对应接口拒绝放行）===
+      # Hermes 插件 / cron 必须使用与此处相同的值
+      QL_INBOX_TOKEN: ${QL_INBOX_TOKEN:-}
+      QL_PUSH_TOKEN: ${QL_PUSH_TOKEN:-}
       
       # === 数据目录 ===
       QL_DATA_DIR: ${QL_DATA_DIR:-/data}

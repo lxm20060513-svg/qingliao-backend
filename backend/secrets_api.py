@@ -29,27 +29,47 @@ def _load_key():
 
 _fernet = Fernet(_load_key().encode())
 
+# BE6：STORE 存在却解不出来（换了 /data/.secrets_key、或上次非原子写只留了半截）时，
+# _load 旧实现一律返回 []，于是任何一次「新增/删除」都会把「读失败」当「空表」写回去
+# —— 全部已存凭证被静默清空。现在记住这个状态并拒绝写盘。
+_read_failed = False
+
+
 def _load():
+    global _read_failed
+    _read_failed = False
     if not os.path.exists(STORE):
         return []
     try:
-        data = _fernet.decrypt(open(STORE, 'rb').read())
-        items = json.loads(data)
+        with open(STORE, 'rb') as f:
+            items = json.loads(_fernet.decrypt(f.read()))
         return items if isinstance(items, list) else []
     except Exception:
+        _read_failed = True
         return []
 
+
 def _save(items):
-    enc = _fernet.encrypt(json.dumps(items, ensure_ascii=False).encode('utf-8'))
-    with open(STORE, 'wb') as f:
-        f.write(enc)
-    os.chmod(STORE, 0o600)
+    """原子落盘（BE6：tmp + os.replace，不再边写边 chmod）。返回 False = 拒绝覆盖损坏文件。"""
+    if _read_failed:
+        return False
+    tmp = STORE + ".tmp"
+    with open(tmp, 'wb') as f:
+        f.write(_fernet.encrypt(json.dumps(items, ensure_ascii=False).encode('utf-8')))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STORE)
+    return True
+
+
+SAVE_REFUSED = {'ok': False, 'error': '凭据文件无法解密，已拒绝写入以免清空已有凭据（请检查 /data/.secrets_key 是否被更换）'}
+
 
 def find_router_cred():
     """供 router_api 等模块读取：优先取 type=router 且含密码的条目"""
-    for it in _load():
-        if it.get('type') == 'router' and it.get('password'):
-            return it
+    with _lock:   # BE6：原来无锁读，与 handler 的读-改-写交错
+        for it in _load():
+            if it.get('type') == 'router' and it.get('password'):
+                return it
     return None
 
 class Handler(BaseHTTPRequestHandler):
@@ -161,7 +181,9 @@ class Handler(BaseHTTPRequestHandler):
                 items.append({'id': sid, 'name': name, 'type': stype,
                               'address': address, 'username': username,
                               'password': password})
-            _save(items)
+            if not _save(items):
+                self._send(SAVE_REFUSED, 500)
+                return
         self._send({'ok': True, 'id': sid})
 
     def do_DELETE(self):
@@ -179,7 +201,9 @@ class Handler(BaseHTTPRequestHandler):
             if len(new) == len(items):
                 self._send({'ok': False, 'error': '条目不存在'}, 404)
                 return
-            _save(new)
+            if not _save(new):
+                self._send(SAVE_REFUSED, 500)
+                return
         self._send({'ok': True, 'deleted': 1})
 
     def log_message(self, fmt, *args):

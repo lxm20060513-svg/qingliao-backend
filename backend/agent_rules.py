@@ -8,12 +8,16 @@
 import json
 import os
 import re
+import tempfile
+import threading
 import time
 import uuid
 
 DATA_DIR = os.environ.get("QL_DATA_DIR", "/data")
 RULES_PATH = os.path.join(DATA_DIR, "agent_rules.json")
 MAX_RULES = 20
+# BE12：读-改-写并发（对话里 stream_api 自动加规则 vs 设置页 agent_api 增删改）会互相覆盖丢条目
+_lock = threading.Lock()
 
 # 声明话术：以后/下次/之后/记住 ... XX ... agent/工具/直接/自动
 # 前缀词放在非捕获组（不进 group(1)），提取出的 pattern 才是干净功能词（如 "查内存"）
@@ -35,22 +39,25 @@ def _load():
 
 
 def _save(rules):
+    """原子写（v3.0.28：tmp+fsync+os.replace）。BE12：返回是否真的落盘——
+    原来固定返回 None 并吞掉全部异常，调用方无论成败都回「已记住」。"""
+    tmp = None
     try:
         os.makedirs(os.path.dirname(RULES_PATH), exist_ok=True)
-        # v3.0.28 review：原子写（tmp+fsync+os.replace），防并发写坏
-        import tempfile
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(RULES_PATH), suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump({"rules": rules[-MAX_RULES:]}, f, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, RULES_PATH)
+        return True
     except Exception:
         try:
-            if os.path.exists(tmp):
+            if tmp and os.path.exists(tmp):
                 os.unlink(tmp)
         except Exception:
             pass
+        return False
 
 
 def list_rules():
@@ -61,18 +68,25 @@ def add_rule(pattern):
     p = pattern.strip()
     if not p or len(p) < 2 or len(p) > 40:
         return False, "规则内容太短或太长"
-    rules = _load()
-    for r in rules:
-        if r.get("pattern") == p:
-            return False, f"规则「{p}」已存在"
-    rules.append({"id": uuid.uuid4().hex[:8], "pattern": p, "created": time.strftime("%m-%d %H:%M")})
-    _save(rules)
+    with _lock:
+        rules = _load()
+        for r in rules:
+            if r.get("pattern") == p:
+                return False, f"规则「{p}」已存在"
+        rules.append({"id": uuid.uuid4().hex[:8], "pattern": p, "created": time.strftime("%m-%d %H:%M")})
+        if not _save(rules):
+            return False, "规则保存失败（检查数据目录是否可写）"
     return True, f"已记住：以后「{p}」直接交给 Agent 处理"
 
 
 def delete_rule(rid):
-    rules = [r for r in _load() if r.get("id") != rid]
-    _save(rules)
+    with _lock:
+        rules = _load()
+        new = [r for r in rules if r.get("id") != rid]
+        if len(new) == len(rules):
+            return False, "规则不存在"
+        if not _save(new):
+            return False, "规则删除失败（检查数据目录是否可写）"
     return True, "规则已删除"
 
 
@@ -81,17 +95,19 @@ def update_rule(rid, pattern):
     p = (pattern or "").strip()
     if not p or len(p) < 2 or len(p) > 40:
         return False, "规则内容太短或太长"
-    rules = _load()
-    target = None
-    for r in rules:
-        if r.get("id") == rid:
-            target = r
-        elif r.get("pattern") == p:
-            return False, f"规则「{p}」已存在"
-    if target is None:
-        return False, "规则不存在"
-    target["pattern"] = p
-    _save(rules)
+    with _lock:
+        rules = _load()
+        target = None
+        for r in rules:
+            if r.get("id") == rid:
+                target = r
+            elif r.get("pattern") == p:
+                return False, f"规则「{p}」已存在"
+        if target is None:
+            return False, "规则不存在"
+        target["pattern"] = p
+        if not _save(rules):
+            return False, "规则更新失败（检查数据目录是否可写）"
     return True, f"已更新：以后「{p}」直接交给 Agent 处理"
 
 

@@ -37,7 +37,9 @@ from http.server import BaseHTTPRequestHandler
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("QL_DATA_DIR", os.path.join(os.path.dirname(BASE), "data"))
 QUEUE_FILE = os.path.join(DATA_DIR, "inbox_queue.json")
-INBOX_TOKEN = os.environ.get("QL_INBOX_TOKEN", "ql-inbox-default")
+# BE3：默认值曾是公开仓库里可读的常量，改空串=拒绝一切（fail-closed）；
+# 部署时 .env 必须注入 QL_INBOX_TOKEN，且与 Hermes 插件侧使用同一个值。
+INBOX_TOKEN = os.environ.get("QL_INBOX_TOKEN", "")
 # 收件箱上限（防堆积）
 QUEUE_LIMIT = 100
 # sending 未 done 超过此时长（秒）→ 重置回 pending 重投

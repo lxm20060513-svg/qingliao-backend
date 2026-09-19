@@ -4,7 +4,15 @@ import json
 import os
 
 DEFAULT_DIR = os.environ.get("QL_UPLOAD_DIR", "/data/uploads")
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "upload_config.json")
+# BE5：存代码目录 → 重建镜像即丢自定义上传目录，改存持久化的 QL_DATA_DIR
+CONFIG_PATH = os.path.join(os.environ.get("QL_DATA_DIR", "/data"), "upload_config.json")
+_legacy = os.path.join(os.path.dirname(os.path.abspath(__file__)), "upload_config.json")
+if not os.path.exists(CONFIG_PATH) and os.path.exists(_legacy):
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        os.replace(_legacy, CONFIG_PATH)   # BE5：升级当次保住已设置的自定义上传目录
+    except Exception:
+        pass
 
 
 def get_dir():

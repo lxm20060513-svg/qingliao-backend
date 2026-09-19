@@ -43,6 +43,8 @@ from http.server import BaseHTTPRequestHandler
 STREAM_PASS = os.environ.get("STREAM_PASS", "")
 MAX_CONTENT_LEN = 200_000   # v2.0.116 review：回复内容上限（防无限输出）
 MAX_CONTEXT_MESSAGES = int(os.environ.get("STREAM_MAX_CONTEXT_MSGS", 40))  # 上下文消息上限，超出自动截断旧消息
+# BE1：/api/stream/media 免鉴权，单次响应大小上限（生成物图片/PDF 足够，日志类不再整本读进内存）
+MAX_MEDIA_BYTES = int(os.environ.get("QL_MAX_MEDIA_BYTES", 32 * 1024 * 1024))
 DATA_DIR = os.environ.get("STREAM_DATA_DIR", "/data/streams_data")
 STREAM_DIR = os.path.join(DATA_DIR, "streams")
 HERMES_URL = os.environ.get("STREAM_HERMES_URL", "http://127.0.0.1:9123/v1/chat/completions")
@@ -241,11 +243,22 @@ SYNC_ENDPOINTS = {
     "zai-coding": ("https://api.z.ai/api/coding/paas/v4/models", ["providers", "zai-coding", "api_key"]),
 }
 
+def _hermes_cfg_path():
+    """BE23：Hermes config.yaml 路径统一由 provider_admin 解析（QL_HERMES_CONFIG →
+    QL_CONFIG_YAML → 默认）。原来 4 个模块各读各的、连默认值都不一致（本函数原调用点之一
+    写的是 /etc/hermes/config.yaml），而 compose 只注入 QL_CONFIG_YAML → 净部署全是死路。"""
+    try:
+        import provider_admin
+        return provider_admin.hermes_cfg_path()
+    except Exception:
+        return os.environ.get("QL_HERMES_CONFIG", "/data/hermes_config.yaml")
+
+
 def _load_cfg_key(keypath):
     if _yaml is None:
         return ""
     # Hermes 配置路径（QL_HERMES_CONFIG 环境变量指定）
-    for path in (os.environ.get("QL_HERMES_CONFIG", "/data/hermes_config.yaml"),):
+    for path in (_hermes_cfg_path(),):
         try:
             with open(path, encoding="utf-8") as f:
                 cfg = _yaml.safe_load(f)
@@ -264,7 +277,7 @@ def _provider_base_url(pid):
     if _yaml is None:
         return None
     try:
-        with open(os.environ.get("QL_HERMES_CONFIG", "/data/hermes_config.yaml"), encoding="utf-8") as f:
+        with open(_hermes_cfg_path(), encoding="utf-8") as f:
             cfg = _yaml.safe_load(f)
         p = (cfg.get("providers") or {}).get(pid)
         if isinstance(p, dict) and p.get("base_url"):
@@ -617,7 +630,8 @@ _ql_stream_lock = threading.Lock()
 # ①流式任务（App 发出的请求，streaming 即 AI 干活中）直接从 _tasks 收集；
 # ②其他后台作业（webhook/cron 触发、不经 App 流式）由 _bgjob_register 登记。
 # v3.4.25：QL_INBOX_TOKEN 环境变量在模块加载时读取（/api/tasks/bg 端点鉴权用）
-INBOX_TOKEN_ENV = os.environ.get("QL_INBOX_TOKEN", "ql-inbox-default")
+# BE3：与 inbox_api 同源、同口径——默认空串（原 "ql-inbox-default" 是公开常量，等于无鉴权）
+INBOX_TOKEN_ENV = os.environ.get("QL_INBOX_TOKEN", "")
 _background_jobs = {}
 _background_jobs_lock = threading.Lock()
 _BGJOB_TTL = 2 * 3600        # 完成作业保留 2h 供查看
@@ -878,7 +892,7 @@ def _agent_key():
         return AGENT_KEY
     try:
         import re
-        txt = open(os.environ.get("QL_HERMES_CONFIG", "/etc/hermes/config.yaml"), encoding="utf-8").read()
+        txt = open(_hermes_cfg_path(), encoding="utf-8").read()
         m = re.search(r"deepseek:\s*\n\s*api_key:\s*([A-Za-z0-9_\-]+)", txt)
         if m:
             return m.group(1)
@@ -2484,14 +2498,22 @@ def _serve_media(self):
         self._send(400, {"error": "bad p"})
         return
     # 容器路径 → 宿主路径（App 直接编码 MEDIA: 里的容器路径）
-    for _pre, _host in [(os.environ.get("QL_DATA_DIR", "/data"), os.environ.get("QL_HERMES_DATA_DIR", "/data/hermes")),
-                        ("/opt/hermes_host", os.environ.get("QL_HERMES_ROOT", "/data/hermes"))]:
+    # BE2：与 media_convert._PREFIX_MAP 同一份映射，环境变量名对齐 docker-compose
+    import media_convert as _mc
+    for _pre, _host in _mc._PREFIX_MAP:
         if path == _pre or path.startswith(_pre + "/"):
             path = _host + path[len(_pre):]
             break
-    # 只允许 hermes-data(/data/hermes) 与轻聊 data 目录下的图片（防任意文件读取）
-    allowed = [os.environ.get("QL_HERMES_DATA", "/data/hermes"), os.environ.get("QL_DATA_DIR", "/data")]
-    if not any(path.startswith(a) for a in allowed):
+    # BE1：只允许 hermes 媒体/生成物目录与上传目录。刻意不含 QL_DATA_DIR 本身——
+    # initial_password.txt / auth_config.json / custom_providers.json / auth_tokens.json
+    # 都在该目录根部，免鉴权接口整目录放行等于公开读凭证。
+    allowed = [os.environ.get("QL_HERMES_DATA_DIR", "/data/hermes"),
+               os.environ.get("QL_HERMES_ROOT_DIR", "/data/hermes"),
+               os.environ.get("QL_HERMES_HOST_DIR", "/data/hermes_host"),
+               os.environ.get("QL_UPLOAD_DIR", "/data/uploads")]
+    real = os.path.realpath(path)
+    _roots = [os.path.realpath(a) for a in allowed]
+    if not any(real == r or real.startswith(r + os.sep) for r in _roots):
         self._send(403, {"error": "forbidden path"})
         return
     ext = os.path.splitext(path)[1].lower()
@@ -2507,14 +2529,28 @@ def _serve_media(self):
              ".txt": "text/plain; charset=utf-8", ".md": "text/plain; charset=utf-8",
              ".csv": "text/csv; charset=utf-8", ".json": "application/json; charset=utf-8",
              ".log": "text/plain; charset=utf-8"}.get(ext)
-    if not ctype or not os.path.isfile(path):
+    if not ctype or not os.path.isfile(real):
         self._send(404, {"error": "not found"})
         return
+    # BE1：媒体目录内也不放行的文件名（防止把配置/密钥类文件当生成物读走）
+    _base = os.path.basename(real).lower()
+    if (_base.startswith(".") or any(w in _base for w in ("password", "token", "secret",
+                                                          "credential", "config", "apikey"))
+            or _base.endswith((".env", ".key", ".pem", ".yaml", ".yml"))):
+        self._send(403, {"error": "forbidden file"})
+        return
     try:
-        with open(path, "rb") as f:
-            data = f.read()
+        # BE1：大小上限，防单次请求把整本日志/大文件读进内存
+        if os.path.getsize(real) > MAX_MEDIA_BYTES:
+            self._send(413, {"error": "too large"})
+            return
+        with open(real, "rb") as f:
+            data = f.read(MAX_MEDIA_BYTES + 1)
     except OSError:
         self._send(404, {"error": "read fail"})
+        return
+    if len(data) > MAX_MEDIA_BYTES:
+        self._send(413, {"error": "too large"})
         return
     self.send_response(200)
     self.send_header("Content-Type", ctype)

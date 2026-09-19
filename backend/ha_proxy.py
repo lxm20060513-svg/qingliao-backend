@@ -24,7 +24,9 @@ def _ha_cred():
 
 HA_URL = os.environ.get("QL_HA_URL", "http://localhost:8123")
 HA_TOKEN = os.environ.get("QL_HA_TOKEN", "")
-HA_PASSWORD = os.environ.get("QL_PASSWORD", "change-me")
+# BE4：默认值改空串（"change-me" 是公开仓库里的常量；密码兜底本身已由
+# QINGLIAO_ALLOW_PW_FALLBACK 默认关闭，这里只是不留弱口令）
+HA_PASSWORD = os.environ.get("QL_PASSWORD", "")
 
 
 def _keep_entity(e):
@@ -82,10 +84,12 @@ class HAProxyHandler(http.server.BaseHTTPRequestHandler):
         if "?" in path:
             path, _, query = path.partition("?")
             path = path + "?" + query
-        url = HA_URL + path
+        # BE8：地址也取已保存的配置（原写法 url 用 HA_URL 算完就再不管 _addr，
+        # 导致面板「保存 HA 地址」成功但代理仍打旧地址）
+        _addr, _tok = _ha_cred()
+        url = _addr.rstrip("/") + path
 
         body = None
-        _addr, _tok = _ha_cred()
         headers = {"Authorization": "Bearer " + _tok}
         if method == "POST":
             length = int(self.headers.get("Content-Length", 0) or 0)

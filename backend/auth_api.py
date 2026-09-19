@@ -25,7 +25,10 @@ from http.server import BaseHTTPRequestHandler
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(DATA_DIR, "auth_config.json")
-TOKENS_PATH = os.path.join(BASE_DIR, "auth_tokens.json")
+# BE5：原来落在 BASE_DIR（= 镜像里的代码目录 /app），`docker compose up --build`
+# 一次性重建就把全部已签发 token 抹掉，「token 跨重启有效」形同虚设、App 被踢回登录页。
+TOKENS_PATH = os.path.join(DATA_DIR, "auth_tokens.json")
+TOKENS_PATH_LEGACY = os.path.join(BASE_DIR, "auth_tokens.json")
 DEFAULT_USER = "qingliao"
 # v2.0.116 review：默认密码优先 QL_PASSWORD 环境变量；未注入则随机生成并写文件告知
 # （原硬编码 "123" 弱口令，文档声称 QL_PASSWORD 实际代码 123——已核实）
@@ -92,6 +95,13 @@ def _load_tokens():
     global _tokens
     # v2.0.116：磁盘存 sha256(token) 哈希表——重启后恢复，token 跨重启有效（校验时哈希比对）
     now = time.time()
+    # BE5：老版本写在代码目录，一次性搬到 DATA_DIR，升级当次不掉线
+    if not os.path.exists(TOKENS_PATH) and os.path.exists(TOKENS_PATH_LEGACY):
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            os.replace(TOKENS_PATH_LEGACY, TOKENS_PATH)
+        except Exception:
+            pass
     raw = _load_json(TOKENS_PATH, {})
     _tokens = {h: exp for h, exp in raw.items() if exp > now}
 

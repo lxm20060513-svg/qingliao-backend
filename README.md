@@ -71,7 +71,10 @@ docker compose up -d
 
 | 变量 | 必填 | 默认 | 说明 |
 |---|---|---|---|
-| `QL_PASSWORD` | ✅ | `change-me` | 统一访问密码（所有 API 密码鉴权） |
+| `QL_PASSWORD` | ✅ | 空→自动生成随机密码写入 `$QL_DATA_DIR/initial_password.txt` | 统一访问密码（`install.sh` 会写进 `.env`） |
+| `QL_INBOX_TOKEN` | ✅ | 空=收件箱/后台作业接口拒绝放行 | 服务间 token，须与 Hermes 插件侧一致（`install.sh` 自动生成） |
+| `QL_PUSH_TOKEN` | ✅ | 空=推送队列接口拒绝放行 | 服务间 token，须与投递 cron 侧一致（`install.sh` 自动生成） |
+| `QL_HERMES_CONFIG` | | — | Hermes `config.yaml` 路径；不设置时按 `QL_CONFIG_YAML` → `/data/hermes_config.yaml` 依次探测 |
 | `QL_DATA_DIR` | | `/data` | 数据目录（会话/上传/日志/密钥） |
 | `QL_UPLOAD_DIR` | | `$QL_DATA_DIR/uploads` | 文件上传目录 |
 | `QL_HERMES_URL` | ✅ | — | 上游 LLM（OpenAI 兼容端点） |

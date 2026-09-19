@@ -19,12 +19,18 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler
 
 # Hermes config.yaml 路径（QL_HERMES_CONFIG 指向 Hermes config.yaml）
-HERMES_CONFIG_PATH = os.environ.get("QL_HERMES_CONFIG", "/data/hermes_config.yaml")
+# BE23：统一由 provider_admin 解析——compose 只注入 QL_CONFIG_YAML，原来这里净部署必读到空路径
+try:
+    import provider_admin as _pa
+    HERMES_CONFIG_PATH = _pa.hermes_cfg_path()
+except Exception:
+    HERMES_CONFIG_PATH = os.environ.get("QL_HERMES_CONFIG", "/data/hermes_config.yaml")
 HERMES_CONTAINER = os.environ.get("QL_HERMES_CONTAINER", "hermes-container")
 RESTART_STATUS_FILE = "/data/streams_data/mcp_restart_status.json"
 
@@ -54,9 +60,20 @@ def _read_config_text():
 
 
 def _write_config_text(text):
-    tmp = HERMES_CONFIG_PATH + ".qingliao-tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    # BE20：唯一 tmp + fsync，权限沿用原文件（config.yaml 含 API key，且 Hermes 侧要能读）
+    try:
+        _mode = os.stat(HERMES_CONFIG_PATH).st_mode & 0o777
+    except OSError:
+        _mode = 0o644
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(HERMES_CONFIG_PATH) or ".", suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        os.chmod(tmp, _mode)
+    except OSError:
+        pass
     os.replace(tmp, HERMES_CONFIG_PATH)
 
 

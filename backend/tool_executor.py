@@ -9,6 +9,8 @@ import subprocess
 import time
 import urllib.request
 
+import rules_engine   # BE7：HA 凭证统一入口 ha_creds()（仅依赖标准库，无循环 import 风险）
+
 # ---- 工具 Schema（OpenAI function calling 格式）----
 
 TOOLS = [
@@ -370,10 +372,6 @@ TOOLS = [
 ]
 
 # ---- 工具执行 ----
-
-HA_URL = os.environ.get("QL_HA_URL", "http://localhost:8123")
-HA_TOKEN = os.environ.get("QL_HA_TOKEN", "")
-
 
 
 def _hermes_tool_call(tool_name, tool_args, timeout=120):
@@ -753,12 +751,30 @@ def _hermes_execute(task, agent_model=None, agent_provider=None):
         return f"Hermes 转交失败：{str(e)[:150]}"
 
 
+def _ha_service_url(service, entity):
+    """BE9：HA 服务路径是 /api/services/<domain>/<service>（斜杠），模型给的却是点分隔
+    "climate.turn_off"。原先直接 f".../api/services/{service}" 拼 → agent 控制设备 100% 404。
+    service 不含点时按 entity 前缀补 domain（"light.bed" + "turn_on" → light/turn_on）。
+    返回 (url, token)；推不出 domain 时抛 ValueError（由 _ha_call 回成失败说明给模型）。
+    """
+    domain, _, svc = (service or "").partition(".")
+    if not svc:
+        svc = domain
+        domain = entity.split(".", 1)[0] if isinstance(entity, str) and "." in entity else ""
+    if not domain or not svc:
+        raise ValueError("service=%r 无法确定 domain（需 domain.service 形式，或 entity 带前缀如 light.bed）"
+                         % service)
+    ha_url, ha_token = rules_engine.ha_creds()           # BE7：与 ha_proxy/rules_engine 同源
+    return "%s/api/services/%s/%s" % (ha_url, domain, svc), ha_token
+
+
 def _ha_call(entity, service, data):
     try:
+        url, ha_token = _ha_service_url(service, entity)
         body = json.dumps({"entity_id": entity, **data}).encode()
-        req = urllib.request.Request(f"{HA_URL}/api/services/{service}",
+        req = urllib.request.Request(url,
                                      data=body, headers={
-                                         "Authorization": "Bearer " + HA_TOKEN,
+                                         "Authorization": "Bearer " + ha_token,
                                          "Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=15) as r:
             return f"HA 调用成功（{service} {entity}）：HTTP {r.status}"
@@ -769,8 +785,9 @@ def _ha_call(entity, service, data):
 def _ha_list_entities():
     """列出 HA 实体（灯/空调/开关/安防/传感器电量）"""
     try:
-        req = urllib.request.Request(HA_URL + "/api/states",
-                                     headers={"Authorization": "Bearer " + HA_TOKEN}, method="GET")
+        ha_url, ha_token = rules_engine.ha_creds()      # BE7
+        req = urllib.request.Request(ha_url + "/api/states",
+                                     headers={"Authorization": "Bearer " + ha_token}, method="GET")
         with urllib.request.urlopen(req, timeout=15) as r:
             states = json.loads(r.read())
         lines = []
