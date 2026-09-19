@@ -1942,7 +1942,11 @@ class StreamHandler(BaseHTTPRequestHandler):
             except Exception:
                 return self._send(400, {"error": "bad json"})
             tk = (self.headers.get("X-Inbox-Token") or "").strip()
-            if not tk:
+            # v3.9.41（B3）原来是 `if not tk` —— 只判「非空」，任意垃圾 token 都能过。
+            # 这条分支写的是**别人会话里的流式正文**（下面按 chat_id 找到 _ql_stream_task
+            # 对应的 task 直接追加 delta / 置 status=done），所以未鉴权即可注入他人回复。
+            # 同文件紧接其后的 /api/tasks/bg 一直用的是 compare_digest，这里补齐同一口径。
+            if not tk or not hmac.compare_digest(tk, INBOX_TOKEN_ENV):
                 return self._send(401, {"error": "unauthorized"})
             chat_id = str(dat.get("chat_id", ""))
             delta = str(dat.get("delta", ""))

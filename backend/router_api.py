@@ -3,7 +3,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # 路由器面板后端：状态查询 + Clash 快捷启停
 # 连接方式：宿主 docker exec hermes 容器内 paramiko 连路由器（NAS 宿主无 paramiko）
-# 凭据：优先 secrets_api 存储的 type=router 条目，缺省 root/admin
+# 凭据：优先 secrets_api 存储的 type=router 条目，缺省读 QL_ROUTER_* 环境变量
 
 ROUTER_DEFAULT = {'host': os.environ.get("QL_ROUTER_HOST", ""), 'port': 22, 'username': os.environ.get("QL_ROUTER_USER", "root"), 'password': os.environ.get("QL_ROUTER_PASS", "")}
 CONTAINER = os.environ.get('QL_HERMES_CONTAINER', 'hermes-container')
@@ -201,7 +201,12 @@ class Handler(BaseHTTPRequestHandler):
     def _cors(self):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-Auth-Token')
+
+    def _check_auth(self):
+        import auth_api
+        return auth_api.check_auth(self.headers, "X-Router-Password",
+                                   os.environ.get("QL_PASSWORD", ""))
 
     def _send(self, data, code=200):
         body = json.dumps(data, ensure_ascii=False).encode('utf-8')
@@ -221,12 +226,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        if not self._check_auth():
+            self._send({'ok': False, 'error': '未授权'}, 401)
+            return
         if self.path == '/api/router/status' or self.path.startswith('/api/router/status?'):
             self._send(_router_status())
             return
         self._send({'ok': False, 'error': 'not found'}, 404)
 
     def do_POST(self):
+        if not self._check_auth():
+            self._send({'ok': False, 'error': '未授权'}, 401)
+            return
         if self.path in ('/api/router/clash/start', '/api/router/clash/stop'):
             action = 'start' if self.path.endswith('start') else 'stop'
             self._send(_clash(action))
