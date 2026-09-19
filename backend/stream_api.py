@@ -2506,11 +2506,16 @@ def _serve_media(self):
             break
     # BE1：只允许 hermes 媒体/生成物目录与上传目录。刻意不含 QL_DATA_DIR 本身——
     # initial_password.txt / auth_config.json / custom_providers.json / auth_tokens.json
-    # 都在该目录根部，免鉴权接口整目录放行等于公开读凭证。
+    # 都在该目录根部，免鉴权接口整目录放行等于公开读凭证（sessions/streams 同理）。
+    # 但生成物确实会落在 DATA_DIR/files（AI 出图、报告、CSV…），所以**只显式放行 files
+    # 子目录**，根目录与 sessions/、streams/、kb/ 一律不放行。
+    # 注意 QL_HERMES_HOST_DIR：若把它指向包含凭据的父目录（例如整个 docker 根），
+    # 等于把上面这条收窄作废——按部署实际语义给到媒体目录本身。
     allowed = [os.environ.get("QL_HERMES_DATA_DIR", "/data/hermes"),
                os.environ.get("QL_HERMES_ROOT_DIR", "/data/hermes"),
                os.environ.get("QL_HERMES_HOST_DIR", "/data/hermes_host"),
-               os.environ.get("QL_UPLOAD_DIR", "/data/uploads")]
+               os.environ.get("QL_UPLOAD_DIR", "/data/uploads"),
+               os.path.join(os.environ.get("QL_DATA_DIR", "/data"), "files")]
     real = os.path.realpath(path)
     _roots = [os.path.realpath(a) for a in allowed]
     if not any(real == r or real.startswith(r + os.sep) for r in _roots):
