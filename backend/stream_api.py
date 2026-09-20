@@ -21,6 +21,7 @@ import hmac
 import json
 import os
 import kb_inject
+import doc_ref          # v3.9.44：附件正文按需注入（消息只存 doc= 引用）
 import memory_store
 import media_convert  # v2.0.130: MEDIA:路径→data URL 图片
 import re
@@ -1435,6 +1436,10 @@ def _build_hermes_messages(st, last_user, is_agent):
     user_content = last_user if isinstance(last_user, list) else str(last_user or "")
     if not sanitized or sanitized[-1].get("role") != "user":
         sanitized = sanitized + [{"role": "user", "content": user_content}]
+    # v3.9.44（方案1+3）：附件正文按需注入——聊天消息里只存「（已上传 NAS：doc=…）」引用，
+    # 全文在这一步才从上传原件读出来（最新 user 轮全文、更早轮节选）。历史每轮不再重复
+    # 携带 12000 字文件全文；Word/Excel/PPT 也因此第一次能被 AI 读到。
+    sanitized = doc_ref.expand_turns(sanitized)
     if is_agent:
         sys_content = ("你是轻聊的 AI 助手，用中文简洁友好地回答用户的问题。"
                        "可以调用工具查询/控制 NAS、Docker、智能家居。"

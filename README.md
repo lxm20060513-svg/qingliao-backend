@@ -1,6 +1,6 @@
 # 轻聊后端（Qingliao Backend）
 
-家庭 NAS 上的 AI 助手后端服务，纯 Python 标准库实现（仅路由器/密码管理两个可选依赖）。为 [轻聊 iOS/Web 客户端提供 AI 对话流式代理、会话同步、文件管理、智能家居（Home Assistant）代理、Docker 管理、知识库、定时任务、密码管理等 API。
+家庭 NAS 上的 AI 助手后端服务，纯 Python 标准库为主（第三方只有 `paramiko` / `cryptography` / `PyYAML` / `PyMuPDF`）。为 [轻聊 iOS/Web 客户端提供 AI 对话流式代理、会话同步、文件管理、智能家居（Home Assistant）代理、Docker 管理、知识库、定时任务、密码管理等 API。
 
 ## ✨ 功能
 
@@ -86,6 +86,8 @@ docker compose up -d
 | `QL_ROUTER_PASSWORD` | | 空 | 路由器 SSH 密码 |
 | `QL_DOCKER_ROOT` | | `/data/docker` | Docker Compose 项目目录 |
 | `STREAM_DATA_DIR` | | `$QL_DATA_DIR/streams_data` | 流式任务数据 |
+| `STREAM_DOC_INLINE_MAX` | | `30000` | 聊天附件正文注入上限（字）：最新一条用户消息里引用的文件按此截断注入（`doc_ref.py`） |
+| `STREAM_DOC_OLDER_MAX` | | `800` | 更早历史轮里同一附件只注入这么长的节选（跨轮记得文件但不重复付全文 token） |
 | `SESSIONS_DATA_DIR` | | `$QL_DATA_DIR/sessions` | 会话数据 |
 | `QL_LOG_CONTAINER` | | `hermes` | 日志模块查询的容器名 |
 | `QL_AGENT_URL` | | DeepSeek 官方 | Agent 模式模型端点（需支持 function calling） |
@@ -113,7 +115,7 @@ docker compose up -d
 ## 📦 非 Docker 部署
 
 ```bash
-pip install paramiko cryptography   # 可选依赖
+pip install -r requirements.txt   # paramiko / cryptography / PyYAML / PyMuPDF（PDF 正文解析）
 cd backend
 export QL_PASSWORD=your-password
 export QL_HERMES_URL=http://127.0.0.1:9123/v1/chat/completions

@@ -214,11 +214,12 @@ def _extract_pptx(data):
 
 
 def _extract_pdf(data):
-    """PDF：容器内没有 PDF 库时明确提示（App 端用系统 PDFKit 走文本通道）"""
+    """PDF：需要 PyMuPDF（v3.9.44 起进 requirements）。没装时明确报错——
+    App 侧已不再自己把全文拼进消息（改发 doc= 引用），所以这里失败就是真读不到。"""
     try:
-        import fitz  # PyMuPDF（可选）
+        import fitz  # PyMuPDF
     except ImportError:
-        return "", "PDF 请用 App 端上传（App 用系统 PDFKit 提取文字）"
+        return "", "服务器未安装 PDF 解析组件（PyMuPDF），无法读取该文件正文"
     try:
         doc = fitz.open(stream=data, filetype="pdf")
         pages = [p.get_text() for p in doc]

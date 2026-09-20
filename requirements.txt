@@ -2,6 +2,9 @@
 # paramiko    —— router_api 走 SSH 管路由器（Clash 启停/状态）
 # cryptography—— secrets_api 的 Fernet 凭据存储
 # PyYAML      —— provider_admin / channel_api / stream_api / usage_api 读写 Hermes config.yaml
+# PyMuPDF     —— kb_api/doc_ref 解析 PDF 正文（import 名是 fitz）。缺失时 PDF 降级成
+#                「读取失败」提示；docx/xlsx/pptx/txt 仍走标准库 zipfile+XML，不受影响
 paramiko>=3,<4
 cryptography>=42,<46
 PyYAML>=6,<7
+PyMuPDF>=1.24,<2
