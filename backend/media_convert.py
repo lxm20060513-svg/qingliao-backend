@@ -36,19 +36,26 @@ def media_roots():
     刻意不含 QL_DATA_DIR 根部与 sessions/、streams/、kb/：initial_password.txt /
     auth_config.json / auth_tokens.json 就在那一层。生成物确实会落在 DATA_DIR/files
     （AI 出图、报告、CSV…），所以**只显式放行 files 子目录**。
-    部署注意：QL_HERMES_HOST_DIR 若指向包含凭据的父目录（例如整个 docker 根），
-    等于把这条收窄作废——按实际语义给到媒体目录本身。
+    因为白名单直接继承映射表的宿主目录，映射表里的宽条目（例如把 /opt/hermes_host 指向
+    整个 docker 根）会被一并继承——所以下面还剔除了「等于或包含 QL_DATA_DIR」的根：
+    这类根一旦放行，DATA_DIR 根部的 auth_tokens.json / sessions/ 会重新变成免鉴权可读
+    （实测 403→200）。护栏按 QL_DATA_DIR 判定，不依赖部署方是否记得收窄 QL_HERMES_HOST_DIR。
     """
     roots = [host for _, host in _PREFIX_MAP]
     roots += [_HERMES_DATA, _HERMES_ROOT,
               os.environ.get("QL_HERMES_HOST_DIR", "/data/hermes_host"),
               os.environ.get("QL_UPLOAD_DIR", "/data/uploads"),
               os.path.join(os.environ.get("QL_DATA_DIR", "/data"), "files")]
+    _d = os.path.realpath(os.environ.get("QL_DATA_DIR", "/data"))
     out, seen = [], set()
     for r in roots:
-        if r and r not in seen:
-            seen.add(r)
-            out.append(r)
+        if not r or r in seen:
+            continue
+        rr = os.path.realpath(r)
+        if rr == _d or _d.startswith(rr + os.sep):
+            continue                 # 是 QL_DATA_DIR 的祖先（或就是它）→ 剔除
+        seen.add(r)
+        out.append(r)
     return out
 
 
