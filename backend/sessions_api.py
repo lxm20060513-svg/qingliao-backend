@@ -24,15 +24,33 @@ SESSIONS_PASSWORD = os.environ.get("QL_PASSWORD", "")
 # 数据目录（root 运行，可写）：默认路径，可用 POST /api/sessions/location 修改（持久化到 LOC_FILE）
 LOC_FILE = os.path.join(DATA_DIR, "sessions_loc.json")
 
+def _dir_writable(p):
+    """真实写入探测：只读挂载（EROFS）下 os.access(W_OK) 在 root 也会骗人，必须试写一次。"""
+    probe = os.path.join(p, '.sessions_write_probe')
+    try:
+        with open(probe, 'w') as _f:
+            _f.write('')
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
 def _data_dir():
+    fallback = os.environ.get('SESSIONS_DATA_DIR', os.path.join(DATA_DIR, 'sessions'))
     try:
         with open(LOC_FILE, 'r', encoding='utf-8') as f:
             p = (json.load(f) or {}).get('path', '')
         if p and os.path.isdir(p):
-            return p
+            if _dir_writable(p):
+                return p
+            # 位置覆盖指向不可写目录时不能硬用：否则每次 merge/save 都 500，客户端只看到
+            # 「删除失败 服务器错误(500)」。典型成因：容器把宿主卷以 :ro 挂入，而这份覆盖
+            # 是历史遗留、指向该卷下的旧目录（换过数据目录名的部署最容易踩）。
+            print('[sessions] 位置覆盖不可写，回退默认目录: %s -> %s' % (p, fallback), flush=True)
     except Exception:
         pass
-    return os.environ.get('SESSIONS_DATA_DIR', os.path.join(DATA_DIR, 'sessions'))
+    return fallback
 
 def _data_file():
     return os.path.join(_data_dir(), 'sessions.json')
