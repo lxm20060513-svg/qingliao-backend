@@ -120,27 +120,15 @@ def query_deepseek() -> dict:
 
 
 def query_stepfun() -> dict:
-    p = _provider_cfg("stepfun")
-    key = _custom_key("stepfun") or p.get("api_key", "")
-    if not key:
-        return {"provider": "stepfun", "name": "阶跃 StepFun", "mode": "payg",
-                "available": False, "error": "未配置 api_key"}
-    try:
-        # 官方账户余额（platform.stepfun.com 文档：GET /v1/accounts）
-        _, j = _get_json("https://api.stepfun.com/v1/accounts", key)
-        return {
-            "provider": "stepfun", "name": "阶跃 StepFun", "mode": "payg",
-            "available": j.get("balance", 0) > 0 if isinstance(j.get("balance"), (int, float)) else False,
-            "balance": {
-                "total": j.get("balance", 0) if isinstance(j.get("balance"), (int, float)) else 0,
-                "currency": "CNY",
-            },
-            "raw": j,
-        }
-    except Exception as e:
-        # Step Plan 订阅模式：/step_plan 域可能返回 404（无此接口），降级为不可查询
-        return {"provider": "stepfun", "name": "阶跃 StepFun", "mode": "plan",
-                "available": False, "error": str(e)[:150]}
+    """Step Plan 订阅制：额度（Credit 月池）与账户按量余额是两套独立体系，官方无公开查询接口
+    → 一律降级 unsupported（App 主文本标「订阅制」，副文本提示去哪看额度）。
+    实测（2026-09-21，真 key）：GET /v1/accounts 恒 200 且 balance 全 0（订阅账号的正常表现）；
+    /step_plan/v1/{usage,credits,quota,subscription,account,balance} 全 404；
+    而 /step_plan/v1/models 与 chat/completions 均 200（= 钱在订阅侧）。
+    订阅额度只能看控制台「组织管理 > 组织用量」。"""
+    return {"provider": "stepfun", "name": "阶跃 StepFun", "mode": "plan",
+            "available": False, "unsupported": True,
+            "error": "Step Plan · 额度见控制台"}
 
 
 def query_opencode(pid="opencode-apple") -> dict:
