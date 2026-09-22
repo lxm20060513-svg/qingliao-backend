@@ -1304,9 +1304,11 @@ def _is_strong_model(provider="", model=""):
 QCARD_PROMPT = (
     "\n\n【结果卡片协议（可选）】当回复属于结构化结果类（体检/诊断/巡检/任务清单/对比表格/多步骤结果汇报），"
     "在文字总结之后追加一个 ```ql-card 代码围栏，围栏内是单个 JSON 对象（不要多对象）。字段（全部可选，有什么写什么）："
-    'type(result|metrics|list|table|status)/title/subtitle/status({text,tone:ok|warn|error|info})/'
+    'type(result|metrics|list|table|status|plan)/title/subtitle/status({text,tone:ok|warn|error|info})/'
     'fields([{key,value}])/metrics([{label,value,unit?,tone?}])/list([{title,subtitle?,status?,tone?}])/'
     'table({columns,rows})/footer。'
+    "type=plan（任务计划卡）：多步骤任务收尾时用，list 段按执行顺序放各步骤"
+    "（title=步骤名，status/tone=完成/ok、进行中/warn、跳过/信息），title 下可带 subtitle=该步结果一句话。"
     "围栏独占一行、必须闭合；围栏外文字照常写。纪律：闲聊/解释/短回复一律不要用卡片；"
     "一张卡片讲完当前这轮结果，不要多卡堆叠；JSON 必须合法（客户端解析失败会原样显示文本，不会报错）。"
 )
@@ -1867,6 +1869,20 @@ def _hermes_responses_worker(task_id, task, req_body, headers, last_write):
                     # 据此显示"在跑什么"。只存英文工具标识（非用户内容），无隐私面。
                     st["lastTool"] = str(item.get("name"))[:40]
                     st["lastToolAt"] = time.time()
+                    # v3.9.58 工具耗时：记步开始时刻，等 output_item.done 收口算秒。
+                    # 键用 call_id（done 事件带同 id 才能配上对）；无 id 的流降级为单槽
+                    # （同一时刻最多一个在跑，闭环顺序=新增顺序，够用）。
+                    _cid = str(item.get("id") or item.get("call_id") or "")
+                    try:
+                        if _cid:
+                            _spans = st.setdefault("toolSpanStart", {})
+                            _spans[_cid] = time.time()
+                            if len(_spans) > 30:
+                                _spans.pop(next(iter(_spans)))   # 防异常流把 dict 撑大
+                        else:
+                            st["toolSpanStartSolo"] = time.time()
+                    except Exception:
+                        pass
                     try:
                         _hist = st.setdefault("toolHistory", [])
                         _hist.append(str(item.get("name"))[:40])
@@ -1875,8 +1891,27 @@ def _hermes_responses_worker(task_id, task, req_body, headers, last_write):
                     except Exception:
                         pass
             elif jtype == "response.output_item.done":
-                # v3.7.0：工具进度行已下线 → ✅ 回填一并移除（已无进度行需要收尾）
-                pass
+                # v3.9.58 工具耗时收口：done 事件按 call_id 配对 added 的开始时刻，
+                # 算出该步耗时（秒）追加进 toolSpans（与 toolHistory 同序、同长度上限）。
+                # 老字段口径全保留；配不上对（异常流/老 Hermes）就记 0 秒，不影响主流程。
+                item = j.get("item") or {}
+                if item.get("type") == "function_call" and item.get("name"):
+                    try:
+                        _now = time.time()
+                        _cid = str(item.get("id") or item.get("call_id") or "")
+                        _t0 = None
+                        _spans = st.setdefault("toolSpanStart", {})
+                        if _cid and _cid in _spans:
+                            _t0 = _spans.pop(_cid)
+                        elif st.get("toolSpanStartSolo"):
+                            _t0 = st.pop("toolSpanStartSolo")
+                        _sec = max(0.0, _now - _t0) if _t0 else 0.0
+                        _hist = st.setdefault("toolSpans", [])
+                        _hist.append({"n": str(item.get("name"))[:40], "s": round(_sec, 1)})
+                        if len(_hist) > 20:
+                            del _hist[:-20]
+                    except Exception:
+                        pass
             elif jtype == "response.output_text.done":
                 # 兜底：本轮流里没出现过 delta 时，用 done 事件的整段文本补上
                 text = j.get("text") or ""
@@ -2465,6 +2500,11 @@ class StreamHandler(BaseHTTPRequestHandler):
             #   —— 工具名一律给中文（App 不必再维护一份映射表，与 _TOOL_NAME_ZH 保持一处真相）
             #   —— 只回最近 10 个，防长任务把响应撑大（轮询频率 0.15-0.25s，体积要克制）
             _th = [str(x) for x in (st.get("toolHistory") or [])][-10:]
+            # v3.9.58：工具耗时随轮询下发（[{n:中文名, s:秒}]），App 画「✓ 查天气 · 1.2s」。
+            # 与 toolHistory 对齐裁最近 10 步；App 只在条数变化时刷新，这里保持追加序即可。
+            # 老 App 不认识此键=忽略（纯增量字段）。
+            _tspans = [{"n": _TOOL_NAME_ZH.get(str(x.get("n") or ""), str(x.get("n") or "")),
+                        "s": x.get("s")} for x in (st.get("toolSpans") or [])][-10:]
             return self._send(200, {
                 "content": new,
                 "done": st["status"] != "streaming",
@@ -2477,6 +2517,7 @@ class StreamHandler(BaseHTTPRequestHandler):
                 "lastTool": _TOOL_NAME_ZH.get(str(st.get("lastTool") or ""),
                                               str(st.get("lastTool") or "")),
                 "toolNames": [_TOOL_NAME_ZH.get(x, x) for x in _th],
+                "toolSpans": _tspans,               # v3.9.58：已完成步骤的耗时（秒）
                 "lastToolAt": st.get("lastToolAt") or 0
             })
         return self._send(404, {"error": "not found"})
