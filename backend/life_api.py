@@ -648,6 +648,51 @@ def search_stocks(q):
     return _search_tx(q)
 
 
+# ---------------------------------------------------------------- v3.9.58 股票日K历史（sparkline 用）
+
+# 腾讯日K接口：web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=<txcode>,day,,,<n>,qfq
+# A股/港股/美股同一入口；返回 JSON data.<txcode>.qfqday 或 .day（[[date,open,close,high,low,volume],...]）
+_TX_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=%s,day,,,%d,qfq"
+# 进程内缓存：secid -> (取数时刻, 收盘价列表)。日K一天变一次，缓存 6h 足够；
+# sparkline 只看形态不看精确值，盘中最后一根用实时价补也行（App 端不补，简单为上）。
+_KLINE_CACHE = {}
+_KLINE_CACHE_TTL = 6 * 3600
+_KLINE_CACHE_LOCK = threading.Lock()
+
+
+def stock_history(market, code, days=30):
+    """近 N 日收盘价列表（旧→新），sparkline 用。失败返回空列表（App 画不出线就不画）。"""
+    market, code = str(market), str(code)
+    tx = _tx_code(market, code)
+    if not tx:
+        return []
+    secid = "%s.%s" % (market, code)
+    now = time.time()
+    with _KLINE_CACHE_LOCK:
+        hit = _KLINE_CACHE.get(secid)
+        if hit and now - hit[0] < _KLINE_CACHE_TTL:
+            return list(hit[1])
+    try:
+        raw = _get(_TX_KLINE_URL % (tx, max(5, min(int(days), 90))), timeout=HTTP_TIMEOUT)
+        j = json.loads(raw.decode("utf-8", "ignore"))
+        node = (j.get("data") or {}).get(tx) or {}
+        rows = node.get("qfqday") or node.get("day") or []
+        closes = []
+        for r in rows:
+            # 每行 [date, open, close, high, low, ...]；收盘在第 3 列（index 2）
+            c = _num(r[2]) if isinstance(r, (list, tuple)) and len(r) > 2 else None
+            if c is not None and c > 0:
+                closes.append(round(c, 3))
+        closes = closes[-int(days):]
+        with _KLINE_CACHE_LOCK:
+            if len(_KLINE_CACHE) > 64:
+                _KLINE_CACHE.clear()   # 简单防爆（与 life 其他缓存同款策略）
+            _KLINE_CACHE[secid] = (now, closes)
+        return list(closes)
+    except Exception:
+        return []
+
+
 # ---------------------------------------------------------------- RSS / Atom
 def _local(tag):
     return str(tag).rsplit("}", 1)[-1].lower()
@@ -1154,6 +1199,16 @@ class LifeHandler(BaseHTTPRequestHandler):
             elif parsed.path.startswith("/api/life/stock/search"):
                 q = (params.get("q") or [""])[0]
                 self._send(200, {"ok": True, "items": search_stocks(q)})
+            elif parsed.path.startswith("/api/life/stock/history"):
+                # v3.9.58：sparkline 日K——/api/life/stock/history?market=1&code=601138&days=30
+                m = (params.get("market") or [""])[0]
+                c = (params.get("code") or [""])[0]
+                try:
+                    days = int((params.get("days") or ["30"])[0])
+                except ValueError:
+                    days = 30
+                closes = stock_history(m, c, days)
+                self._send(200, {"ok": bool(closes), "closes": closes})
             else:
                 self._send(404, {"ok": False, "error": "Not Found"})
         except Exception as e:

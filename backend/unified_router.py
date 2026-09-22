@@ -16,7 +16,15 @@ Phase 2 of backend port consolidation (2026-08-22):
 """
 import importlib
 import sys
+import threading
+import time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+# v3.9.58 滑动窗口限流参数（RouterHandler._rate_limit_ok 用）
+_RATE_WINDOW_SECONDS = 60
+_RATE_LIMIT_PER_WINDOW = 600
+_RATE_WINDOWS = {}          # key -> {秒: 计数}
+_RATE_WINDOWS_LOCK = threading.Lock()
 
 ROUTE_TABLE = {
     "/api/ha":        ("ha_proxy",     "HAProxyHandler"),
@@ -167,27 +175,87 @@ class RouterHandler(BaseHTTPRequestHandler):
     因为 handle() 在请求已解析后才被调用，此时 socket 数据已被消费。
     """
 
+    def _rate_limit_ok(self):
+        """v3.9.58：滑动窗口限流（防 key 被刷 / 异常客户端拖垮后端）。
+
+        键 = X-Auth-Token（鉴权主键，App 全部带）+ 兜底 client IP；
+        窗口 60s / 600 次（App 高频轮询 0.15s 一轮 ≈ 400 次/分，600 给足余量；
+        单 key 超限回 429 + Retry-After）。窗口计数按秒分桶，内存上限 512 key。
+        返回 True=放行（并记账），False=超限（调用方直接回 429）。
+        健康检查路径（/api/auth/ping 之类无状态探测）不限。
+        """
+        tok = (self.headers.get("X-Auth-Token") or "")[:64]
+        if tok:
+            key = "t:" + tok
+        else:
+            try:
+                key = "ip:" + (self.client_address[0] if self.client_address else "anon")
+            except Exception:
+                key = "ip:anon"
+        now = int(time.time())
+        with _RATE_WINDOWS_LOCK:
+            win = _RATE_WINDOWS.setdefault(key, {})
+            # 清掉窗口外的旧桶（惰性清理，无后台线程）
+            for s in [s for s in win if s <= now - _RATE_WINDOW_SECONDS]:
+                win.pop(s, None)
+            cnt = sum(win.values())
+            if cnt >= _RATE_LIMIT_PER_WINDOW:
+                return False
+            win[now] = win.get(now, 0) + 1
+            # 键数防爆：超上限时丢弃最旧的键
+            if len(_RATE_WINDOWS) > 512:
+                for k in sorted(_RATE_WINDOWS.keys()):
+                    if len(_RATE_WINDOWS) <= 512:
+                        break
+                    _RATE_WINDOWS.pop(k, None)
+        return True
+
+    def _reject_429(self):
+        try:
+            self.send_response(429)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Retry-After", "5")
+            self.end_headers()
+            self.wfile.write(b'{"ok":false,"error":"rate limited"}')
+        except Exception:
+            pass
+
     def do_GET(self):
+        if not self._rate_limit_ok():
+            self._reject_429()
+            return
         handler_cls = _resolve_handler(self.path)
         _delegate_to_handler(handler_cls, self)
 
     def do_POST(self):
+        if not self._rate_limit_ok():
+            self._reject_429()
+            return
         handler_cls = _resolve_handler(self.path)
         _delegate_to_handler(handler_cls, self)
 
     def do_PUT(self):
+        if not self._rate_limit_ok():
+            self._reject_429()
+            return
         handler_cls = _resolve_handler(self.path)
         _delegate_to_handler(handler_cls, self)
 
     def do_PATCH(self):
         # v3.9.40（#17 前置）：原先**没有**这个 handler —— BaseHTTPRequestHandler 对未定义的
-        # 方法直接回 "501 Unsupported method ('PATCH')"，请求根本到不了 cron_api。
+        # 方法直接回 "501 Unsupported method ('PATCH')",请求根本到不了 cron_api。
         # cron_api.do_PATCH 一直是完整实现的（代理到 Hermes /api/jobs/{id}），所以 501 的根因
         # 在这里，不在 cron_api。补上即恢复定时任务的「编辑」能力。
+        if not self._rate_limit_ok():
+            self._reject_429()
+            return
         handler_cls = _resolve_handler(self.path)
         _delegate_to_handler(handler_cls, self)
 
     def do_DELETE(self):
+        if not self._rate_limit_ok():
+            self._reject_429()
+            return
         handler_cls = _resolve_handler(self.path)
         _delegate_to_handler(handler_cls, self)
 
