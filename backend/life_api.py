@@ -90,6 +90,13 @@ EM_FIELDS = "f43,f44,f45,f46,f47,f48,f57,f58,f59,f60,f116,f169,f170"
 EM_SUGGEST = ("https://searchapi.eastmoney.com/api/suggest/get"
               "?input={q}&type=14&token=D43BF722C8E33BDC906FB84D85E326E8&count=10")
 
+# 腾讯公开行情（东财 push2 在 NAS 容器网络被拒连时的主用源，实测直连 200）
+TX_QUOTE = "https://qt.gtimg.cn/q=%s"
+TX_SUGGEST = "https://smartbox.gtimg.cn/s3/?v=2&q=%s&t=all"
+# 市场编号 → 腾讯代码前缀（105/106/107 都是美股，腾讯统一 us 前缀）
+TX_PREFIX = {"1": "sh", "0": "sz", "116": "hk", "105": "us", "106": "us", "107": "us"}
+TX_MARKET_BACK = {"sh": "1", "sz": "0", "hk": "116", "us": "105"}
+
 # 快递100 免费网页接口（免 key，实测可用）；type=快递公司代码，postid=单号
 KUAIDI100_FREE = ("https://www.kuaidi100.com/query"
                   "?type={carrier}&postid={no}&temp={ts}&resultv2=4&phone={phone}")
@@ -430,7 +437,83 @@ def _mk_stock(market, code):
             "error": "行情获取失败"}
 
 
-def _fetch_stock(item, index=0):
+def _tx_code(market, code):
+    """市场编号 + 代码 → 腾讯行情代码（sh601138 / sz300750 / hk00700 / usNVDA）。"""
+    c = _s(code, 16).upper()
+    prefix = TX_PREFIX.get(market, "sh")
+    # 用户可能把 .OQ/.N 之类的后缀也填进来，腾讯不接受 → 去掉
+    if market in ("105", "106", "107"):
+        c = c.split(".")[0]
+    return prefix + c
+
+
+def _fetch_tx(item, index=0):
+    """腾讯公开行情（qt.gtimg.cn）：东财 push2 在 NAS 容器网络被拒连时的主用源。
+
+    返回 v_xxx="1~工业富联~601138~63.60~62.71~63.99~..." 的 GBK 串（~ 分隔）。
+    实测字段位序（A股/港股/美股均为同一套）：
+      [1]名称 [2]代码 [3]现价 [4]昨收 [5]今开 [6]成交量(手)
+      [31]涨跌额 [32]涨跌幅(%) [33]最高 [34]最低 [37]成交额(万元) [45]总市值(亿)
+    """
+    market, code = item["market"], item["code"]
+    secid = "%s.%s" % (market, code)
+    tx = _tx_code(market, code)
+    try:
+        raw = _get(TX_QUOTE % tx, timeout=HTTP_TIMEOUT)
+    except Exception as e:
+        return {"kind": "stock", "id": secid, "market": market, "code": code,
+                "name": code, "currency": CURRENCY.get(market, "USD"),
+                "ok": False, "error": "腾讯行情不可用: %s" % e}
+    try:
+        text = raw.decode("gbk", "ignore")
+    except Exception:
+        text = raw.decode("utf-8", "ignore")
+    body = text.split('"', 2)[1] if '"' in text else ""
+    f = body.split("~") if body else []
+    if len(f) < 40:
+        return {"kind": "stock", "id": secid, "market": market, "code": code,
+                "name": code, "currency": CURRENCY.get(market, "USD"),
+                "ok": False, "error": "腾讯无行情(%s)" % tx}
+
+    def _f(i):
+        return _num(f[i]) if i < len(f) else None
+
+    dec = 2 if market in ("0", "1") else 3
+    price = _scaled_tx(_f(3), dec)
+    prev = _scaled_tx(_f(4), dec)
+    change = _scaled_tx(_f(31), dec)
+    pct = _f(32)
+    name = (f[1] or code) if len(f) > 1 else code
+    amount_wan = _f(37)          # 万元 → 元
+    cap_yi = _f(45)              # 亿元 → 元
+    ok = price is not None and price > 0
+    return {
+        "kind": "stock", "id": secid, "market": market, "code": code,
+        "name": name or code,
+        "price": price,
+        "prev_close": prev,
+        "change": change,
+        "change_pct": (round(pct, 2) if pct is not None else None),
+        "open": _scaled_tx(_f(5), dec),
+        "high": _scaled_tx(_f(33), dec),
+        "low": _scaled_tx(_f(34), dec),
+        "volume": _f(6),
+        "amount": (round(amount_wan * 10000) if amount_wan is not None else None),
+        "market_cap": (round(cap_yi * 1e8) if cap_yi is not None else None),
+        "currency": CURRENCY.get(market, "USD"),
+        "ok": ok,
+        "error": "" if ok else "行情未就绪",
+    }
+
+
+def _scaled_tx(v, dec):
+    """腾讯返回的价格串（字符串，已是 2~3 位小数）→ float，不缩放。"""
+    f = _num(v)
+    return round(f, max(dec, 2)) if f is not None else None
+
+
+def _fetch_em(item, index=0):
+    """东方财富公开行情（原实现）：腾讯不可用时的备援源。"""
     market, code = item["market"], item["code"]
     secid = "%s.%s" % (market, code)
     data, last_err = None, ""
@@ -475,6 +558,19 @@ def _fetch_stock(item, index=0):
     }
 
 
+def _fetch_stock(item, index=0):
+    """行情取数：腾讯源优先（NAS 容器网络下东财 push2 被拒连），东财备援。"""
+    market, code = item["market"], item["code"]
+    r = _fetch_tx(item, index)
+    if isinstance(r, dict) and r.get("ok"):
+        return r
+    em = _fetch_em(item, index)
+    if isinstance(em, dict) and em.get("ok"):
+        return em
+    # 两边都失败：给更能指导用户的错误文案（腾讯先失败的原因 + 东财的结果）
+    return em if isinstance(em, dict) and em.get("error") else r
+
+
 def _collect_stocks(cfg):
     wl = cfg["stocks"]
     out = _collect_one(_fetch_stock, wl, HTTP_TIMEOUT + COLLECT_SLACK, "stock")
@@ -486,12 +582,10 @@ def _collect_stocks(cfg):
     return out
 
 
-def search_stocks(q):
-    """东财 suggest 搜股票（行情/指数/港美股都能搜到）。"""
-    q = _s(q, 40)
-    if not q:
-        return []
-    j = json.loads(_get(EM_SUGGEST.format(q=urllib.parse.quote(q)), timeout=8).decode("utf-8", "ignore") or "{}")
+def _search_em(q):
+    """东财 suggest：行情/指数/港美股都能搜到（返回结构与 search_stocks 相同）。"""
+    j = json.loads(_get(EM_SUGGEST.format(q=urllib.parse.quote(q)), timeout=8)
+                   .decode("utf-8", "ignore") or "{}")
     rows = _dig(j, "QuotationCodeTable.Data") or []
     out = []
     for r in rows:
@@ -506,6 +600,52 @@ def search_stocks(q):
         if len(out) >= 10:
             break
     return out
+
+
+def _search_tx(q):
+    """腾讯 smartbox 兜底搜索：v_hint="sh~600519~贵州茅台~mtgz~GP^hk~00700~腾讯控股~..."
+
+    记录格式：市场前缀~代码~名称~拼音~类型，^ 分隔多条。
+    """
+    try:
+        raw = _get(TX_SUGGEST % urllib.parse.quote(q), timeout=8)
+    except Exception:
+        return []
+    try:
+        text = raw.decode("gbk", "ignore")
+    except Exception:
+        text = raw.decode("utf-8", "ignore")
+    body = text.split('"', 2)[1] if '"' in text else ""
+    out = []
+    for rec in body.split("^"):
+        f = rec.split("~")
+        if len(f) < 3:
+            continue
+        prefix = _s(f[0], 6)
+        code = _s(f[1], 16)
+        name = _s(f[2], 40)
+        if not code or not name or prefix not in TX_MARKET_BACK:
+            continue
+        out.append({"code": code.upper(), "market": TX_MARKET_BACK[prefix],
+                    "marketName": dict(MARKETS).get(TX_MARKET_BACK[prefix], prefix),
+                    "name": name, "type": _s(f[4], 20) if len(f) > 4 else ""})
+        if len(out) >= 10:
+            break
+    return out
+
+
+def search_stocks(q):
+    """搜股票（东财 suggest 优先，失败/空结果时腾讯 smartbox 兜底）。"""
+    q = _s(q, 40)
+    if not q:
+        return []
+    try:
+        out = _search_em(q)
+        if out:
+            return out
+    except Exception:
+        pass
+    return _search_tx(q)
 
 
 # ---------------------------------------------------------------- RSS / Atom
@@ -1071,3 +1211,5 @@ if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 9136
     print("life_api v2 配置: %s" % CONFIG_PATH)
     ThreadingHTTPServer(("127.0.0.1", port), LifeHandler).serve_forever()
+
+
