@@ -166,6 +166,9 @@ def _default_config():
         "rss": [{"name": f["name"], "url": f["url"]} for f in RSS_CATALOG if f.get("builtin")],
         "express": {"source": dict(DEFAULT_EXPRESS_SOURCE), "packages": []},
         "price": {"source": {"headers": {}, "timeout": 8}, "items": []},
+        "expense": {"items": []},
+        "notify": {"expressWatch": False, "expressWatchEvery": 1800, "weeklyReport": True,
+                   "weeklyReportDay": 6, "weeklyReportHour": 20, "scheduler": True},
     }
 
 
@@ -296,6 +299,67 @@ def _norm_price(raw):
     return {"source": source, "items": items}
 
 
+MAX_EXPENSE_ITEMS = 400
+TODO_OPEN = "[ ]"
+TODO_DONE = "[x]"
+
+
+def _norm_expense(raw):
+    """记账条目：{id, date(YYYY-MM-DD), amount(元,正数=支出/负数=收入), name, note}。
+
+    normalize_config 是白名单重建——不把新段写进来，App 保存其它段时
+    会把这些条目整段丢掉（v3.6.3「保存即回读覆盖」同款坑）。
+    """
+    raw = raw if isinstance(raw, dict) else {}
+    items, seen = [], set()
+    for it in (raw.get("items") or []):
+        if not isinstance(it, dict):
+            continue
+        try:
+            amt = float(it.get("amount"))
+        except Exception:
+            continue
+        if not amt or amt != amt or abs(amt) > 1e9:   # NaN / 0 / 越界一律丢
+            continue
+        d = _s(it.get("date"), 10)
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", d):
+            d = time.strftime("%Y-%m-%d")
+        key = (d, round(amt, 2), _s(it.get("name"), 60))
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append({"id": _s(it.get("id"), 24) or hashlib.md5(
+            ("%s|%s|%s" % key).encode()).hexdigest()[:10],
+            "date": d, "amount": round(amt, 2),
+            "name": _s(it.get("name"), 60) or "未命名", "note": _s(it.get("note"), 200)})
+        if len(items) >= MAX_EXPENSE_ITEMS:
+            break
+    items.sort(key=lambda x: (x["date"], x["id"]))
+    return {"items": items}
+
+
+def _norm_notify(raw):
+    raw = raw if isinstance(raw, dict) else {}
+    def _b(k, d):
+        v = raw.get(k, d)
+        return bool(v) if isinstance(v, bool) else str(v) in ("1", "true", "yes")
+    return {
+        "expressWatch": _b("expressWatch", False),   # 快递状态变化才推
+        "expressWatchEvery": max(60, min(86400, int(_to_int(raw.get("expressWatchEvery"), 1800)))),
+        "weeklyReport": _b("weeklyReport", True),     # 周报允许推播
+        "weeklyReportDay": max(0, min(6, int(_to_int(raw.get("weeklyReportDay"), 6)))),   # 0=周一 … 6=周日（对外口径）
+        "weeklyReportHour": max(0, min(23, int(_to_int(raw.get("weeklyReportHour"), 20)))),
+        "scheduler": _b("scheduler", True),           # 总开关：进程内调度线程
+    }
+
+
+def _to_int(v, d):
+    try:
+        return int(v)
+    except Exception:
+        return d
+
+
 def normalize_config(raw):
     raw = raw if isinstance(raw, dict) else {}
     return {
@@ -304,6 +368,8 @@ def normalize_config(raw):
         "rss": _norm_rss(raw.get("rss")),
         "express": _norm_express(raw.get("express")),
         "price": _norm_price(raw.get("price")),
+        "expense": _norm_expense(raw.get("expense")),
+        "notify": _norm_notify(raw.get("notify")),
     }
 
 
@@ -1078,6 +1144,327 @@ def _fetch_article(url, title="", fresh=False):
     return payload
 
 
+# ---------------------------------------------------------------- 待办 / 记账 / 周报
+def _notes_file():
+    """便签文件（App 可用 X-Notes-Dir 改目录，周报侧只读默认位——取不到就当 0 条）。"""
+    return os.path.join(os.environ.get("QL_DATA_DIR", "/data"), "notes.json")
+
+
+def _collect_todo():
+    """待办 = 看板便签里以 [ ] / [x] 开头的行（无前缀 = 普通便签，不算待办）。
+
+    不新增存储：便签已在用，复用文件避免第二个待办真源。
+    """
+    path = _notes_file()
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        notes = data.get("notes") if isinstance(data, dict) else data
+    except Exception:
+        return {"kind": "todo", "id": "todo", "title": "待办", "ok": False,
+                "items": [], "open": 0, "done": 0, "error": "便签不可读"}
+    items = []
+    for n in (notes or []):
+        if not isinstance(n, dict):
+            continue
+        txt = _s(n.get("text"), 300)
+        if txt.startswith(TODO_DONE):
+            state = "done"
+        elif txt.startswith(TODO_OPEN):
+            state = "open"
+        else:
+            continue
+        items.append({"id": _s(n.get("id"), 24),
+                      "text": txt[3:].strip() or txt, "state": state,
+                      "created": int(n.get("created") or 0)})
+    items.sort(key=lambda x: x["created"])
+    op = sum(1 for x in items if x["state"] == "open")
+    return {"kind": "todo", "id": "todo", "title": "待办", "ok": bool(items),
+            "items": items[-MAX_ITEMS:], "open": op, "done": len(items) - op,
+            "error": "" if items else "便签里没有 [ ] 待办行"}
+
+
+def _date_ts(d):
+    """'YYYY-MM-DD' → 当日 00:00 本地时间戳；解析失败返回 0（该条被算进历史、不进本周）。"""
+    try:
+        t = time.strptime(d, "%Y-%m-%d")
+        return time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0, 0, 0, -1))
+    except Exception:
+        return 0
+
+
+def _collect_expense():
+    """记账 = 配置里 expense.items；统计本周（周一起）收支与分类 top。"""
+    items = load_config().get("expense", {}).get("items", [])
+    now = time.localtime()
+    monday = time.mktime((now.tm_year, now.tm_mon, now.tm_mday, 0, 0, 0, 0, 0, 0)) \
+        - now.tm_wday * 86400
+    week = [x for x in items if x.get("date") and _date_ts(x["date"]) >= monday]
+    spend = round(sum(x["amount"] for x in week if x["amount"] > 0), 2)
+    income = round(-sum(x["amount"] for x in week if x["amount"] < 0), 2)
+    by_name = {}
+    for x in week:
+        if x["amount"] > 0:
+            by_name[x["name"]] = round(by_name.get(x["name"], 0) + x["amount"], 2)
+    top = sorted(by_name.items(), key=lambda kv: -kv[1])[:5]
+    return {"kind": "expense", "id": "expense", "title": "记账", "ok": bool(items),
+            "count": len(items), "weekCount": len(week), "spend": spend,
+            "income": income, "net": round(income - spend, 2), "top": top,
+            "recent": week[-MAX_ITEMS:],
+            "error": "" if items else "还没有记账条目"}
+
+
+def _expense_op(body):
+    """记账条目增删：走 life_config.express/expense 段整体读写，原子落盘。
+
+    返回 {ok, op, ...}；金额非法/条目不存在 → ok:false + HTTP 200（与 life 其他端点同口径）。
+    """
+    cfg = load_config()
+    items = list(cfg.get("expense", {}).get("items", []))
+    op = _s(body.get("op"), 10) or "add"
+    if op == "add":
+        name = _s(body.get("name"), 60)
+        if not name:
+            return {"ok": False, "op": op, "error": "name 必填"}
+        raw_amt = body.get("amount")
+        try:
+            amt = float(raw_amt)
+        except Exception:
+            return {"ok": False, "op": op, "error": "amount 必须是数字"}
+        if amt != amt or abs(amt) > 1e9:
+            return {"ok": False, "op": op, "error": "amount 超出范围"}
+        if not amt:
+            return {"ok": False, "op": op, "error": "amount 不能为 0（支出填正数、收入填负数）"}
+        d = _s(body.get("date"), 10) or time.strftime("%Y-%m-%d")
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", d):
+            return {"ok": False, "op": op, "error": "date 格式应为 YYYY-MM-DD"}
+        items.append({"date": d, "amount": round(amt, 2), "name": name,
+                      "note": _s(body.get("note"), 200)})
+        cfg["expense"] = {"items": items}
+        save_config(cfg)
+        return _collect_expense() | {"op": "add"}
+    if op == "del":
+        eid = _s(body.get("id"), 24)
+        nxt = [x for x in items if x.get("id") != eid]
+        if len(nxt) == len(items):
+            return {"ok": False, "op": op, "error": "条目不存在: %s" % eid}
+        cfg["expense"] = {"items": nxt}
+        save_config(cfg)
+        return _collect_expense() | {"op": "del", "id": eid}
+    return {"ok": False, "op": op, "error": "op 只支持 add/del"}
+
+
+
+def _weekly_report(days=7, push=False):
+    """生活周报聚合：天气 / 快递 / 股票 / 待办 / 记账 五段。
+
+    只聚合，不调模型（省时省钱、结果可测）；push=True 时推收件箱（cron/system）。
+    """
+    days = max(1, min(30, int(days or 7)))
+    sig = _sig()
+    cards = _collect(fresh=False)          # 复用既有缓存，不打上游
+    by_kind = {}
+    for c in cards.get("cards", []):
+        if isinstance(c, dict) and c.get("kind"):
+            by_kind[c["kind"]] = c
+    todo = _collect_todo()
+    exp = _collect_expense()
+    by_kind["todo"] = todo
+    by_kind["expense"] = exp
+
+    lines = ["📅 轻聊生活周报（近 %d 天）" % days, ""]
+
+    exp_c = by_kind.get("express") or {}
+    pkgs = [p for p in (exp_c.get("packages") or []) if p.get("ok")]
+    lines.append("📦 快递：%d 单在途" % sum(1 for p in pkgs
+                                        if p.get("state") not in ("3", "4")))
+    for p in pkgs[:5]:
+        lines.append("  · %s %s %s｜%s" % (p.get("carrierName", ""), p.get("no", "")[-6:],
+                                          p.get("stateText", ""),
+                                          (p.get("latest") or {}).get("context", "")[:40]))
+    if not pkgs:
+        lines.append("  · 暂无在途快递")
+
+    stock = by_kind.get("stock") or {}
+    rows = [c for c in cards.get("cards", []) if isinstance(c, dict) and c.get("kind") == "stock"]
+    for r in rows[:6]:
+        if not r.get("ok"):
+            continue
+        chg = r.get("changePct")
+        lines.append("📈 %s %s %s（%s）" % (r.get("name", ""), r.get("price", ""),
+                                          ("%+.2f%%" % chg) if isinstance(chg, (int, float)) else "—",
+                                          r.get("stateText", "")))
+    if not any(r.get("ok") for r in rows):
+        lines.append("📈 股票：行情获取失败")
+
+    lines.append("✅ 待办：未完成 %d / 已完成 %d" % (todo.get("open", 0), todo.get("done", 0)))
+    for t in [x for x in todo.get("items", []) if x["state"] == "open"][:5]:
+        lines.append("  · %s" % t["text"][:40])
+
+    lines.append("💰 本周支出 ¥%s（收入 ¥%s，%d 笔）" % (
+        exp.get("spend", 0), exp.get("income", 0), exp.get("weekCount", 0)))
+    for n, v in (exp.get("top") or [])[:3]:
+        lines.append("  · %s ¥%s" % (n, v))
+
+    text = chr(10).join(lines)
+    allowed = bool(load_config().get("notify", {}).get("weeklyReport", True))
+    pushed, perr = False, ""
+    if push:
+        if not allowed:
+            perr = "notify.weeklyReport=false，已跳过推送"
+        else:
+            try:
+                import inbox_api
+                ok, msg = inbox_api.push(text, task_id="life-weekly-%d" % int(time.time() / 86400),
+                                         task_type="cron")
+                pushed, perr = bool(ok), msg
+            except Exception as e:
+                perr = "推送失败: %s" % e
+    return {"ok": True, "days": days, "generatedAt": int(time.time()),
+            "text": text, "pushed": pushed, "pushError": perr,
+            "parts": {"express": exp_c.get("ok", False), "todo": todo.get("ok", False),
+                      "expense": exp.get("ok", False),
+                      "stock": any(r.get("ok") for r in rows)}}
+
+
+# ---------------------------------------------------------------- 快递状态变化订阅
+_WATCH_FILE = os.path.join(os.environ.get("QL_DATA_DIR", "/data"), "express_watch.json")
+_WATCH_LOCK = threading.Lock()
+
+
+def _load_watch():
+    try:
+        with open(_WATCH_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_watch(d):
+    tmp = _WATCH_FILE + ".tmp"
+    os.makedirs(os.path.dirname(_WATCH_FILE) or ".", exist_ok=True)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, _WATCH_FILE)
+    try:
+        os.chmod(_WATCH_FILE, 0o644)
+    except Exception:
+        pass
+
+
+def _watch_key(pkg):
+    return "%s|%s" % (pkg.get("carrier", ""), pkg.get("no", ""))
+
+
+def check_express_changes(push=True):
+    """比对上轮快照，只在 state 或最新轨迹文本变化时推送。
+
+    首次调用只建基线不推（否则一订阅就报一坨「无变化」）；
+    签收/退签后保留快照但标 done，同状态不再推。
+    """
+    res = _collect_express(load_config())
+    pkgs = [p for p in (res.get("packages") or []) if p.get("ok")]
+    with _WATCH_LOCK:
+        old = _load_watch()
+        changed, new = [], {}
+        for p in pkgs:
+            k = _watch_key(p)
+            latest = p.get("latest") or {}
+            sig_now = "%s|%s" % (p.get("state", ""), _s(latest.get("context"), 120))
+            prev = old.get(k)
+            new[k] = {"state": p.get("state", ""), "sig": sig_now,
+                      "name": p.get("name", ""), "carrierName": p.get("carrierName", ""),
+                      "no": p.get("no", ""), "time": latest.get("time", ""),
+                      "context": latest.get("context", ""),
+                      "stateText": p.get("stateText", ""), "ts": int(time.time())}
+            if not isinstance(prev, dict) or not prev.get("sig"):
+                continue                      # 首轮：只建基线
+            if prev.get("sig") != sig_now:
+                changed.append(p)
+        _save_watch(new)
+
+    pushed, perr = 0, ""
+    if changed and push:
+        try:
+            import inbox_api
+            for p in changed:
+                latest = p.get("latest") or {}
+                msg = "📦 %s %s %s\n%s（%s）" % (
+                    p.get("carrierName", ""), p.get("name", ""), p.get("stateText", ""),
+                    _s(latest.get("context"), 80), p.get("latest", {}).get("time", ""))
+                ok, e = inbox_api.push(msg, task_id="express-%s" % _watch_key(p),
+                                       task_type="system")
+                if ok:
+                    pushed += 1
+                else:
+                    perr = e
+        except Exception as e:
+            perr = "推送失败: %s" % e
+    elif changed and not push:
+        perr = "dry-run（未推送）"
+    return {"ok": True, "checked": len(pkgs), "changed": len(changed),
+            "pushed": pushed, "error": perr,
+            "changes": [{"no": p.get("no"), "name": p.get("name"),
+                         "stateText": p.get("stateText"),
+                         "context": (p.get("latest") or {}).get("context", "")}
+                        for p in changed],
+            "watching": len(new)}
+
+
+# ---------------------------------------------------------------- 进程内调度线程
+# 之前 expressWatchEvery / weeklyReport 只是配置项，没有任何循环去读它们（形同虚设）。
+# 这里起一个 daemon 线程：快递轮询 + 每周固定时刻推周报，只依赖本进程，不依赖 Hermes 在线。
+_SCHED_STATE = {"lastWeekly": 0, "lastExpress": 0.0, "ticks": 0, "lastError": ""}
+_SCHED_LOCK = threading.Lock()
+# 生产容器时区是 UTC，但用户口径是北京时间（固定 +8，无夏令时）。
+# 若直接用 time.localtime() 判周几/几点，周报会差 8 小时（周日20:00 实际周一04:00 才触发）。
+# ⚠️ 必须用 gmtime(t + 8h)，不能用 localtime(t + 8h)：后者会叠加宿主机自身的时区偏移。
+CST_OFFSET = 8 * 3600
+
+
+def _now_cst():
+    return time.gmtime(time.time() + CST_OFFSET)
+
+
+def _sched_loop():
+    while True:
+        try:
+            n = load_config().get("notify", {}) or {}
+            if n.get("scheduler", True):
+                now = time.time()
+                lt = _now_cst()
+
+                # 快递状态变化监控
+                if n.get("expressWatch"):
+                    every = max(60, int(_to_int(n.get("expressWatchEvery"), 1800)))
+                    if now - _SCHED_STATE["lastExpress"] >= every:
+                        _SCHED_STATE["lastExpress"] = now
+                        r = check_express_changes(push=True)
+                        print("[sched] express: %s" % json.dumps(r, ensure_ascii=False), flush=True)
+
+                # 生活周报：到点触发，一周只推一次（用 ISO 周 key 去重，进程重启不重复也不漏）
+                # 注意：Python 的 time.struct_time.tm_wday 已是 0=周一…6=周日，与配置口径一致，不换算
+                if n.get("weeklyReport", True):
+                    day, hour = int(n.get("weeklyReportDay", 6)), int(n.get("weeklyReportHour", 20))
+                    if lt.tm_wday == day and lt.tm_hour == hour:
+                        key = "%d-W%02d" % (lt.tm_year, lt.tm_yday // 7)
+                        if _SCHED_STATE["lastWeekly"] != key:
+                            _SCHED_STATE["lastWeekly"] = key
+                            r = _weekly_report(days=7, push=True)
+                            print("[sched] weekly: %s" % json.dumps(r, ensure_ascii=False), flush=True)
+        except Exception as e:
+            _SCHED_STATE["lastError"] = str(e)
+            print("[sched] error: %s" % e, flush=True)
+        time.sleep(30)
+
+
+def _start_scheduler():
+    t = threading.Thread(target=_sched_loop, name="life-sched", daemon=True)
+    t.start()
+    return t
+
+
 # ---------------------------------------------------------------- 缓存 + 汇总
 _CACHE = {}
 
@@ -1209,6 +1596,15 @@ class LifeHandler(BaseHTTPRequestHandler):
                     days = 30
                 closes = stock_history(m, c, days)
                 self._send(200, {"ok": bool(closes), "closes": closes})
+            elif parsed.path.startswith("/api/life/todo"):
+                self._send(200, _collect_todo())
+            elif parsed.path.startswith("/api/life/expense"):
+                self._send(200, _collect_expense())
+            elif parsed.path.startswith("/api/life/weekly"):
+                self._send(200, _weekly_report(days=(params.get("days") or ["7"])[0]))
+            elif parsed.path.startswith("/api/life/express/watch"):
+                self._send(200, check_express_changes(
+                    push=(params.get("push", ["0"])[0] in ("1", "true", "yes"))))
             else:
                 self._send(404, {"ok": False, "error": "Not Found"})
         except Exception as e:
@@ -1244,6 +1640,25 @@ class LifeHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     price, err = None, "抓取失败: %s" % e
                 self._send(200, {"ok": ok, "price": price, "error": err})
+            elif parsed.path.startswith("/api/life/expense"):
+                self._send(200, _expense_op(body))
+            elif parsed.path.startswith("/api/life/weekly/report"):
+                self._send(200, _weekly_report(days=body.get("days") or 7, push=True))
+            elif parsed.path.startswith("/api/life/express/check"):
+                self._send(200, check_express_changes(push=bool(body.get("push", True))))
+            elif parsed.path.startswith("/api/life/sched"):
+                n = load_config().get("notify", {}) or {}
+                alive = any(t.name == "life-sched" for t in threading.enumerate())
+                self._send(200, {"ok": True, "threadAlive": alive,
+                                 "scheduler": n.get("scheduler", True),
+                                 "expressWatch": n.get("expressWatch"),
+                                 "expressWatchEvery": n.get("expressWatchEvery"),
+                                 "weeklyReport": n.get("weeklyReport"),
+                                 "weeklyReportDay": n.get("weeklyReportDay"),
+                                 "weeklyReportHour": n.get("weeklyReportHour"),
+                                 "lastExpress": _SCHED_STATE["lastExpress"],
+                                 "lastWeekly": _SCHED_STATE["lastWeekly"],
+                                 "lastError": _SCHED_STATE["lastError"]})
             else:
                 self._send(404, {"ok": False, "error": "Not Found"})
         except Exception as e:
@@ -1251,6 +1666,23 @@ class LifeHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         pass
+
+
+# 生产里 life_api 是被 unified_router **import** 加载的（__name__ != "__main__"），
+# 所以调度线程必须在模块导入时就起，不能只挂在 __main__ 分支下。
+_SCHED_THREAD = None
+
+
+def _ensure_scheduler():
+    global _SCHED_THREAD
+    if _SCHED_THREAD is not None and _SCHED_THREAD.is_alive():
+        return _SCHED_THREAD
+    _SCHED_THREAD = _start_scheduler()
+    print("[sched] 调度线程已在 import 期启动", flush=True)
+    return _SCHED_THREAD
+
+
+_ensure_scheduler()
 
 
 if __name__ == "__main__":
@@ -1265,6 +1697,10 @@ if __name__ == "__main__":
         raise SystemExit(0)
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 9136
     print("life_api v2 配置: %s" % CONFIG_PATH)
+    _ensure_scheduler()
+    print("调度线程已启动（快递轮询 + 每周 %s %02d:00 周报）" % (
+        "一二三四五六日"[int(load_config().get("notify", {}).get("weeklyReportDay", 6))],
+        int(load_config().get("notify", {}).get("weeklyReportHour", 20))))
     ThreadingHTTPServer(("127.0.0.1", port), LifeHandler).serve_forever()
 
 
