@@ -39,12 +39,12 @@ def _expire_chunks(now):
                 pass
 
 # 安全根目录：轻聊数据目录（前端只允许浏览这里）
-ROOT = os.environ.get("QL_DATA_DIR", "/data")
+ROOT = '/volume1/docker/hermes/微信文件/轻聊web/data'
 # 额外允许浏览的目录（只读列表，不在此列表的根不可访问）
 # 注意：不包含 hermes-data 根（其下有 config.yaml 等敏感文件）
 ALLOWED_ROOTS = [ROOT]
 # 上传目标目录
-UPLOAD_DIR = os.environ.get("QL_UPLOAD_DIR", "/data/uploads")
+UPLOAD_DIR = '/volume1/docker/hermes/微信文件/轻聊web/uploads'
 
 
 def resolve_path(p):

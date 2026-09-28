@@ -10,7 +10,7 @@ import tempfile
 import urllib.request
 from http.server import BaseHTTPRequestHandler
 
-DATA_DIR = os.environ.get("QL_DATA_DIR", "/data")
+DATA_DIR = os.environ.get("QL_DATA_DIR", "/volume1/docker/hermes/微信文件/轻聊web/data")
 SCENES_FILE = os.path.join(DATA_DIR, "scenes.json")
 LOCK = __import__("threading").Lock()
 

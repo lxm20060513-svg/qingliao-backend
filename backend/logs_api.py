@@ -10,7 +10,7 @@ import time
 import os
 import hmac
 
-CONTAINER = os.environ.get("QL_HERMES_CONTAINER", "hermes-container")
+CONTAINER = "hermes-hermes-1"
 LOGS_PASSWORD = os.environ.get("QL_LOGS_PASSWORD", "")
 LOG_SOURCES = [
     ("hermes", "docker logs --tail 300 " + CONTAINER + " 2>&1"),
@@ -174,7 +174,7 @@ class LogsHandler(http.server.BaseHTTPRequestHandler):
                 # v2.0.47：崩溃日志统一放轻聊文件夹/logs/（用户要求）
                 # BE5：原写法整段是字符串字面量（'os.environ.get(...)/logs'），既没读环境变量、
                 # 又在代码目录里建了个怪名字的空目录，崩溃报告静默丢失却仍回 ok:true
-                crash_dir = os.path.join(os.environ.get("QL_DATA_DIR", "/data"), "logs")
+                crash_dir = os.path.join(os.environ.get("QL_DATA_DIR", "/volume1/docker/hermes/微信文件/轻聊web/data"), "logs")
                 crash_file = os.path.join(crash_dir, 'crash_reports.log')
                 os.makedirs(crash_dir, exist_ok=True)
                 with open(crash_file, 'a', encoding='utf-8') as f:

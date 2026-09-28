@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""生活数据卡片 API v2：股票行情 / 资讯 RSS / 快递查询 / 价格监控（全部可 App 内增删改）
+"""生活数据卡片 API v2：股票行情 / 资讯 RSS / 快递查询 / 记账（全部可 App 内增删改）
 
 端点（均需鉴权，与其它模块一致走 X-Auth-Token）：
   GET  /api/life/cards[?fresh=1]      → {"ok":bool,"ts":Int,"cards":[…]}   看板取数
@@ -10,8 +10,6 @@
   POST /api/life/article {"url","title"[,"fresh"]}
                                       → {"ok":bool,"title","content","source":"ai"|"raw",…}
                                         单条资讯正文（后端抓取 + 模型整理，按 URL 缓存 6h）
-  POST /api/life/price/test {"url","pattern","group","extract","path","headers"}
-                                      → 正则/JSON 路径试抓（保存规则前先验一次）
 
 卡片结构（kind 区分类型，UI 按 kind 渲染）：
   {"kind":"stock","id":"1.601138","market":"1","code":"601138","name":"工业富联",
@@ -24,9 +22,6 @@
    "packages":[{"no":"YT…","carrier":"yuantong","carrierName":"圆通速递","name":"我的快递",
                 "state":"3","stateText":"已签收","latest":{"time":"…","context":"…"},
                 "ok":true,"error":""}],"error":""}
-  {"kind":"price","id":"price","title":"价格监控","ok":true,
-   "items":[{"name":"…","url":"…","price":129.0,"currency":"CNY","ok":true,"error":"",
-             "target":100.0,"hit":false}],"error":""}
 
 约定：单条目/单源失败不影响其它；全部失败才 ok:false + error。上游请求短超时，
 整体收集有硬上限（不死等），失败降级为条目内 ok:false + error 文本。
@@ -64,7 +59,6 @@ COLLECT_SLACK = 2         # 整体收集相对单个超时的宽限（秒）
 STOCK_TTL = 60            # 行情缓存 60s
 RSS_TTL = 900             # RSS 缓存 15 分钟
 EXPRESS_TTL = 300         # 快递缓存 5 分钟（物流更新频率低）
-PRICE_TTL = 900           # 价格缓存 15 分钟
 MAX_ENTRIES_PER_FEED = 4  # 每个源取多少条
 MAX_ENTRIES = 8           # 合并后最多返回多少条（源多时保证首页只显示最近的）
 
@@ -165,7 +159,6 @@ def _default_config():
                    (("1", "601138"), ("0", "300750"), ("116", "00700"), ("105", "AAPL"))],
         "rss": [{"name": f["name"], "url": f["url"]} for f in RSS_CATALOG if f.get("builtin")],
         "express": {"source": dict(DEFAULT_EXPRESS_SOURCE), "packages": []},
-        "price": {"source": {"headers": {}, "timeout": 8}, "items": []},
         "expense": {"items": []},
         "notify": {"expressWatch": False, "expressWatchEvery": 1800, "weeklyReport": True,
                    "weeklyReportDay": 6, "weeklyReportHour": 20, "scheduler": True},
@@ -249,59 +242,25 @@ def _norm_express(raw):
     return {"source": source, "packages": pkgs}
 
 
-def _norm_price(raw):
-    raw = raw if isinstance(raw, dict) else {}
-    src = raw.get("source") if isinstance(raw.get("source"), dict) else {}
-    try:
-        to = int(src.get("timeout") or 8)
-    except Exception:
-        to = 8
-    source = {
-        "headers": {(_s(k, 60)): _s(v, 400) for k, v in
-                    (src.get("headers") if isinstance(src.get("headers"), dict) else {}).items()
-                    if _s(k)},
-        "timeout": max(3, min(20, to)),
-    }
-    items, seen = [], set()
-    for it in (raw.get("items") or []):
-        if not isinstance(it, dict):
-            continue
-        url = _s(it.get("url"), 800)
-        # v3.6.3 修复「点添加价格监控后卡片立刻回退」：URL 尚未填写的未完成项必须保留。
-        # App 的添加是「先追加空卡片 → 落库」，原实现把非 http 开头的项直接丢弃，
-        # POST 回读的配置里没有这条 → App 用回读值覆盖本地 → 刚加的卡片瞬间消失。
-        # 填了 URL 才做合法性校验与去重；url 为空 = 用户还在填，原样保留。
-        if url:
-            if not re.match(r"^https?://", url, re.I) or url in seen:
-                continue
-            seen.add(url)
-        extract = "json" if _s(it.get("extract")) == "json" else "regex"
-        try:
-            group = int(it.get("group") or 1)
-        except Exception:
-            group = 1
-        try:
-            target = float(it.get("target")) if it.get("target") not in (None, "") else None
-        except Exception:
-            target = None
-        items.append({
-            "name": _s(it.get("name"), 60) or urllib.parse.urlparse(url).netloc,
-            "url": url,
-            "extract": extract,
-            "pattern": _s(it.get("pattern"), 400),
-            "path": _s(it.get("path"), 200),
-            "group": max(0, min(9, group)),
-            "currency": _s(it.get("currency"), 6) or "CNY",
-            "target": target,
-        })
-        if len(items) >= MAX_ITEMS:
-            break
-    return {"source": source, "items": items}
+_URL_IN_TEXT = re.compile(r"https?://[A-Za-z0-9\-._~:/?#@!$&()*+,;=%\[\]]+", re.I)
+_PLATFORM_NAMES = ("京东", "淘宝", "天猫", "拼多多", "抖音", "唯品会", "苏宁", "小红书")
 
 
-MAX_EXPENSE_ITEMS = 400
-TODO_OPEN = "[ ]"
-TODO_DONE = "[x]"
+def _first_url(text):
+    """Bill-1: 从整段分享文案里抽出第一条 http(s) 链接。"""
+    m = _URL_IN_TEXT.search(text or "")
+    if not m:
+        return ""
+    return m.group(0).rstrip(".,;:!?)]}>")
+
+
+def _name_from_text(text):
+    """Bill-2: 分享文案里的商品名（「」/『』/【】包裹），平台名不算。"""
+    for m in re.finditer("【([^】]{2,40})】|「([^」]{2,40})」|『([^』]{2,40})』", text or ""):
+        name = (m.group(1) or m.group(2) or m.group(3) or "").strip()
+        if name and name not in _PLATFORM_NAMES:
+            return name
+    return ""
 
 
 def _norm_expense(raw):
@@ -360,17 +319,31 @@ def _to_int(v, d):
         return d
 
 
+# 已下线的配置段：功能移除后必须显式丢弃。
+# ⚠️ 不能只从白名单里删掉——v3.9.87 的「未知段保留」兜底（for k not in out）会把
+#    磁盘上遗留的旧配置段原样塞回来，等于功能没删干净。删除功能时必须登记进这里。
+RETIRED_CONFIG_KEYS = ("price",)
+
+
 def normalize_config(raw):
+    """白名单段逐个重建；**raw 里本函数不认识的段一律原样保留**。
+
+    v3.9.87：App 只回传它认识的段；App 未来新增段时，后端先于 App 上线的那段
+    不会被「保存即回读覆盖」清空。已知段仍照旧清洗规范。
+    """
     raw = raw if isinstance(raw, dict) else {}
-    return {
+    out = {
         "version": 2,
         "stocks": _norm_stocks(raw.get("stocks")),
         "rss": _norm_rss(raw.get("rss")),
         "express": _norm_express(raw.get("express")),
-        "price": _norm_price(raw.get("price")),
         "expense": _norm_expense(raw.get("expense")),
         "notify": _norm_notify(raw.get("notify")),
     }
+    for _k, _v in raw.items():
+        if _k not in out and _k not in RETIRED_CONFIG_KEYS:
+            out[_k] = _v
+    return out
 
 
 def load_config():
@@ -399,7 +372,18 @@ def load_config():
 
 
 def save_config(raw):
-    cfg = normalize_config(raw)
+    """**以磁盘现存配置为底**再套 normalize_config。
+
+    v3.9.87 审查复现：App 的 LifeConfig 不含 expense 段（App 侧没这个功能），
+    但 normalize_config 重建时会把缺失段当空 dict -> 用户在 App 里存任意一个
+    生活设置（股票/快递/提醒…），记账条目就被整段清空。
+    先 load_config() 垫底，raw 里出现的段才覆盖 -> 缺失段保持磁盘现值。
+    """
+    base = load_config()
+    merged = dict(base) if isinstance(base, dict) else {}
+    if isinstance(raw, dict):
+        merged.update(raw)
+    cfg = normalize_config(merged)
     tmp = CONFIG_PATH + ".tmp"
     with _CFG_LOCK:
         with open(tmp, "w", encoding="utf-8") as f:
@@ -970,83 +954,6 @@ def _collect_express(cfg):
             "packages": norm, "error": "" if ok else ("查询失败: %s" % "、".join(bad[:3]))}
 
 
-# ---------------------------------------------------------------- 价格监控
-def _extract_price(text, item, src):
-    if item.get("extract") == "json":
-        try:
-            j = json.loads(text)
-        except Exception as e:
-            return None, "返回不是 JSON: %s" % e
-        v = _dig(j, item.get("path") or "")
-        p = _num(v)
-        return (p, "" if p is not None else "JSON 路径未取到数值: %s" % item.get("path"))
-    pat = item.get("pattern") or ""
-    if not pat:
-        return None, "未配置提取规则"
-    try:
-        m = re.search(pat, text, re.S)
-    except re.error as e:
-        return None, "正则错误: %s" % e
-    if not m:
-        return None, "页面里没匹配到（规则需按该页面实际内容调整）"
-    g = item.get("group") or 0
-    try:
-        raw = m.group(g)
-    except Exception:
-        return None, "分组号 %d 不存在" % g
-    digits = re.findall(r"\d+(?:\.\d+)?", (raw or "").replace(",", ""))
-    if not digits:
-        return None, "匹配到「%s」但里面没有数字" % _clean(raw, 30)
-    return float(digits[0]), ""
-
-
-def _fetch_price(item, index=0):
-    cfg = load_config()
-    src = cfg["price"]["source"]
-    base = {"name": item.get("name") or "", "url": item.get("url") or "",
-            "price": None, "currency": item.get("currency") or "CNY",
-            "target": item.get("target"), "hit": False, "ok": False, "error": ""}
-    # v3.6.3：未完成项（URL 还没填）给友好提示，别去请求空地址
-    if not (item.get("url") or "").strip():
-        base["error"] = "未填写商品 URL"
-        return base
-    try:
-        raw = _get(item["url"], timeout=src.get("timeout") or 8, headers=src.get("headers") or {})
-    except Exception as e:
-        base["error"] = "抓取失败: %s" % e
-        return base
-    text = raw.decode("utf-8", "ignore")
-    price, err = _extract_price(text, item, src)
-    if price is None:
-        base["error"] = err
-        return base
-    base["price"] = round(price, 2)
-    base["ok"] = True
-    if item.get("target") is not None:
-        base["hit"] = price <= float(item["target"])
-    return base
-
-
-def _collect_price(cfg):
-    items = cfg["price"]["items"]
-    if not items:
-        return {"kind": "price", "id": "price", "title": "价格监控", "ok": False,
-                "items": [], "error": "未添加监控商品", "hint": "设置 → 生活卡片 → 价格监控"}
-    out = _collect_one(_fetch_price, items, HTTP_TIMEOUT + COLLECT_SLACK * 3, "price")
-    norm = []
-    for i, r in enumerate(out):
-        if not isinstance(r, dict) or "url" not in r:
-            it = items[i]
-            norm.append({"name": it.get("name") or "", "url": it.get("url") or "", "price": None,
-                         "currency": it.get("currency") or "CNY", "target": it.get("target"),
-                         "hit": False, "ok": False, "error": (r or {}).get("_error") or "超时"})
-        else:
-            norm.append(r)
-    ok = any(p.get("ok") for p in norm)
-    return {"kind": "price", "id": "price", "title": "价格监控", "ok": ok,
-            "items": norm, "error": "" if ok else "全部商品获取失败"}
-
-
 # ---------------------------------------------------------------- v3.6.2 资讯正文
 _ARTICLE_CACHE = {}   # url_md5 -> (ts, payload)
 
@@ -1506,10 +1413,6 @@ def _collect(fresh=False):
     cards.append(exp if isinstance(exp, dict) and "packages" in exp
                  else _placeholder("express", "快递", "快递查询失败"))
 
-    prc = _cached("price:" + sig, PRICE_TTL, lambda: _collect_price(cfg), fresh)
-    cards.append(prc if isinstance(prc, dict) and "items" in prc
-                 else _placeholder("price", "价格监控", "价格获取失败"))
-
     ok = any(c.get("ok") for c in cards)
     return {"ok": ok, "ts": int(time.time()), "cards": cards,
             "error": "" if ok else "全部数据源获取失败"}
@@ -1624,22 +1527,6 @@ class LifeHandler(BaseHTTPRequestHandler):
                 # v3.6.2：单条资讯正文（后端抓取 + 模型整理，按 URL 缓存）
                 self._send(200, _fetch_article(body.get("url"), body.get("title"),
                                                fresh=bool(body.get("fresh"))))
-            elif parsed.path.startswith("/api/life/price/test"):
-                src = load_config()["price"]["source"]
-                item = {"url": _s(body.get("url"), 800),
-                        "extract": "json" if _s(body.get("extract")) == "json" else "regex",
-                        "pattern": _s(body.get("pattern"), 400),
-                        "path": _s(body.get("path"), 200),
-                        "group": body.get("group") or 1}
-                ok, err = False, ""
-                try:
-                    raw = _get(item["url"], timeout=src.get("timeout") or 8,
-                               headers=src.get("headers") or {})
-                    price, err = _extract_price(raw.decode("utf-8", "ignore"), item, src)
-                    ok = price is not None
-                except Exception as e:
-                    price, err = None, "抓取失败: %s" % e
-                self._send(200, {"ok": ok, "price": price, "error": err})
             elif parsed.path.startswith("/api/life/expense"):
                 self._send(200, _expense_op(body))
             elif parsed.path.startswith("/api/life/weekly/report"):
@@ -1702,5 +1589,6 @@ if __name__ == "__main__":
         "一二三四五六日"[int(load_config().get("notify", {}).get("weeklyReportDay", 6))],
         int(load_config().get("notify", {}).get("weeklyReportHour", 20))))
     ThreadingHTTPServer(("127.0.0.1", port), LifeHandler).serve_forever()
+
 
 

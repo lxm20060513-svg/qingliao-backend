@@ -33,7 +33,7 @@ def _resolve_relay_url():
     now = time.time()
     if now - _RELAY_IP_CACHE["t"] > 300:
         try:
-            out = os.popen("docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' " + os.environ.get("QL_HERMES_CONTAINER", "hermes-container") + " 2>/dev/null").read()
+            out = os.popen("docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' hermes-hermes-1 2>/dev/null").read()
             ip = (out.strip().split() or [None])[0]
             if ip:
                 _RELAY_IP_CACHE["ip"] = ip

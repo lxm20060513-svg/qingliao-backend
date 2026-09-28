@@ -176,7 +176,7 @@ def fetch_models_from_endpoint(base_url: str, api_key: str) -> dict:
 
 CUSTOM_JSON_CANDIDATES = [
     # 与其它 App 数据同处（容器同名挂载；宿主可直接查看/备份）
-    os.environ.get("QL_DATA_DIR", "/data") + "/custom_providers.json",
+    "/volume1/docker/hermes/微信文件/轻聊web/data/custom_providers.json",
     # 兜底：容器 /data（NAS /data）
     "/data/custom_providers.json",
 ]

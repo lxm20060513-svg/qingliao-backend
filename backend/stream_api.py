@@ -22,6 +22,10 @@ import json
 import os
 import kb_inject
 import doc_ref          # v3.9.44：附件正文按需注入（消息只存 doc= 引用）
+try:
+    import ctx_summary       # v3.9.80 上下文策略：最近 N 轮原样 + 早期转摘要
+except Exception:            # 模块缺失也不能让服务起不来（宁可退回全量发历史）
+    ctx_summary = None
 import memory_store
 import media_convert  # v2.0.130: MEDIA:路径→data URL 图片
 import re
@@ -343,7 +347,7 @@ def _collect_nas_status():
         if os.path.isdir("/host_root"):
             # 宿主候选挂载点（系统盘 + 数据盘；/tmp 相对次要）
             cands = ["/boot", "/rootfs", "/ugreen", "/mnt/factory", "/overlay",
-                     "/data", "/volume2", "/volume3"]
+                     "/volume1", "/volume2", "/volume3"]
             df = subprocess.run(["df", "-B1"] + ["/host_root" + c for c in cands],
                                 capture_output=True, text=True, timeout=10)
         else:
@@ -426,7 +430,7 @@ def _collect_nas_status():
         # v3.0.36 fix：容器极简镜像无 pgrep/ps（FileNotFoundError 曾致整个 try 异常 → hermes 恒 null）
         #           内存改 docker exec hermes 容器内 ps -eo rss（Hermes 容器是完整镜像，ps 可用）
         try:
-            p = subprocess.run(["docker", "exec", os.environ.get("QL_HERMES_CONTAINER", "hermes-container"), "ps", "-eo", "pid,rss,comm"],
+            p = subprocess.run(["docker", "exec", "hermes-hermes-1", "ps", "-eo", "pid,rss,comm"],
                                capture_output=True, text=True, timeout=10)
             rss = 0
             for ln in (p.stdout or "").splitlines()[1:]:
@@ -441,7 +445,7 @@ def _collect_nas_status():
             services["hermes_mem"] = None
         # v3.0.8：Hermes 容器版本（docker exec hermes --version 首行，如 "Hermes Agent v0.20.4 ..."）
         try:
-            v = subprocess.run(["docker", "exec", os.environ.get("QL_HERMES_CONTAINER", "hermes-container"), "hermes", "--version"],
+            v = subprocess.run(["docker", "exec", "hermes-hermes-1", "hermes", "--version"],
                                capture_output=True, text=True, timeout=10)
             first = (v.stdout or "").strip().splitlines()[0] if v.stdout else ""
             services["hermes_version"] = first if first else None
@@ -485,7 +489,7 @@ def _collect_diagnose():
     else:
         add("svc_hermes", "Hermes Agent", "ok" if h_up else "error",
             "9123 健康检查通过" if h_up else "9123 健康检查失败",
-            "Hermes 容器异常，等看门狗自动重启，或 docker restart hermes-container")
+            "Hermes 容器异常，等看门狗自动重启，或 docker restart hermes-hermes-1")
 
     # v3.4.x：轻聊后端端口自检——9127 统一路由 / 9132 流式直连（App 长连接独立端口）
     # 容器内对本机端口 TCP 连通探测：通=监听中；拒=服务挂；超时=异常
@@ -984,11 +988,110 @@ def _is_auto_request(text):
     return any(k in text for k in ("分钟后", "定时", "自动化", "延时", "延迟", "秒后", "小时后再", "几小时后"))
 
 
+# ---- v3.9.55：TypeSafe 会话路由（要干活 vs 纯聊天）----
+# 关键词规则（_is_agent_request / agent_rules）零延迟先判；规则命中 → Agent（现状）。
+# 规则未命中且消息「短、纯文本、无附件、非本地模型」时才调 TypeSafe 判 needs_action：
+#   要干活 → Agent（工具契约，现状）；纯聊天 → 纯聊天契约（不带工具/Agent 提示）。
+# 任何异常/超时/未配置一律回退现状（按 Agent 走）——判定只为「少把闲聊当任务」，不为提速冒险。
+# 结果写 /tmp/typesafe_route.log，并进流状态（route/routeReason/routeMs）便于 App 与诊断核对。
+_TS_CACHE = {}            # text -> (判定时刻, 判定结果)
+_TS_CACHE_TTL = 60        # 同文本 60s 内复用（App 重试/重复发送不重复调用）
+_TS_CACHE_MAX = 64
+_TS_CACHE_LOCK = threading.Lock()
+_TS_SMALLTALK = frozenset(("嗯", "哦", "好的", "好", "谢谢", "多谢", "收到", "在", "在吗", "哈哈",
+                           "嘿嘿", "早", "早安", "晚安", "ok", "OK", "？", "?", "。。", "..."))
+
+
+def _ts_route_log(line):
+    try:
+        p = "/tmp/typesafe_route.log"
+        if os.path.exists(p) and os.path.getsize(p) > 200_000:
+            os.rename(p, p + ".old")
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _ts_judge(text):
+    """调 TypeSafe chat_router（带 60s 同文本缓存）。异常 → {"ok": False}：调用方回退现状。"""
+    t = (text or "").strip()
+    if not t:
+        return {"ok": False, "error": "空文本"}
+    now = time.time()
+    with _TS_CACHE_LOCK:
+        hit = _TS_CACHE.get(t)
+        if hit and now - hit[0] < _TS_CACHE_TTL:
+            v = dict(hit[1])
+            v["cached"] = True
+            return v
+    try:
+        import typesafe_api
+        v = typesafe_api.route(t)
+    except Exception as e:
+        v = {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:120])}
+    with _TS_CACHE_LOCK:
+        if len(_TS_CACHE) >= _TS_CACHE_MAX:
+            _TS_CACHE.clear()
+        _TS_CACHE[t] = (now, v)
+    return v
+
+
+def _route_decision(st, rule_agent, last_user):
+    """返回 (route, source, detail)。route ∈ {"agent", "fast_chat"}（fail-open 恒回 agent）。
+
+    source 说明依据：rule/smalltalk/typesafe/attachment/too_long/local_model/judge_fail/
+    disabled/mode_off/force_agent/media/empty/no_module。
+    """
+    if rule_agent:
+        return "agent", "rule", {"ok": True}
+    if not isinstance(last_user, str):
+        return "agent", "media", {"ok": False}          # 图片/多模态 → 不判定
+    t = (last_user or "").strip()
+    if not t:
+        return "agent", "empty", {"ok": False}
+    try:
+        import typesafe_api
+        cfg = typesafe_api.routing_cfg()
+    except Exception as e:
+        return "agent", "no_module", {"ok": False, "error": str(e)[:120]}
+    if not cfg.get("enabled"):
+        return "agent", "disabled", {"ok": False}
+    mode = str(cfg.get("mode") or "smart").strip().lower()
+    if mode == "off":
+        return "agent", "mode_off", {"ok": False}
+    if mode == "force_agent":
+        return "agent", "mode_force", {"ok": True}
+    if ("doc=" in t) or ("MEDIA:" in t):
+        return "agent", "attachment", {"ok": False}     # 附件/生成物引用 → 交给 Agent
+    try:
+        max_chars = int(cfg.get("max_chars") or 120)
+    except Exception:
+        max_chars = 120
+    if len(t) > max_chars:
+        return "agent", "too_long", {"ok": False}
+    if str(st.get("provider") or "").lower() in ("local", "ollama"):
+        return "agent", "local_model", {"ok": False}
+    if t.strip("。.!！~～… 　") in _TS_SMALLTALK:        # 超短应答免判定（省一次上游调用）
+        return "fast_chat", "smalltalk", {"ok": True, "needs_action": False, "ms": 0}
+    v = _ts_judge(t)
+    if not v.get("ok"):
+        return "agent", ("judge_breaker" if v.get("breaker") else "judge_fail"), v
+    return ("agent" if v.get("needs_action") else "fast_chat"), "typesafe", v
+
+
 def _chat_once(body, url=None, key=None):
+    """一次性问答（非流式）。App「AI 翻译」/ Siri 问轻聊 / 上下文压缩摘要都走这里。
+
+    v3.9.89 fix：opencode Go 上游要求 `x-opencode-session` 头，否则一律 400
+    MissingSessionID（实测 2026-09-26）。缺头 → 上游报错 → App 翻译浮层每次都落
+    「没拿到译文」卡，其他走本函数的出口一并静默降级。带别的 provider 时这个头无害。
+    """
     import urllib.request
     req = urllib.request.Request(url or AGENT_URL, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json",
                                           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                                          "x-opencode-session": "ql-" + uuid.uuid4().hex,
                                           "Authorization": "Bearer " + (key or _agent_key())}, method="POST")
     with urllib.request.urlopen(req, timeout=120) as r:
         return json.loads(r.read())
@@ -1011,7 +1114,7 @@ def _agent_endpoint(model, provider):
             key = _load_cfg_key(["providers", provider, "api_key"])
             return base + "/chat/completions", key or "", model
     if provider == "local":
-        base = _provider_base_url("ollama") or os.environ.get("QL_OLLAMA_URL", "http://host.docker.internal:11434/v1")
+        base = _provider_base_url("ollama") or os.environ.get("OLLAMA_BASE", "")
         key = _load_cfg_key(["providers", "ollama", "api_key"]) or "ollama"
         return base + "/chat/completions", key, model
     return AGENT_URL, AGENT_KEY, AGENT_MODEL
@@ -1061,6 +1164,9 @@ def _agent_loop(messages, task=None, model=None, provider=None):
         msgs = _compress_long_assistants(msgs)
         msgs = _break_repeat_seed(msgs)
         sys_content += QCARD_PROMPT   # v3.9.31 ql-card 协议
+        sys_content += QLACTION_PROMPT   # v3.9.95 ql-action 本地动作协议
+        sys_content += SOUL_PROMPT    # v3.9.73 soul：输出精炼
+        sys_content += memory_store.prompt_block()   # v3.9.95 AI 记忆注入（哈希门控稳定前缀）
         sys_p = {"role": "system", "content": sys_content}
         msgs = [sys_p] + msgs
         _log_sent_messages("agent", msgs)
@@ -1299,6 +1405,14 @@ def _is_strong_model(provider="", model=""):
             or m.startswith("gpt-5") or m.startswith("claude") or m.startswith("glm-5"))
 
 
+# v3.9.73 soul：输出风格人设——长文先总结再输出、精炼少废话。注入所有 system 组装点。
+SOUL_PROMPT = (
+    "\n\n【输出风格（必须遵守）】回复前先在内部把内容消化提炼：长文/多步骤/技术类内容"
+    "必须先总结出核心要点再输出，只给结论和关键细节。禁止铺垫、客套、复述用户问题、"
+    "罗列无关背景。能一句说清就不写三句；长内容用要点组织，每条都要有信息量。"
+    "精炼不等于省略：关键步骤、数值、结论必须完整保留。"
+)
+
 # v3.9.31：ql-card 结果卡片协议（App 端 v3.5.0 起 AgentCardParser 已解析渲染）。
 # 注入 5 处 system prompt 组装点；纪律段防滥用：仅结构化结果类回复收尾用，闲聊禁用。
 QCARD_PROMPT = (
@@ -1306,11 +1420,80 @@ QCARD_PROMPT = (
     "在文字总结之后追加一个 ```ql-card 代码围栏，围栏内是单个 JSON 对象（不要多对象）。字段（全部可选，有什么写什么）："
     'type(result|metrics|list|table|status|plan)/title/subtitle/status({text,tone:ok|warn|error|info})/'
     'fields([{key,value}])/metrics([{label,value,unit?,tone?}])/list([{title,subtitle?,status?,tone?}])/'
-    'table({columns,rows})/footer。'
+    'table 必须是**嵌套对象**：table({"columns":["列1","列2"],"rows":[["值1","值2"]]})，'
+    'columns/rows 只能写在 table 里面，**禁止提到 JSON 顶层**'
+    '（顶层写 columns/rows 客户端读不到，表格会整段丢失、卡片只剩标题）/footer。'
     "type=plan（任务计划卡）：多步骤任务收尾时用，list 段按执行顺序放各步骤"
     "（title=步骤名，status/tone=完成/ok、进行中/warn、跳过/信息），title 下可带 subtitle=该步结果一句话。"
     "围栏独占一行、必须闭合；围栏外文字照常写。纪律：闲聊/解释/短回复一律不要用卡片；"
+    "【闭合纪律】收尾的三反引号必须另起一行、独占一行（前面不许粘 JSON 的结尾花括号或任何字符），否则客户端认不出闭合，整张卡片会被当代码块原样显示。JSON 与闭合围栏之间不要留空行。"
     "一张卡片讲完当前这轮结果，不要多卡堆叠；JSON 必须合法（客户端解析失败会原样显示文本，不会报错）。"
+)
+
+# v3.9.95：ql-action 本地动作卡协议（App 端 v3.9.95 起 AgentActionParser 已解析渲染）。
+# ⚠️ 与 QCARD_PROMPT 的本质区别：ql-card 只是「展示信息」，ql-action 会**真的改动用户设备**
+#    （建/删日历事件、往相册存图、发系统通知）。所以纪律段必须比 ql-card 严得多。
+QLACTION_PROMPT = (
+    "\n\n【本地设备操作（可选）】当且仅当用户**明确要求**你操作他手机上的数据时"
+    "（记到日历/改个日程/我明天几点有空/到点提醒我/我有什么待办/查某人的电话/我在哪/"
+    "复制到剪贴板/存成文件/把这张图存相册），"
+    "在文字说明之后追加一个 ```ql-action 代码围栏，围栏内是单个 JSON 对象（不要多对象）："
+    '{"action":"<动作>","params":{...},"summary":"给用户看的一句话"}。'
+    "可用动作（params 只用该动作列出的键，值一律写成**字符串**）："
+    "calendar.create（title 必填、start 必填、end 可选、location、notes）；"
+    "calendar.update（eventIdentifier 必填，title/start/end/location/notes 至少给一个）；"
+    "calendar.delete（eventIdentifier 必填，取自 calendar.today / calendar.free 的返回）；"
+    "calendar.today（days 可选，默认 1）；calendar.free（days 可选，默认 3）；"
+    "reminder.create（title 必填、due 可选、notes 可选）；reminder.list（days 可选，默认 7）；"
+    "reminder.delete（identifier 必填，取自 reminder.list 返回里的 id=…）；"
+    "photo.save（dataURL 必填，格式 data:image/*;base64, …）；"
+    "photo.delete（identifier 必填【相册读到的 localIdentifier】，或用 latest=1..5 删最近 N 张）；"
+    "contacts.search（query 可选，按姓名/号码/邮箱匹配，留空=列前 20 个）；"
+    "contacts.create（name 必填、phone 可选、email 可选）；"
+    "location.current（无参数，读一次当前位置）；"
+    "clipboard.read（无参数）；clipboard.write（text 必填）；"
+    "file.list（path 可选，默认根目录）；file.read（path 必填，须是文本且 ≤200KB）；"
+    "file.write（path 必填、content 必填、append 可选）；"
+    "notify（body 必填、title 可选）。"
+    "【时间格式铁律】start/end/due 必须是 ISO8601 且**带时区偏移**，例如 2026-09-28T15:00:00+08:00；"
+    "绝对不要写「明天下午三点」这种自然语言，也不要省略时区（客户端不猜时区，写错必然失败）。"
+    "【围栏纪律】```ql-action 另起一行、独占一行；收尾的三反引号必须另起一行、独占一行"
+    "（前面不许粘 JSON 的结尾花括号或任何字符），否则客户端认不出闭合，整块会被当代码块原样显示。"
+    "一条回复最多一个动作围栏。"
+    "【能力边界·务必知道】微信等第三方 App 的数据、系统闹钟与计时器、短信和通话记录、"
+    "备忘录与邮件正文、HomeKit 智能家居，在 iOS 上**没有任何公开接口**，你无法读写 —— "
+    "遇到这类请求直接说「这个我做不到，请你自己在对应 App 里操作」，不要假装成功、也不要输出围栏。"
+    "提醒事项**可以**操作（EventKit，与日历同一套框架）；文件只能读写轻聊自己的目录"
+    "（相对路径，不许 .. 与绝对路径）；剪贴板每次读取 iOS 都会弹一次系统「粘贴」提示，"
+    "这是系统行为、不是你操作失败。"
+    "日历/提醒事项/相册/通讯录/定位/通知必须先轻聊「设置 → 权限与 AI 操控」里授权，"
+    "剪贴板与文件不需要系统授权；未授权时用一句文字提醒用户去开，不要重复输出围栏。"
+    "【绝不擅自行动】用户没说「记下来/加到日历/提醒我」就不要输出写/删类动作；"
+    "不确定他要不要落库就先用文字问一句。写和删的卡片要用户在 App 里点确认才会真执行；"
+    "删除照片 App 内不可撤销（相册「最近删除」保留 30 天），说清后果再动手。"
+    "JSON 必须合法（解析失败客户端会原样显示文本，不会报错）。"
+)
+
+
+# v3.9.72 P0.1：任务化回复（自然语言 → 后台任务）。Muse 式「会干活」的核心入口。
+# 只改 prompt 层：告诉模型什么时候该把请求转成 cronjob_manage 计划任务、schedule 怎么写、
+# 怎么防误创建。工具由 Hermes 侧提供（tool_search 可发现 cronjob_manage，
+# 已实证：轻聊会话同构请求里 cronjob_manage 可见可调）。
+TASK_PROMPT = (
+    "\n\n【任务化回复（把请求变成后台任务）】当用户一句话描述的是「以后要发生的事 / 要持续关注的事」"
+    "（提醒、定时播报、到点执行、周期巡检、盯某个数值变化），不要只用文字回答，"
+    "必须调用 cronjob_manage(action=\"create\") 真创建计划任务，"
+    "让它在后台到点跑、完成后自动推送给用户。"
+    "\n写法：schedule 用自然时间（'in 30m'、'every day at 9am'、'weekdays at 9am'、"
+    "'every 2h'、cron 语法 '0 9 * * *' 或 ISO 时间戳）；name ≤40 字说清干什么；"
+    "prompt 必须自包含（写清任务目标、查什么、怎么算达标、结果怎么说，"
+    "因为任务运行时没有当前聊天上下文）。"
+    "\n防误创建（很重要）：只有「时间性 / 重复性」意图才建任务——一次性提问、求解释、闲聊、"
+    "查当前状态（「现在内存多少」）、纯写作都不建。用户没说时间也没说周期时，"
+    "先问一句确认（例如「要每天早八点提醒吗」），别自己猜一个时间就建。"
+    "同类任务已存在时优先 update / pause，不要重复 create。"
+    "\n创建成功后用中文简短确认：任务名 + 什么时候第一次跑 + 结果会推送到哪里。"
+    "工具没返回成功前，不说「已完成 / 已安排好」。"
 )
 
 def _log_sent_messages(tag, msgs):
@@ -1355,6 +1538,9 @@ def _build_messages(st):
                             "每次回复只针对用户最新一条消息：先理解它问的是什么，再给出有针对性的回答。"
                             "不要重复、复述或续写对话历史中你已经回答过的内容。"}]
     base_sys[0]["content"] += QCARD_PROMPT   # v3.9.31 ql-card 协议
+    base_sys[0]["content"] += QLACTION_PROMPT   # v3.9.95 ql-action 本地动作协议
+    base_sys[0]["content"] += SOUL_PROMPT    # v3.9.73 soul：输出精炼
+    base_sys[0]["content"] += memory_store.prompt_block()   # v3.9.95 AI 记忆注入（哈希门控稳定前缀）
     final = base_sys + kb_inject.inject(msgs)
     _log_sent_messages("normal", final)
     return final
@@ -1393,6 +1579,11 @@ def _build_hermes_agent_prompt(st, last_user):
                    "每次回复只针对用户最新一条消息，不要重复历史中已回答过的内容。")
     # v3.9.31 ql-card 协议
     sys_content += QCARD_PROMPT
+    sys_content += QLACTION_PROMPT   # v3.9.95 ql-action 本地动作协议
+    sys_content += SOUL_PROMPT    # v3.9.73 soul：输出精炼
+    sys_content += memory_store.prompt_block()   # v3.9.95 AI 记忆注入（哈希门控稳定前缀）
+    # v3.9.72 P0.1 任务化回复
+    sys_content += TASK_PROMPT
     # v3.3.1：多模态 content 原样透传
     user_content = last_user if isinstance(last_user, list) else str(last_user or "")
     return [{"role": "system", "content": sys_content},
@@ -1417,6 +1608,38 @@ def _compress_all_assistants(msgs):
     return out
 
 
+def _ctx_summary_ask(st):
+    """v3.9.80：摘要模型的单次调用（只被 ctx_summary 的后台线程调用，绝不阻塞本轮回复）。
+
+    默认复用**当前请求的** model/provider（保证模型名一定可用）；可用
+    STREAM_CTX_SUMMARY_MODEL / STREAM_CTX_SUMMARY_PROVIDER 指定更便宜的小模型。
+    关掉思考链：摘要不需要推理过程，且推理模型会把 max_tokens 花在 reasoning 上（实测踩过）。
+    任何异常都返回空串 —— 调用方回落到「已省略」占位，绝不影响本轮回复。
+    """
+    def ask(prompt):
+        try:
+            m = os.environ.get("STREAM_CTX_SUMMARY_MODEL") or st.get("model") or AGENT_MODEL
+            p = os.environ.get("STREAM_CTX_SUMMARY_PROVIDER") or st.get("provider") or "deepseek"
+            url, key, model = _agent_endpoint(m, p)
+            if not url:
+                return ""
+            body = {"model": model or m,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                    "max_tokens": 1200}
+            if str(p or "").lower() not in ("local", "ollama"):
+                body["model_options"] = {"reasoning": {"enabled": False}}
+            j = _chat_once(body, url=url, key=key)
+            ch = j.get("choices") if isinstance(j, dict) else None
+            if not ch:
+                return ""
+            out = ((ch[0] or {}).get("message") or {}).get("content") or ""
+            return out if isinstance(out, str) else ""
+        except Exception:
+            return ""
+    return ask
+
+
 def _build_hermes_messages(st, last_user, is_agent):
     """v3.4.10 X方案：发「断种子净化完整历史」给 Hermes 9123（不再靠 state.db 重建）。
 
@@ -1428,8 +1651,25 @@ def _build_hermes_messages(st, last_user, is_agent):
     模型上下文=净化历史，不复读；模型选择/图片/流式/工具全部保留。
     v3.3.1：last_user 可能是 list（多模态 content 含图片），原样透传不压字符串。"""
     raw = st.get("messages") or []
+    _ctx_text = ""
     if raw:
         sanitized = _sanitize_history(raw)
+        # v3.9.80 上下文策略：最近 N 轮原样 + 早期转摘要（省 token 的大头就在「每轮重发历史」）。
+        # ⚠️ 必须在 _compress_long_assistants 之前跑 —— 那一步会把早期 assistant 压成占位，
+        # 摘要模型就只看得到一堆占位符，摘要等于废的。
+        # 摘要在后台线程生成 + 缓存复用（都在 ctx_summary 里），绝不阻塞本轮；这轮拿不到就先
+        # 用「（更早的 N 条对话已省略，摘要生成中）」占位，下一轮就有真摘要。
+        try:
+            if ctx_summary is not None:
+                sanitized, _ctx_text, _ctx_meta = ctx_summary.apply(
+                    sanitized, st.get("sessionId"), _ctx_summary_ask(st))
+                if _ctx_meta.get("dropped"):
+                    print("[ctx] sid=%s 折叠=%d条 保留=%d条 摘要=%d字 source=%s"
+                          % (st.get("sessionId"), _ctx_meta.get("dropped"), _ctx_meta.get("kept") or 0,
+                             _ctx_meta.get("len") or 0, _ctx_meta.get("source")), flush=True)
+        except Exception as _e:      # 摘要策略失败绝不影响回复（退回全量发历史）
+            _ctx_text = ""
+            print("[ctx] 上下文折叠失败（按原样全量发历史）：%r" % (_e,), flush=True)
         sanitized = _compress_long_assistants(sanitized)
         sanitized = _break_repeat_seed(sanitized)
     else:
@@ -1450,13 +1690,20 @@ def _build_hermes_messages(st, last_user, is_agent):
                        "下面 messages 是会话历史（assistant 回复已压缩为占位符），仅作背景参考。"
                        "【关键】只回答最新一条 user 消息。绝对不要续写、复述、照抄历史上任何一条 "
                        "assistant 回复的内容或任何工具调用/结果——这会重复回答，务必直接给出新答案。")
-        sys_content += QCARD_PROMPT   # v3.9.31 ql-card 协议
     else:
         sys_content = ("你是轻聊的 AI 助手，用中文简洁友好地回答用户的问题。"
                        "下面 messages 是会话历史（assistant 回复已压缩为占位符），仅作背景参考。"
                        "【关键】只回答最新一条 user 消息：先理解它问什么，再给有针对性的回答。"
                        "不要复述、续写或照抄历史里你已经回答过的内容。")
     sys_content += QCARD_PROMPT   # v3.9.31 ql-card 协议
+    sys_content += QLACTION_PROMPT   # v3.9.95 ql-action 本地动作协议
+    sys_content += TASK_PROMPT   # v3.9.72 P0.1 任务化回复
+    sys_content += SOUL_PROMPT    # v3.9.73 soul：输出精炼
+    sys_content += memory_store.prompt_block()   # v3.9.95 AI 记忆注入（哈希门控稳定前缀）
+    if _ctx_text:
+        # v3.9.80：早期对话摘要拼进**首条 system**（Responses 协议只认首条 system 平移到
+        # instructions；在 messages 中间插 system 会被当历史消息发给模型，观感=莫名指令）。
+        sys_content += "\n\n" + _ctx_text
     return [{"role": "system", "content": sys_content}] + sanitized
 
 
@@ -1525,6 +1772,23 @@ def _worker(task_id, task):
         except Exception:
             pass
         is_agent_req = bool(agent_on and (_is_agent_request(st["messages"]) or agent_rules.match(last_user or "")))
+        # v3.9.55：TypeSafe 会话路由 —— 规则未命中时判「要干活 / 纯聊天」，
+        # 结果决定本次请求给模型的 system 契约（Agent 工具契约 vs 纯聊天契约）。
+        # fail-open：判定失败/超时/未配置 → agent（与改动前行为完全一致）。
+        _route, _route_src, _route_detail = _route_decision(st, is_agent_req, last_user)
+        try:
+            st["route"] = _route
+            st["routeReason"] = _route_src
+            st["routeMs"] = _route_detail.get("ms")
+            st["routeNeedsAction"] = _route_detail.get("needs_action")
+        except Exception:
+            pass
+        _ts_route_log("[%s] route=%s src=%s needs_action=%s p=%s ms=%s model=%s text=%s" % (
+            time.strftime("%m-%d %H:%M:%S"), _route, _route_src,
+            _route_detail.get("needs_action"), _route_detail.get("needs_action_prob"),
+            _route_detail.get("ms"), _route_detail.get("model"), str(last_user_text or "")[:50]))
+        print("[route] %s/%s needs_action=%s ms=%s" % (
+            _route, _route_src, _route_detail.get("needs_action"), _route_detail.get("ms")), flush=True)
         # v3.6.1 进度类追问秒回：用户问「进度/好了吗」时，若同会话有正在跑的任务，
         # 直接回该任务的实时进度摘要（不开新 Hermes 请求 → 不排队、不互卡、1 秒内可见）
         try:
@@ -1576,7 +1840,7 @@ def _worker(task_id, task):
             # 现改为去该头 + 发断种子净化历史（_build_hermes_messages），模型用净化上下文，不复读。
             _amodel = st.get("model") or AGENT_MODEL
             # v3.5.2：净化历史先拼好（responses 路径要拆成 instructions + input）
-            _amsgs = _build_hermes_messages(st, last_user, True)
+            _amsgs = _build_hermes_messages(st, last_user, _route == "agent")
             if HERMES_PROTOCOL == "responses":
                 req_body = _hermes_responses_body(_amodel, st, _amsgs)
             else:
@@ -2084,6 +2348,49 @@ class StreamHandler(BaseHTTPRequestHandler):
         except Exception:
             return self._send(400, {"error": "bad json"})
 
+        # v3.9.80：App 的「一问一答（非流式）」出口。
+        # 根因（2026-09-25 取证）：App 侧三处（Siri「问轻聊」/ AI 翻译浮层 / 上下文自动压缩摘要）
+        # 一直在 POST 这个路径，而后端**从来没实现过** —— do_POST 一路落到函数末尾统一 404。
+        # NAS nginx access.log 实证：`Qingliao/524 POST /api/stream/chat` → 404（22 字节 = not found），
+        # 于是翻译浮层每次拍照都落「没拿到译文」卡（用户报的就是这条），
+        # Siri「问轻聊」必失败，上下文压缩摘要静默降级成本地压缩。
+        # 口径与 _ctx_summary_ask 一致：_agent_endpoint 精确路由 provider + 关思考链
+        # （翻译/摘要不需要推理；推理模型会把 max_tokens 花在 reasoning 上，App 侧 30s 超时扛不住）。
+        if self.path == "/api/stream/chat":
+            msgs = data.get("messages")
+            if not msgs or not isinstance(msgs, list):
+                return self._send(400, {"error": "messages required"})
+            model = str(data.get("model") or "").strip()
+            provider = str(data.get("provider") or "").strip()
+            url, key, use_model = _agent_endpoint(model, provider)
+            if not url:
+                return self._send(500, {"error": "no upstream configured"})
+            try:
+                max_tokens = int(data.get("max_tokens") or 2048)
+            except Exception:
+                max_tokens = 2048
+            body = {"model": use_model or model or AGENT_MODEL,
+                    "messages": msgs,
+                    "stream": False,
+                    "max_tokens": max_tokens}
+            if provider.lower() not in ("local", "ollama"):
+                body["model_options"] = {"reasoning": {"enabled": False}}
+            try:
+                j = _chat_once(body, url=url, key=key)
+            except Exception as e:
+                # 上游失败**不吞**：App 侧只会显示「没拿到译文」，真因留在这条 502 里
+                return self._send(502, {"error": "upstream failed: %s" % str(e)[:200]})
+            if not isinstance(j, dict):
+                return self._send(200, {"content": ""})
+            # 补一个顶层 content（App 两种形态都认：`{content}` 与 `choices[0].message.content`）
+            if not j.get("content"):
+                try:
+                    j["content"] = (((j.get("choices") or [{}])[0].get("message") or {})
+                                    .get("content") or "")
+                except Exception:
+                    pass
+            return self._send(200, j)
+
         if self.path == "/api/stream/start":
             session_id = str(data.get("sessionId", ""))
             model = str(data.get("model", "deepseek-v4-flash"))
@@ -2128,6 +2435,14 @@ class StreamHandler(BaseHTTPRequestHandler):
                 return self._send(404, {"error": "no such task"})
             task["cancelled"] = True
             return self._send(200, {"ok": True})
+
+        # v3.9.85：token 用量重置（App 长按 token 卡 → 确认后调用）
+        if self.path.startswith("/api/nas/token-usage-reset"):
+            try:
+                import token_usage_api
+                return self._send(200, token_usage_api.reset_token_usage())
+            except Exception as e:
+                return self._send(200, {"ok": False, "error": str(e)[:150]})
 
         # 服务控制（看板运维：重试/停止轻聊后端，V2.0）
         # v3.0.36：+ hermes 网关重启（service=hermes → channel_api._restart_gateway），仅 restart 不支持 stop
@@ -2257,7 +2572,7 @@ class StreamHandler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "not found"})
 
     def do_GET(self):
-        # v2.0.130：免鉴权 AI 图片端点（App 渲染 MEDIA: 路径时加载）——只允许 /data/hermes(hermes-data) 下图片
+        # v2.0.130：免鉴权 AI 图片端点（App 渲染 MEDIA: 路径时加载）——只允许 /opt/data(hermes-data) 下图片
         if self.path.startswith("/api/stream/media"):
             _serve_media(self)
             return
@@ -2334,6 +2649,13 @@ class StreamHandler(BaseHTTPRequestHandler):
                 return self._send(200, usage_api.collect_usage())
             except Exception as e:
                 return self._send(200, {"ok": False, "error": str(e)[:150], "providers": []})
+        # v3.9.82：token 用量（今日/本月，读 Hermes state.db 只读聚合；口径见 token_usage_api 头注释）
+        if self.path.startswith("/api/nas/token-usage"):
+            try:
+                import token_usage_api
+                return self._send(200, token_usage_api.collect_token_usage())
+            except Exception as e:
+                return self._send(200, {"ok": False, "error": str(e)[:150], "today": {}, "month": {}})
         # v3.0.18：设备一键体检（六维诊断）
         if self.path.startswith("/api/nas/diagnose"):
             return self._send(200, _collect_diagnose())
@@ -2441,13 +2763,20 @@ class StreamHandler(BaseHTTPRequestHandler):
                         # 任务被容器重启/清理切断后 status 仍可能是 streaming，App 收到 done=true
                         # 会把半截内容当「最终答案」落库。改为与内存分支同一口径（按 status 算）。
                         _bst_status = str(_bst.get("status", "done") or "done")
+                        # v3.9.80：磁盘兜底只在「内存里已经没有这条会话的任务」时才会走到。
+                        # 此时文件仍是 streaming = 任务被服务重启/异常切断（内存侧已丢，App 再轮询
+                        # /api/stream/{id} 只会拿到 404 {"error":"no such task"} → 卡在「发送中」、
+                        # 点开会话永远自动接回）。故这里必须判死：done=True + status=error，
+                        # App 收下已生成内容并收尾，不再对着幽灵任务轮询。
+                        if _bst_status == "streaming":
+                            _bst_status = "error"
                         return self._send(200, {
                             "taskId": _bid,
                             "content": _bst.get("content", ""),
-                            "done": _bst_status != "streaming",
+                            "done": True,
                             "status": _bst_status,
-                            "isWorking": _bst_status == "streaming",
-                            "error": _bst.get("error", ""),
+                            "isWorking": False,
+                            "error": _bst.get("error", "") or "任务中断（服务重启或异常），已保留已生成内容",
                             "agent": _bst.get("agent", False),
                             "fromDisk": True
                         })
@@ -2498,13 +2827,18 @@ class StreamHandler(BaseHTTPRequestHandler):
                 pass
             # v3.9.16：带上工具事件，供 App 在对话里画工具卡（纯增量字段，旧版 App 忽略）
             #   —— 工具名一律给中文（App 不必再维护一份映射表，与 _TOOL_NAME_ZH 保持一处真相）
-            #   —— 只回最近 10 个，防长任务把响应撑大（轮询频率 0.15-0.25s，体积要克制）
-            _th = [str(x) for x in (st.get("toolHistory") or [])][-10:]
+            #   —— v3.9.80 起**全量下发**（原先裁最近 10 个；用户要求展开明细能看全，见下）
+            # v3.9.80（用户口径：展开明细要**全量**列出，别只留最近 10 步）：不再裁剪工具名。
+            # 原先回最近 10 步是怕长任务撑大响应，实测响应体积主项是 content（上限 200k 字符），
+            # 工具名每步约 20 字节、耗时每步约 40 字节 → 几十步也就几 KB，直接全量下发。
+            # 步数真值仍由 toolSeq 提供（全量计数，摘要行显示实际步数，见 App 侧 ql_toolsteps 真值表）。
+            _th = [str(x) for x in (st.get("toolHistory") or [])]
             # v3.9.58：工具耗时随轮询下发（[{n:中文名, s:秒}]），App 画「✓ 查天气 · 1.2s」。
-            # 与 toolHistory 对齐裁最近 10 步；App 只在条数变化时刷新，这里保持追加序即可。
+            # v3.9.80：与 toolHistory 一样**不再裁 10 步**（与 _th 同长，App 按下标取耗时不会错位）；
+            # App 只在列表**缩短**时刷新（抽新加步数防重排），这里保持追加序即可。
             # 老 App 不认识此键=忽略（纯增量字段）。
             _tspans = [{"n": _TOOL_NAME_ZH.get(str(x.get("n") or ""), str(x.get("n") or "")),
-                        "s": x.get("s")} for x in (st.get("toolSpans") or [])][-10:]
+                        "s": x.get("s")} for x in (st.get("toolSpans") or [])]
             return self._send(200, {
                 "content": new,
                 "done": st["status"] != "streaming",
@@ -2526,7 +2860,7 @@ class StreamHandler(BaseHTTPRequestHandler):
 def _serve_media(self):
     """v2.0.130：免鉴权图片服务——MEDIA:路径 → 图片字节。
     v3.0.28 security note：免鉴权设计（App 本地 localhost 调用），白名单限制只读允许目录下的图片扩展名。
-    query: p=<base64url(宿主绝对路径)>；仅允许图片扩展名 + 容器 /data/hermes 映射目录。
+    query: p=<base64url(宿主绝对路径)>；仅允许图片扩展名 + 容器 /opt/data 映射目录。
     """
     import urllib.parse as _up
     q = _up.parse_qs(_up.urlparse(self.path).query)
@@ -2559,6 +2893,8 @@ def _serve_media(self):
     real = os.path.realpath(path)
     _roots = [os.path.realpath(a) for a in _mc.media_roots()]
     if not any(real == r or real.startswith(r + os.sep) for r in _roots):
+        self._send(403, {"error": "forbidden path"})
+        return
         self._send(403, {"error": "forbidden path"})
         return
     ext = os.path.splitext(path)[1].lower()
@@ -2650,9 +2986,9 @@ def _relay_query(self):
             "/api/local/", "/api/weather", "/api/push/", "/api/scenes",
             "/api/automation", "/api/memory", "/api/kb", "/api/docker",
             "/api/secrets", "/api/ha/", "/api/cron", "/api/files", "/api/logs",
-            "/api/router/", "/api/agent", "/api/tasks", "/api/mcp",
+            "/api/router/", "/api/agent", "/api/tasks", "/api/mcp","/api/router/", "/api/agent", "/api/tasks", "/api/mcp", "/api/clouddrive",
             "/api/diag",
-            "/api/life",
+            "/api/life", "/api/mail",
             "/api/nas/", "/api/hw/", "/api/channel/",
             "/api/inbox", "/api/history", "/api/tts",
         )
@@ -2702,6 +3038,8 @@ def cleanup_old_tasks():
     # 的 2 倍余量，真任务单请求不会静默超过它；v3.9.28 首版 7200s 太宽，实测期间
     # 又出现一条僵尸挂着灵动岛 100 分钟才等到回收（用户拍板收紧）。
     ZOMBIE_SILENT = 1800
+    # v3.9.56：已完成（非 streaming）任务文件的保留期，与 TASK_TTL 内存侧 2 小时口径区分开
+    STREAM_FILE_TTL = 7200
     while True:
         time.sleep(300)
         now = time.time()
@@ -2727,20 +3065,25 @@ def cleanup_old_tasks():
                         continue
                     fp = os.path.join(STREAM_DIR, fn)
                     try:
-                        if time.time() - os.path.getmtime(fp) <= 7200:
-                            continue
                         try:
                             with open(fp, encoding="utf-8") as _f:
                                 _st = json.load(_f)
                         except Exception:
                             _st = None
+                        # v3.9.56：原实现先判 mtime<=7200 才 continue，而僵尸判定要
+                        # >ZOMBIE_SILENT(1800)——7200 门槛比僵尸阈值宽 4 倍，静默
+                        # 30 分钟~2 小时之间的僵尸文件被这道 continue 永久跳过，worker
+                        # 死后内存侧 _tasks 为空也没人兜底 → 用户每次点会话都 recover
+                        # 到它（"进入又触发进行中"）。改为先读 status 再分档判。
                         if isinstance(_st, dict) and _st.get("status") == "streaming":
-                            # v3.9.28：streaming 不再"一律跳过"——静默超 30 分钟（= 2×上游
-                            # timeout 900s）即僵尸，直接删，防 App recover 误接回（"自动发送"根因）
+                            # 静默超 ZOMBIE_SILENT（= 2×上游 timeout 900s）即僵尸，
+                            # 直接删，防 App recover 误接回（"自动发送"根因）
                             if now - os.path.getmtime(fp) > ZOMBIE_SILENT:
                                 os.remove(fp)
                             continue
-                        os.remove(fp)
+                        # 已完成任务文件保留 STREAM_FILE_TTL（2 小时），沿用原设计
+                        if now - os.path.getmtime(fp) > STREAM_FILE_TTL:
+                            os.remove(fp)
                     except Exception:
                         pass
         except Exception:
@@ -2756,4 +3099,8 @@ if __name__ == "__main__":
     srv = ThreadingHTTPServer(("0.0.0.0", 9132), StreamHandler)
     print("[stream] listening on 9132, dir:", STREAM_DIR, flush=True)
     srv.serve_forever()
+
+
+
+
 

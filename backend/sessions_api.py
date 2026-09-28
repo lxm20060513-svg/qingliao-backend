@@ -9,13 +9,19 @@ import http.server
 import json
 import os
 import threading
-DATA_DIR = os.environ.get("QL_DATA_DIR", "/data")
+DATA_DIR = os.environ.get("QL_DATA_DIR", "/volume1/docker/hermes/微信文件/轻聊web/data")
 import time
 import hmac
 import media_convert  # v2.0.130: 历史消息 MEDIA:路径→data URL 图片
 
+# v3.9.71 delivery: 固定投递会话——cron/system 投递详情落这里（App 任何版本可见，不可删除）
+DELIVERY_SESSION_ID = "qingliao_delivery"
+DELIVERY_SESSION_TITLE = "轻聊投递"
+
+
+
 # v2.0.116 review：并发保存锁（多设备 merge 写覆盖丢数据）
-_save_lock = threading.Lock()
+_save_lock = threading.RLock()   # v3.9.71: RLock——append_delivery_message 持锁调用 save_sessions(内部同锁)
 
 # 访问密码（与 files_api.py 保持一致）
 # BE4：默认改空串——"change-me" 是公开仓库里的常量（密码兜底本身默认关闭，不留弱口令）
@@ -25,7 +31,7 @@ SESSIONS_PASSWORD = os.environ.get("QL_PASSWORD", "")
 LOC_FILE = os.path.join(DATA_DIR, "sessions_loc.json")
 
 def _dir_writable(p):
-    """真实写入探测：只读挂载（EROFS）下 os.access(W_OK) 在 root 也会骗人，必须试写一次。"""
+    """真实写入探测：只读挂载（EROFS）在 root 下 os.access 也会骗人，必须试写一次。"""
     probe = os.path.join(p, '.sessions_write_probe')
     try:
         with open(probe, 'w') as _f:
@@ -44,9 +50,9 @@ def _data_dir():
         if p and os.path.isdir(p):
             if _dir_writable(p):
                 return p
-            # 位置覆盖指向不可写目录时不能硬用：否则每次 merge/save 都 500，客户端只看到
-            # 「删除失败 服务器错误(500)」。典型成因：容器把宿主卷以 :ro 挂入，而这份覆盖
-            # 是历史遗留、指向该卷下的旧目录（换过数据目录名的部署最容易踩）。
+            # 位置覆盖指向不可写目录时不能硬用：否则每次 merge/save 都 500（客户端表现为
+            # 「删除失败 服务器错误(500)」）。典型成因：容器把 /volume1 以 :ro 挂入，而覆盖
+            # 指向该卷下的历史目录（如 微信文件/轻聊app/sessions）。
             print('[sessions] 位置覆盖不可写，回退默认目录: %s -> %s' % (p, fallback), flush=True)
     except Exception:
         pass
@@ -83,11 +89,43 @@ def save_sessions(sessions):
         os.replace(_tmp_file(), _data_file())
 
 
+def ensure_delivery_session():
+    """确保固定投递会话存在，返回 (全量列表, 会话dict)。调用方负责 save_sessions。"""
+    sessions = load_sessions()
+    for s in sessions:
+        if isinstance(s, dict) and s.get("id") == DELIVERY_SESSION_ID:
+            if s.get("title") != DELIVERY_SESSION_TITLE:
+                s["title"] = DELIVERY_SESSION_TITLE
+            return sessions, s
+    s = {"id": DELIVERY_SESSION_ID, "title": DELIVERY_SESSION_TITLE,
+         "messages": [], "createdAt": int(time.time() * 1000), "updatedAt": 0}
+    sessions.insert(0, s)
+    return sessions, s
+
+def append_delivery_message(text, task_type="cron"):
+    """向固定会话追加一条 assistant 消息并落盘。失败只打日志，绝不影响投递主流程。"""
+    try:
+        with _save_lock:
+            sessions, sess = ensure_delivery_session()
+            ts_ms = int(time.time() * 1000)
+            sess.setdefault("messages", []).append({
+                "role": "assistant", "content": text,
+                "timestamp": ts_ms, "isPush": True})
+            sess["updatedAt"] = ts_ms
+            save_sessions(sessions)
+        return True
+    except Exception as e:
+        print('[delivery] 写入固定会话失败: %s' % e, flush=True)
+        return False
+
+
 def merge_sessions(local, incoming, deleted):
     """合并策略：
     - incoming 中 NAS 没有的 -> 新增
     - 同 id 的 -> 取 updatedAt 较新的（incoming 较新则覆盖）
     - deleted 中的 id -> 删除
+    例外（固定投递会话 qingliao_delivery）：不可删 + 标题锁定，但**消息内容以客户端为准**
+    （客户端能删单条/清空，否则投递详情越积越多）——详见下方 v3.9.72 注释。
     返回合并后的完整列表
     """
     merged = []
@@ -95,10 +133,16 @@ def merge_sessions(local, incoming, deleted):
     for s in local:
         if isinstance(s, dict) and s.get('id'):
             by_id[s['id']] = s
+    # v3.9.71 delivery: 固定会话保护——「轻聊投递」(qingliao_delivery) 不可被删除，
+    # deleted 列表里的该 id 直接忽略（App/PWA/任何客户端的删除请求都拦在后端这一层）
+    _PROTECTED_IDS = {"qingliao_delivery"}
+    _DELIVERY_INCOMING = {}   # v3.9.72: 客户端发来的固定会话（内容以客户端为准，见下）
     for s in incoming:
         if not isinstance(s, dict) or not s.get('id'):
             continue
         sid = s['id']
+        if sid in _PROTECTED_IDS:
+            _DELIVERY_INCOMING[sid] = s
         if sid in by_id:
             cur = by_id[sid]
             # 以 updatedAt 较新者为准
@@ -107,7 +151,37 @@ def merge_sessions(local, incoming, deleted):
         else:
             by_id[sid] = s
     for sid in (deleted or []):
+        if sid in _PROTECTED_IDS:
+            print('[sessions] 拒绝删除固定会话: %s' % sid, flush=True)
+            continue
         by_id.pop(sid, None)
+    # v3.9.72 delivery: 固定会话「会话不可删，但内容可删」——客户端发来的该会话消息一律以客户端为准。
+    # 起因（用户反馈「轻聊投递里删不掉投递内容，日积月累太多」）：App 写会话只发 id/title/messages，
+    # 不发 updatedAt（恒 0），而 NAS 侧 append_delivery_message 每次投递都把该会话 updatedAt 抬到
+    # 当前时间（非 0）→ 上面「updatedAt 较新者为准」恒判 incoming 旧 → 删除被静默丢弃，客户端刷新后
+    # 投递内容原样回来（表现就是「删了又复活」，且越积越多）。这里对该 id 特判：
+    #   · incoming 带 messages（list，含空数组=清空本会话）→ 直接采用（删单条/清空都能落库）
+    #   · incoming 不带 messages 键（纯改名等）→ 保留 NAS 消息，防误清
+    #   · 仍锁 title；updatedAt 沿用 NAS 的（避免该会话在列表里掉到底部）
+    for _sid in _PROTECTED_IDS:
+        _inc = _DELIVERY_INCOMING.get(_sid)
+        if not _inc:
+            continue
+        _cur = by_id.get(_sid) or {}
+        _new = dict(_inc)
+        _new["id"] = _sid
+        _new["title"] = DELIVERY_SESSION_TITLE
+        if not isinstance(_new.get("messages"), list):
+            _new["messages"] = list(_cur.get("messages") or [])
+        _new["updatedAt"] = _inc.get("updatedAt") or _cur.get("updatedAt") or int(time.time() * 1000)
+        if _cur.get("createdAt") and not _new.get("createdAt"):
+            _new["createdAt"] = _cur["createdAt"]
+        by_id[_sid] = _new
+        print('[sessions] 固定会话内容以客户端为准: %s msgs=%d' % (_sid, len(_new["messages"])), flush=True)
+    # v3.9.71: 固定会话标题锁定（改名也被还原）
+    for _sid in _PROTECTED_IDS:
+        if _sid in by_id:
+            by_id[_sid]["title"] = DELIVERY_SESSION_TITLE
     # 按 updatedAt 倒序
     merged = list(by_id.values())
     merged.sort(key=lambda s: s.get('updatedAt') or 0, reverse=True)

@@ -10,7 +10,7 @@ import hmac
 
 import json as _json, os as _os
 import os
-DATA_DIR = os.environ.get("QL_DATA_DIR", "/data")
+DATA_DIR = os.environ.get("QL_DATA_DIR", "/volume1/docker/hermes/微信文件/轻聊web/data")
 
 def _ha_config():
     try:

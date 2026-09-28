@@ -69,7 +69,7 @@ def _load_custom() -> list:
     # 于是「App 新增的 API」永远加载不到（自建 provider 的 key 也就永远不生效）。
     # 现在与 provider_admin 共用同一份文件，逐候选路径回退。
     import json as _j
-    for _p in (os.environ.get("QL_DATA_DIR", "/data") + "/custom_providers.json",
+    for _p in ("/volume1/docker/hermes/微信文件/轻聊web/data/custom_providers.json",
                "/data/custom_providers.json",
                "/data/streams_data/custom_providers.json"):
         try:
@@ -129,6 +129,7 @@ def query_stepfun() -> dict:
     return {"provider": "stepfun", "name": "阶跃 StepFun", "mode": "plan",
             "available": False, "unsupported": True,
             "error": "Step Plan · 额度见控制台"}
+
 
 
 def query_opencode(pid="opencode-apple") -> dict:

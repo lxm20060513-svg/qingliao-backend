@@ -23,7 +23,7 @@ except ImportError:
 # 2026-09-09：wechat-profile 已删除，微信通道由 default profile（主 config.yaml）服务。
 # 模型写入主 config.yaml 的 model 段，重启 default gateway 生效。
 # v3.0.83：QL_WECHAT_PROFILE_CFG env 已在 compose 中改指主 config.yaml（旧值指向已删 profile 会 500）。
-_DEFAULT_CFG = os.environ.get("QL_CONFIG_YAML", "/data/hermes_config.yaml")
+_DEFAULT_CFG = "/volume1/docker/hermes/hermes-data/config.yaml"
 _FALLBACK_CFG = "/data/hermes_config.yaml"
 PROFILE_CFG = os.environ.get("QL_WECHAT_PROFILE_CFG") or (
     _DEFAULT_CFG if os.path.exists(_DEFAULT_CFG) else _FALLBACK_CFG
@@ -38,9 +38,12 @@ def _write_lines(out):
     Hermes 下次启动才暴露）。权限沿用原文件：Hermes 侧要能读，这里不擅自改。"""
     text = "\n".join(out) + "\n"
     try:
-        _mode = os.stat(PROFILE_CFG).st_mode & 0o777
+        _st = os.stat(PROFILE_CFG)
+        _mode = _st.st_mode & 0o777
+        _uid, _gid = _st.st_uid, _st.st_gid
     except OSError:
         _mode = 0o644
+        _uid = _gid = None
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(PROFILE_CFG) or ".", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -49,6 +52,12 @@ def _write_lines(out):
             os.fsync(f.fileno())
         os.chmod(tmp, _mode)
         os.replace(tmp, PROFILE_CFG)
+        # 2026-09-21 修：owner 复原（mkstemp 产物属 root → Hermes 侧读不了 config.yaml）
+        if _uid is not None:
+            try:
+                os.chown(PROFILE_CFG, _uid, _gid)
+            except OSError:
+                pass
     except Exception:
         try:
             if os.path.exists(tmp):
@@ -173,7 +182,7 @@ def _restart_gateway():
     """重启 Hermes gateway 使新模型生效（docker exec 容器内，异步不阻塞）"""
     try:
         subprocess.Popen(
-            ["docker", "exec", os.environ.get("QL_HERMES_CONTAINER", "hermes-container"), "hermes", "gateway", "restart"],
+            ["docker", "exec", "hermes-hermes-1", "hermes", "gateway", "restart"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )

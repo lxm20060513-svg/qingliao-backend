@@ -69,6 +69,48 @@ def _save(items):
             pass
 
 
+# ---- v3.9.57 消息归档：被丢弃/被确认的消息一律落 archive/ 可回溯（修"静默蒸发"） ----
+ARCHIVE_DIR = os.path.join(DATA_DIR, "inbox_archive")
+
+
+def _archive(entries, reason=None):
+    """把即将从队列消失/已被确认的消息落盘归档。
+    entries 支持两种形态：
+      - [(item, reason), ...]  逐条带自己的原因（推荐）
+      - [item, ...]            统一用 reason 参数
+    铁律：归档失败不得影响主流程。
+    """
+    if not entries:
+        return
+    norm = []
+    for e in entries:
+        if isinstance(e, (tuple, list)) and len(e) == 2:
+            norm.append((e[0], e[1] or reason or "unknown"))
+        else:
+            norm.append((e, reason or "unknown"))
+    try:
+        os.makedirs(ARCHIVE_DIR, exist_ok=True)
+        ts = time.strftime("%Y%m%d")
+        path = os.path.join(ARCHIVE_DIR, "inbox_%s.jsonl" % ts)
+        with open(path, "a", encoding="utf-8") as f:
+            for it, why in norm:
+                rec = {
+                    "archivedAt": time.time(),
+                    "archivedAtStr": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "reason": why,
+                    "id": it.get("id"),
+                    "ts": it.get("ts") or 0,
+                    "tsStr": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(it.get("ts") or 0)),
+                    "status": it.get("status"),
+                    "source_task_id": it.get("source_task_id"),
+                    "task_type": it.get("task_type", "reply"),
+                    "text": it.get("text", ""),
+                }
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print("[inbox] 归档失败（不影响主流程）:", str(e)[:120], flush=True)
+
+
 def push(text, task_id=None, task_type="reply"):
     """Hermes 事件方调用：推送一条消息到轻聊 App 收件箱。
     v3.4.8：task_id 为该回复的流式任务 id（source_task_id），App 端用作不可变去重标识。
@@ -88,6 +130,14 @@ def push(text, task_id=None, task_type="reply"):
         if len(items) > QUEUE_LIMIT:
             items = items[-QUEUE_LIMIT:]
         _save(items)
+    # v3.9.71 delivery: cron/system 类投递详情同步写入固定会话「轻聊投递」；
+    # reply/progress 是正常 AI 回复链路，刻意不进（用户要求）
+    if task_type in ("cron", "system"):
+        try:
+            import sessions_api
+            sessions_api.append_delivery_message(text, task_type=task_type)
+        except Exception as e:
+            print('[delivery] 投递写入异常: %s' % e, flush=True)
     return True, "已推送"
 
 
@@ -103,18 +153,21 @@ def pop_pending():
     items = _load()
     picked = []
     rest = []
+    dropped = []  # v3.9.57：即将消失的消息 → 先归档再丢，杜绝静默蒸发
     for it in items:
         st = it.get("status")
         ts = it.get("ts") or 0
         if st == "pending":
             if now - ts > STALE_TTL:
-                continue  # 滞留过久（App 长期未确认）→ 舍弃
+                dropped.append((it, "pending_stale_%dh" % (STALE_TTL // 3600)))
+                continue  # 滞留过久（App 长期未确认）→ 归档后舍弃
             it["status"] = "sending"
             it["sent_ts"] = now
             picked.append(it)
         elif st == "sending":
             if now - ts > STALE_TTL:
-                continue  # 滞留过久 → 舍弃
+                dropped.append((it, "sending_stale_%dh" % (STALE_TTL // 3600)))
+                continue  # 滞留过久 → 归档后舍弃
             sent_ts = it.get("sent_ts") or ts
             if now - sent_ts > SENDING_TIMEOUT:
                 # 僵尸 sending（App 拉到但没来得及 done）→ 重置回 pending 重投
@@ -124,18 +177,28 @@ def pop_pending():
             else:
                 rest.append(it)
         elif st == "done" and now - ts > 3600:
-            continue  # 清理已完成的旧消息
+            dropped.append((it, "done_aged_1h"))
+            continue  # 清理已完成的旧消息 → 归档后清理
         else:
             rest.append(it)
     _save(rest + picked)
+    # v3.9.57：归档 + 落日志（此前三条 continue 都是静默丢弃，出事无法查证）
+    if dropped:
+        _archive(dropped)  # dropped 已是 [(item, reason), ...]，逐条保留原因
+        for d, reason in dropped:
+            print("[inbox] 消息离开队列 id=%s task=%s 原因=%s 字数=%d（已归档）" % (
+                d.get("id"), d.get("source_task_id"), reason, len(d.get("text") or "")), flush=True)
     return picked
 
 
 def mark_done(mid):
     with _lock:
         items = _load()
+        hit = [it for it in items if it.get("id") == mid]
         new = [it for it in items if it.get("id") != mid]
         if len(new) != len(items):
+            # v3.9.57：App 确认前先把内容归档——此前是物理删除，App 未存住即永久丢失
+            _archive(hit, "mark_done")
             _save(new)
             return True
     return False
@@ -210,6 +273,8 @@ class Handler(BaseHTTPRequestHandler):
             self.headers.get("X-Inbox-Token", ""), INBOX_TOKEN)
 
     def do_OPTIONS(self):
+        # v3.9.57：CORS 预检必须不经鉴权（返回 401 会让浏览器/客户端预检直接失败，
+        # 表现为"接口完全打不通"）。原 do_GET/do_POST 的鉴权逻辑保持不变。
         self.send_response(204)
         self._cors()
         self.end_headers()
@@ -218,9 +283,13 @@ class Handler(BaseHTTPRequestHandler):
         # GET /api/inbox —— App 轮询拉取待推送消息
         if self.path.startswith("/api/inbox"):
             if not self._auth_app():
+                print("[inbox] GET 401 未授权 path=%s" % self.path[:60], flush=True)
                 self._send(401, {"ok": False, "error": "unauthorized"})
                 return
             items = pop_pending()
+            if items:
+                print("[inbox] GET 取走 %d 条: %s" % (
+                    len(items), ",".join(str(x.get("source_task_id")) for x in items)), flush=True)
             self._send(200, {"ok": True, "items": [{
                 "id": it["id"], "text": it["text"], "ts": it.get("ts", 0),
                 "source_task_id": it.get("source_task_id"),
@@ -234,9 +303,11 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/api/inbox/([0-9a-f]+)/done$", self.path)
         if m:
             if not self._auth_app():
+                print("[inbox] POST 401 未授权 done id=%s" % m.group(1), flush=True)
                 self._send(401, {"ok": False, "error": "unauthorized"})
                 return
             ok = mark_done(m.group(1))
+            print("[inbox] POST done id=%s → %s（内容已归档）" % (m.group(1), ok), flush=True)
             self._send(200, {"ok": ok})
             return
         # POST /api/inbox/push —— Hermes 主动推消息

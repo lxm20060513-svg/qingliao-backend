@@ -254,7 +254,7 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "description": "搜索关键词（文件名或内容）"},
-                    "path": {"type": "string", "description": "搜索目录（默认 /data）"},
+                    "path": {"type": "string", "description": "搜索目录（默认 /volume1）"},
                 },
                 "required": ["pattern"],
             },
@@ -302,6 +302,53 @@ TOOLS = [
             "name": "patch_file",
             "description": "精确替换文件中的指定字符串。适合对已有文件做小范围修改",
             "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "文件路径"}, "old_string": {"type": "string", "description": "要替换的字符串"}, "new_string": {"type": "string", "description": "替换后的新字符串"}}, "required": ["path", "old_string", "new_string"]},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mail_accounts",
+            "description": "列出已接入的邮箱账号（id/地址/是否默认/是否允许AI直接发送）。发信或查信前不确定用哪个邮箱时先查这里",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mail_list",
+            "description": "列出邮箱里的邮件（默认最新20封）。可只看未读，或按主题关键词搜索",
+            "parameters": {"type": "object", "properties": {
+                "account": {"type": "string", "description": "邮箱账号 id 或邮箱地址；不传用默认账号"},
+                "folder": {"type": "string", "description": "IMAP 文件夹，默认 INBOX"},
+                "limit": {"type": "integer", "description": "最多返回几封，默认20，上限50"},
+                "unread": {"type": "boolean", "description": "true = 只看未读"},
+                "query": {"type": "string", "description": "主题关键词，精确匹配"},
+            }, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mail_read",
+            "description": "读某封邮件的正文（uid 来自 mail_list 的结果）",
+            "parameters": {"type": "object", "properties": {
+                "uid": {"type": "string", "description": "邮件 uid"},
+                "account": {"type": "string", "description": "邮箱账号 id 或地址；不传用默认账号"},
+                "folder": {"type": "string", "description": "IMAP 文件夹，默认 INBOX"},
+            }, "required": ["uid"]},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mail_send",
+            "description": "用已接入的邮箱发邮件。若该账号未开启「允许AI直接发送」，只会生成草稿，你必须在回复里明说「已生成草稿，请用户在邮件界面确认发送」，并回显收件人与主题，绝不谎称已发送",
+            "parameters": {"type": "object", "properties": {
+                "to": {"type": "string", "description": "收件人邮箱地址"},
+                "subject": {"type": "string", "description": "邮件主题"},
+                "body": {"type": "string", "description": "邮件正文（纯文本）"},
+                "account": {"type": "string", "description": "用哪个邮箱发；不传用默认账号"},
+            }, "required": ["to", "subject", "body"]},
         },
     },
     {
@@ -411,11 +458,11 @@ def _fmt_kb(kb):
 
 
 def _disk_usage():
-    """存储卷磁盘状态：容量/已用/可用/使用率 + 各卷顶层主要占用。
+    """宿主存储卷磁盘状态：/volume1/2/3 容量/已用/可用/使用率 + 各卷顶层主要占用。
     qingliao 跑在宿主 systemd，df/du 天然是宿主视角（区别于容器内 df 只见自身挂载）。
     注意：勿用 df -hT | head -8——系统分区会占满前 8 行，/volume3 被截断（历史 bug）。"""
     out = []
-    df = _sh("df -h /data", timeout=20)
+    df = _sh("df -h /volume1 /volume2 /volume3", timeout=20)
     for row in df.splitlines()[1:]:
         p = row.split()
         if len(p) < 6:
@@ -534,7 +581,7 @@ def execute(name, args, agent_model=None, agent_provider=None):
         if name == "list_files":
             return _list_files(args.get("path", "."))
         if name == "search_files":
-            return _search_files(args.get("pattern", ""), args.get("path", os.environ.get("QL_NAS_ROOT", "/data")))
+            return _search_files(args.get("pattern", ""), args.get("path", "/volume1"))
         if name == "execute_code":
             return _execute_code(args.get("code", ""), args.get("language", "python"))
         if name == "delegate_task":
@@ -543,6 +590,67 @@ def execute(name, args, agent_model=None, agent_provider=None):
             return _hermes_tool_call("web_extract", {"urls": [args.get("url", "")]})
         if name == "patch_file":
             return _hermes_tool_call("patch", {"path": args.get("path", ""), "old_string": args.get("old_string", ""), "new_string": args.get("new_string", "")})
+        if name == "mail_accounts":
+            import mail_api
+            accs = mail_api.list_accounts()
+            if not accs:
+                return "还没有接入任何邮箱。请提示用户在轻聊「设置 → 邮件接入」里添加邮箱账号（QQ/163/Outlook 等，用授权码而非登录密码）。"
+            out = []
+            for a in accs:
+                tag = []
+                if a.get("default"):
+                    tag.append("默认")
+                if a.get("allow_direct_send"):
+                    tag.append("可直发")
+                if not a.get("has_secret"):
+                    tag.append("缺授权码")
+                out.append("%s（id=%s%s）" % (a.get("email", ""), a.get("id", ""),
+                                             "，" + "、".join(tag) if tag else ""))
+            return "\n".join(out)
+        if name == "mail_list":
+            import mail_api
+            r = mail_api.list_messages(aid=(args.get("account") or "").strip() or None,
+                                       email_addr=(args.get("account") or "").strip() or None,
+                                       folder=args.get("folder") or "INBOX",
+                                       limit=args.get("limit") or 20,
+                                       unread_only=bool(args.get("unread")),
+                                       query=(args.get("query") or "").strip())
+            if not r.get("ok"):
+                return "读取邮箱失败：" + str(r.get("error") or r)
+            msgs = r.get("messages") or []
+            if not msgs:
+                return "邮箱 %s 里没有符合条件的邮件。" % r.get("email", "")
+            lines = ["邮箱 %s（未读 %d 封）：" % (r.get("email", ""),
+                                              sum(1 for m in msgs if m.get("unread")))]
+            for m in msgs:
+                lines.append("uid=%s %s %s %s%s" % (
+                    m.get("uid"), "[未读]" if m.get("unread") else "      ",
+                    m.get("date", ""), m.get("from", ""), m.get("subject", "")))
+            return "\n".join(lines)
+        if name == "mail_read":
+            import mail_api
+            r = mail_api.read_message(aid=(args.get("account") or "").strip() or None,
+                                      email_addr=(args.get("account") or "").strip() or None,
+                                      uid=str(args.get("uid") or "").strip(),
+                                      folder=args.get("folder") or "INBOX")
+            if not r.get("ok"):
+                return "读取邮件失败：" + str(r.get("error") or r)
+            return "主题：%s\n发件人：%s\n时间：%s\n%s\n\n%s" % (
+                r.get("subject", ""), r.get("from", ""), r.get("date", ""),
+                ("附件：" + "、".join(r.get("attachments") or [])) if r.get("attachments") else "",
+                r.get("text", ""))
+        if name == "mail_send":
+            import mail_api
+            # AI 永远不能自己强开直发：direct 只由账号上的「允许AI直接发送」开关决定
+            r = mail_api.send_mail(aid=(args.get("account") or "").strip() or None,
+                                   email_addr=(args.get("account") or "").strip() or None,
+                                   to=(args.get("to") or "").strip(),
+                                   subject=(args.get("subject") or "").strip(),
+                                   body=(args.get("body") or "").strip())
+            if r.get("draft"):
+                return "未发送（该邮箱未开启允许AI直接发送）。已生成草稿：收件人 %s，主题 %s。" % (
+                    r.get("to", ""), r.get("subject", ""))
+            return "已发送：收件人 %s，主题 %s。" % (r.get("to", ""), r.get("subject", ""))
         if name == "todo":
             return _hermes_tool_call("todo", args)
     except Exception as e:
@@ -634,7 +742,7 @@ def _list_files(path='.'):
         return f"列目录失败：{str(e)[:150]}"
 
 
-def _search_files(pattern, path=os.environ.get("QL_NAS_ROOT", "/data")):
+def _search_files(pattern, path='/volume1'):
     """按文件名搜索"""
     if not pattern:
         return "搜索词为空"
