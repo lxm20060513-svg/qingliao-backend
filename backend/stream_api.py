@@ -54,6 +54,11 @@ DATA_DIR = os.environ.get("STREAM_DATA_DIR", "/data/streams_data")
 STREAM_DIR = os.path.join(DATA_DIR, "streams")
 HERMES_URL = os.environ.get("STREAM_HERMES_URL", "http://127.0.0.1:9123/v1/chat/completions")
 HERMES_KEY = os.environ.get("STREAM_HERMES_KEY", "")
+# 本地模型（provider=local）直连 Ollama 的基址。
+# 2026-10-01 修：此前此处与「断网兜底」分支各硬编码一个地址（一个是 NAS 内网地址、一个是 127.0.0.1，
+# 且都没读已有的 QL_OLLAMA_URL），导致换机器/改端口必须改代码。现统一由环境变量注入，
+# 与 docker-compose.yml 的 QL_OLLAMA_URL 一致。
+OLLAMA_BASE_URL = os.environ.get("QL_OLLAMA_URL", "http://localhost:11434/v1").rstrip("/")
 
 
 def _reasoning_options(mode=None):
@@ -1132,7 +1137,7 @@ def _agent_endpoint(model, provider):
             key = _load_cfg_key(["providers", provider, "api_key"])
             return base + "/chat/completions", key or "", model
     if provider == "local":
-        base = _provider_base_url("ollama") or "http://192.168.31.40:11434/v1"
+        base = _provider_base_url("ollama") or OLLAMA_BASE_URL
         key = _load_cfg_key(["providers", "ollama", "api_key"]) or "ollama"
         return base + "/chat/completions", key, model
     return AGENT_URL, AGENT_KEY, AGENT_MODEL
@@ -1951,7 +1956,7 @@ def _worker(task_id, task):
             try:
                 local_model = st.get("model") or "qwen3:4b"
                 lbody = json.dumps({"model": local_model, "messages": req_body["messages"], "stream": True}).encode("utf-8")
-                lreq = urllib.request.Request("http://127.0.0.1:11434/v1/chat/completions",
+                lreq = urllib.request.Request(OLLAMA_BASE_URL + "/chat/completions",
                                               data=lbody, headers={"Content-Type": "application/json"})
                 lresp = urllib.request.urlopen(lreq, timeout=900)
                 for raw in lresp:
