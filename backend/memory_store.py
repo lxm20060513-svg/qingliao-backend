@@ -5,6 +5,7 @@
 注入：entries 非空时作为 system 消息（"关于用户的信息"）
 API：/api/memory/list|add|delete|update（memory_api.py）
 """
+import hashlib
 import json
 import os
 import re
@@ -12,7 +13,7 @@ import tempfile
 import threading
 import time
 
-MEMORY_PATH = os.environ.get("QL_DATA_DIR", "/data") + "/memory.json"
+MEMORY_PATH = "/volume1/docker/hermes/微信文件/轻聊web/data/memory.json"
 MAX_ENTRIES = 50
 
 # v3.0.6 review fix：记忆 JSON 高并发读写（每条流式消息 inject→add_entry），
@@ -85,6 +86,8 @@ def add_entry(text):
 
 
 def delete_entry(text):
+    # v3.9.95 修：函数体曾被一次改动顶成裸 `return False`（8 空格缩进仍在，
+    # 语法合法所以没被发现）→ App 点「删除」永远返回 False、条目删不掉。
     # v3.0.6 review fix：读-改-写全在锁内
     with _lock:
         entries = _load()
@@ -96,10 +99,10 @@ def delete_entry(text):
 
 
 def update_entry(old, new):
-    """就地改写一条记忆（v3.9.40 #19：App 端「编辑」），保持它在列表里的位置不变。
+    """就地改写一条记忆（v3.9.40 #19），保持它在列表里的位置不变。
 
-    为什么不做成 delete + add：add_entry 是 append，改完的条目会跳到末尾；而注入 system 时
-    是 "；".join(entries)，条目顺序就是模型读到记忆的次序，位置不该被一次编辑打乱。
+    不做成 delete + add：add_entry 是 append，改完会跳到末尾；注入 system 时
+    是 "；".join(entries)，条目顺序就是模型读到记忆的次序，不该被编辑打乱。
     """
     o = (old or "").strip()
     n = (new or "").strip()
@@ -113,7 +116,6 @@ def update_entry(old, new):
         if n == o:
             return True
         if n in entries:
-            # 改后的内容已存在 → 直接去掉这条，避免记忆里留两份重复
             entries.pop(i)
             return _save(entries)
         entries[i] = n
@@ -161,3 +163,44 @@ def inject(messages):
         return [{"role": "system", "content": ctx}] + list(messages)
     except Exception:
         return messages
+
+
+# v3.9.95：system 前缀注入（哈希门控）。
+# 背景：memory.json 一直只有 App 侧 CRUD（memory_api）在写，stream_api 里 `import memory_store`
+# 之后从无调用点 → 用户在「AI 记忆」页写的条目从未进过对话 prompt（写了没人读）。
+# 门控做法（照 Kelivo 的思路，自己重写）：把条目序列化成**逐字稳定**的前缀，先算内容
+# sha256 前 16 位签名，签名没变就直接复用上次的字符串——整段 system 因此逐字不变，
+# 上游 prompt cache 才能命中；记忆一改，前缀才变一次。顺序必须是「先比签名再决定重建」，
+# 反过来先写后比就永远检测不到变化。
+# 线程安全：dict 赋值原子；文件读失败沿用上一次的块（绝不把「读不到」当成「没有记忆」）。
+_prefix_cache = {"sig": None, "block": ""}
+
+
+def prompt_block():
+    """返回记忆 system 前缀（无条目时返回空串）。供 stream_api 各 system 组装点拼接。"""
+    try:
+        with open(MEMORY_PATH, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        raw = b""
+    except Exception as e:
+        print("[memory] 记忆注入读取失败：%s" % e, flush=True)
+        return _prefix_cache["block"]
+    sig = hashlib.sha256(raw).hexdigest()[:16]
+    if sig == _prefix_cache["sig"]:
+        return _prefix_cache["block"]
+    try:
+        entries = json.loads(raw.decode("utf-8")).get("entries", []) if raw else []
+    except Exception as e:
+        # 解析失败（写一半/外部截断）→ 沿用上一次的块，而不是当成「没有记忆」把前缀清空
+        print("[memory] 记忆注入解析失败，沿用上次前缀：%s" % e, flush=True)
+        return _prefix_cache["block"]
+    items = [str(e).strip() for e in entries if str(e).strip()]
+    block = ""
+    if items:
+        block = ("\n\n【用户长期记忆（App「AI 记忆」页维护的条目，回答时自然参考，"
+                 "不要逐条复述）】" + "；".join(items))
+    _prefix_cache["sig"] = sig
+    _prefix_cache["block"] = block
+    return block
+

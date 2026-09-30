@@ -78,6 +78,14 @@ def main():
     except Exception as e:
         print(f"[engine] suggest_engine failed: {e}", flush=True)
 
+    # v4.0.11 主动型 Agent 中枢（决策层 + 事件源 + 目标追踪 + 打扰预算）
+    try:
+        import proactive_agent
+        proactive_agent.start_engine()
+        print("[engine] proactive_agent started", flush=True)
+    except Exception as e:
+        print(f"[engine] proactive_agent failed: {e}", flush=True)
+
     print(f"[ready] all {len(servers)} services running", flush=True)
     try:
         while True:

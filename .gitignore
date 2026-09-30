@@ -11,3 +11,23 @@ upload_config.json
 sessions_loc.json
 *.log
 .env
+
+# 运行时配置/数据（后端会在生产目录里真实生成，绝不可提交）
+life_config.json
+token_usage_reset.json
+token_usage.json
+
+# 部署/调试过程留下的中间产物（生产 backend/ 目录里会堆积）
+_bak_*
+*.bak
+*.bak-*
+*.new
+*.new*
+*.patched.py
+*.qlaction.py
+stream_api.patched.py
+stream_api.qlaction.py
+__be_backup_*/
+_be_backup_*/
+_archived_baks_*/
+.wtest

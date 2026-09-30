@@ -3,9 +3,9 @@
 import json
 import os
 
-DEFAULT_DIR = os.environ.get("QL_UPLOAD_DIR", "/data/uploads")
+DEFAULT_DIR = os.environ.get("QL_UPLOAD_DIR", "/volume1/docker/hermes/微信文件/轻聊web/uploads")
 # BE5：存代码目录 → 重建镜像即丢自定义上传目录，改存持久化的 QL_DATA_DIR
-CONFIG_PATH = os.path.join(os.environ.get("QL_DATA_DIR", "/data"), "upload_config.json")
+CONFIG_PATH = os.path.join(os.environ.get("QL_DATA_DIR", "/volume1/docker/hermes/微信文件/轻聊web/data"), "upload_config.json")
 _legacy = os.path.join(os.path.dirname(os.path.abspath(__file__)), "upload_config.json")
 if not os.path.exists(CONFIG_PATH) and os.path.exists(_legacy):
     try:

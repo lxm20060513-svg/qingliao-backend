@@ -41,6 +41,10 @@ ROUTE_TABLE = {
     "/api/weather":   ("weather_api",  "WeatherHandler"),
     "/api/scenes":    ("scenes_api",   "Handler"),
     "/api/agent":     ("agent_api",    "Handler"),
+    # v4.0.11 主动型 Agent 中枢。借 /api/agent 前缀 → lucky 白名单/relay/nginx 三处零改动。
+    # 放最前面只为读起来显眼；_resolve_handler 是最长前缀优先，故 /api/agent/tasks、
+    # /api/agent/usage、/api/agent/tts 这几条更长前缀仍优先命中，不受影响。
+    "/api/agent/proactive": ("proactive_agent", "Handler"),
     "/api/agent/tool": ("stream_api",  "StreamHandler"),
     "/api/automations": ("automation_api", "Handler"),
     "/api/push":      ("push_api",     "Handler"),
@@ -50,8 +54,10 @@ ROUTE_TABLE = {
     "/api/channel":   ("channel_api",  "Handler"),
     "/api/router":   ("router_api",  "Handler"),
     "/api/mcp":      ("mcp_api",     "Handler"),
+    "/api/clouddrive": ("clouddrive_api", "Handler"),
     "/api/diag":     ("diag_api",    "DiagHandler"),
     "/api/life":      ("life_api",    "LifeHandler"),
+    "/api/mail":      ("mail_api",    "MailHandler"),
     # v3.9.18 危险操作确认闸门：Hermes pre_tool_call 插件 ↔ 本后端 ↔ App 三方链路
     # 2026-08-22 docker 化后补挂：App/WebUI 主链路（/api/nas、/api/stream）
     # 此前 9127 直连这两个前缀 404，仅 nginx->9132 路径可用
@@ -78,6 +84,18 @@ ROUTE_TABLE = {
     #   ⇒ 若将来出现「某前缀蜂窝/Wi-Fi 单侧不通」，先查 nginx 那份 location 打到哪个端口，
     #     再决定是补本表还是补 relay 白名单/nginx。
     "/api/history": ("automation_api", "Handler"),
+    # v3.9.71 输入收口：意图抽取云端兜底（借 /api/agent 前缀 → nginx/lucky/relay 零改动）
+    "/api/intent": ("intent_api", "Handler"),
+    "/api/agent/intent": ("intent_api", "Handler"),
+    # v3.9.56 TypeSafe 智能路由：App 调 /api/agent/typesafe/routing
+    # （借 /api/agent 前缀：lucky 白名单与 relay 已放行，nginx 三份 conf 无需改）。
+    # 2026-09-22 该段被覆盖丢失 → 请求退化到 /api/agent
+    # → agent_api 返回 404 {"ok": false, "error": "not found"}（App：状态获取失败）。
+    "/api/typesafe": ("typesafe_api", "Handler"),
+    "/api/agent/typesafe": ("typesafe_api", "Handler"),
+    # v4.0.x 网盘接入别名（借 /api/agent 前缀，lucky 白名单 + relay + nginx 三处零改动）：
+    # 实测 lucky(16666) 只放行了 /api/mail，/api/clouddrive 直连 404 → App 默认地址打不开网盘。
+    "/api/agent/clouddrive": ("clouddrive_api", "Handler"),
     "/api/tts":     ("stream_api",     "StreamHandler"),
 }
 

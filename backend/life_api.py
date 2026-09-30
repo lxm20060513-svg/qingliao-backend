@@ -48,16 +48,16 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# v4.0.7 长期目标：并进本模块而不是新建 goals_api.py —— /api/life 前缀在
+# unified_router + nginx(16668) + webui_443 + ALLOWED_RELAY 四处都已通，
+# 新开前缀要同步改四处，漏一处就 404/403。并进去 = 零接线改动。
+try:
+    import goal_module
+except Exception:      # 模块缺失时只让 /api/life/goal 报 501，不拖垮整个生活数据 API
+    goal_module = None
+
 # ---------------------------------------------------------------- 路径与参数
-# BE5：看板配置存代码目录会在每次重建镜像时丢失，改存持久化的 QL_DATA_DIR
-CONFIG_PATH = os.path.join(os.environ.get("QL_DATA_DIR", "/data"), "life_config.json")
-_legacy = os.path.join(os.path.dirname(os.path.abspath(__file__)), "life_config.json")
-if not os.path.exists(CONFIG_PATH) and os.path.exists(_legacy):
-    try:
-        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-        os.replace(_legacy, CONFIG_PATH)   # BE5：升级当次把旧配置搬过来，不丢看板设置
-    except Exception:
-        pass
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "life_config.json")
 
 HTTP_TIMEOUT = 5          # 单个上游请求超时（秒）
 COLLECT_SLACK = 2         # 整体收集相对单个超时的宽限（秒）
@@ -89,13 +89,6 @@ EM_UT = "fa5fd1943c7b386f172d6893dbfba10b"
 EM_FIELDS = "f43,f44,f45,f46,f47,f48,f57,f58,f59,f60,f116,f169,f170"
 EM_SUGGEST = ("https://searchapi.eastmoney.com/api/suggest/get"
               "?input={q}&type=14&token=D43BF722C8E33BDC906FB84D85E326E8&count=10")
-
-# 腾讯公开行情（东财 push2 在 NAS 容器网络被拒连时的主用源，实测直连 200）
-TX_QUOTE = "https://qt.gtimg.cn/q=%s"
-TX_SUGGEST = "https://smartbox.gtimg.cn/s3/?v=2&q=%s&t=all"
-# 市场编号 → 腾讯代码前缀（105/106/107 都是美股，腾讯统一 us 前缀）
-TX_PREFIX = {"1": "sh", "0": "sz", "116": "hk", "105": "us", "106": "us", "107": "us"}
-TX_MARKET_BACK = {"sh": "1", "sz": "0", "hk": "116", "us": "105"}
 
 # 快递100 免费网页接口（免 key，实测可用）；type=快递公司代码，postid=单号
 KUAIDI100_FREE = ("https://www.kuaidi100.com/query"
@@ -166,9 +159,6 @@ def _default_config():
         "rss": [{"name": f["name"], "url": f["url"]} for f in RSS_CATALOG if f.get("builtin")],
         "express": {"source": dict(DEFAULT_EXPRESS_SOURCE), "packages": []},
         "price": {"source": {"headers": {}, "timeout": 8}, "items": []},
-        "expense": {"items": []},
-        "notify": {"expressWatch": False, "expressWatchEvery": 1800, "weeklyReport": True,
-                   "weeklyReportDay": 6, "weeklyReportHour": 20, "scheduler": True},
     }
 
 
@@ -299,9 +289,20 @@ def _norm_price(raw):
     return {"source": source, "items": items}
 
 
-MAX_EXPENSE_ITEMS = 400
-TODO_OPEN = "[ ]"
-TODO_DONE = "[x]"
+MAX_EXPENSE_ITEMS = 500
+
+
+def _to_int(v, d):
+    try:
+        return int(v)
+    except Exception:
+        return d
+
+
+# 已下线的配置段：功能移除后必须显式丢弃。
+# ⚠️ 不能只从白名单里删掉——v3.9.87 的「未知段保留」兜底（for k not in out）会把
+#    磁盘上遗留的旧配置段原样塞回来，等于功能没删干净。删除功能时必须登记进这里。
+
 
 
 def _norm_expense(raw):
@@ -338,6 +339,7 @@ def _norm_expense(raw):
     return {"items": items}
 
 
+
 def _norm_notify(raw):
     raw = raw if isinstance(raw, dict) else {}
     def _b(k, d):
@@ -353,24 +355,28 @@ def _norm_notify(raw):
     }
 
 
-def _to_int(v, d):
-    try:
-        return int(v)
-    except Exception:
-        return d
-
 
 def normalize_config(raw):
+    """白名单段逐个重建；**raw 里本函数不认识的段一律原样保留**。
+
+    v3.9.87：App 只回传它认识的段；App 未来新增段时，后端先于 App 上线的那段
+    不会被「保存即回读覆盖」清空。已知段仍照旧清洗规范。
+    """
     raw = raw if isinstance(raw, dict) else {}
-    return {
+    out = {
         "version": 2,
         "stocks": _norm_stocks(raw.get("stocks")),
         "rss": _norm_rss(raw.get("rss")),
         "express": _norm_express(raw.get("express")),
-        "price": _norm_price(raw.get("price")),
         "expense": _norm_expense(raw.get("expense")),
         "notify": _norm_notify(raw.get("notify")),
+        "price": _norm_price(raw.get("price")),
     }
+    for _k, _v in raw.items():
+        if _k not in out and _k not in RETIRED_CONFIG_KEYS:
+            out[_k] = _v
+    return out
+
 
 
 def load_config():
@@ -503,6 +509,15 @@ def _mk_stock(market, code):
             "error": "行情获取失败"}
 
 
+# 腾讯公开行情（东财 push2 在 NAS 容器网络被拒连时的主用源，实测直连 200）
+TX_QUOTE = "https://qt.gtimg.cn/q=%s"
+TX_SUGGEST = "https://smartbox.gtimg.cn/s3/?v=2&q=%s&t=all"
+# 市场编号 → 腾讯代码前缀（105/106/107 都是美股，腾讯统一 us 前缀）
+TX_PREFIX = {"1": "sh", "0": "sz", "116": "hk", "105": "us", "106": "us", "107": "us"}
+TX_MARKET_BACK = {"sh": "1", "sz": "0", "hk": "116", "us": "105"}
+
+
+
 def _tx_code(market, code):
     """市场编号 + 代码 → 腾讯行情代码（sh601138 / sz300750 / hk00700 / usNVDA）。"""
     c = _s(code, 16).upper()
@@ -511,6 +526,12 @@ def _tx_code(market, code):
     if market in ("105", "106", "107"):
         c = c.split(".")[0]
     return prefix + c
+
+
+def _scaled_tx(v, dec):
+    """腾讯返回的价格串（字符串，已是 2~3 位小数）→ float，不缩放。"""
+    f = _num(v)
+    return round(f, max(dec, 2)) if f is not None else None
 
 
 def _fetch_tx(item, index=0):
@@ -572,10 +593,36 @@ def _fetch_tx(item, index=0):
     }
 
 
-def _scaled_tx(v, dec):
-    """腾讯返回的价格串（字符串，已是 2~3 位小数）→ float，不缩放。"""
-    f = _num(v)
-    return round(f, max(dec, 2)) if f is not None else None
+def _search_tx(q):
+    """腾讯 smartbox 兜底搜索：v_hint="sh~600519~贵州茅台~mtgz~GP^hk~00700~腾讯控股~..."
+
+    记录格式：市场前缀~代码~名称~拼音~类型，^ 分隔多条。
+    """
+    try:
+        raw = _get(TX_SUGGEST % urllib.parse.quote(q), timeout=8)
+    except Exception:
+        return []
+    try:
+        text = raw.decode("gbk", "ignore")
+    except Exception:
+        text = raw.decode("utf-8", "ignore")
+    body = text.split('"', 2)[1] if '"' in text else ""
+    out = []
+    for rec in body.split("^"):
+        f = rec.split("~")
+        if len(f) < 3:
+            continue
+        prefix = _s(f[0], 6)
+        code = _s(f[1], 16)
+        name = _s(f[2], 40)
+        if not code or not name or prefix not in TX_MARKET_BACK:
+            continue
+        out.append({"code": code.upper(), "market": TX_MARKET_BACK[prefix],
+                    "marketName": dict(MARKETS).get(TX_MARKET_BACK[prefix], prefix),
+                    "name": name, "type": _s(f[4], 20) if len(f) > 4 else ""})
+        if len(out) >= 10:
+            break
+    return out
 
 
 def _fetch_em(item, index=0):
@@ -624,30 +671,6 @@ def _fetch_em(item, index=0):
     }
 
 
-def _fetch_stock(item, index=0):
-    """行情取数：腾讯源优先（NAS 容器网络下东财 push2 被拒连），东财备援。"""
-    market, code = item["market"], item["code"]
-    r = _fetch_tx(item, index)
-    if isinstance(r, dict) and r.get("ok"):
-        return r
-    em = _fetch_em(item, index)
-    if isinstance(em, dict) and em.get("ok"):
-        return em
-    # 两边都失败：给更能指导用户的错误文案（腾讯先失败的原因 + 东财的结果）
-    return em if isinstance(em, dict) and em.get("error") else r
-
-
-def _collect_stocks(cfg):
-    wl = cfg["stocks"]
-    out = _collect_one(_fetch_stock, wl, HTTP_TIMEOUT + COLLECT_SLACK, "stock")
-    for i, r in enumerate(out):
-        if not isinstance(r, dict) or "kind" not in r:
-            base = _mk_stock(wl[i]["market"], wl[i]["code"])
-            base["error"] = (r or {}).get("_error") or "超时"
-            out[i] = base
-    return out
-
-
 def _search_em(q):
     """东财 suggest：行情/指数/港美股都能搜到（返回结构与 search_stocks 相同）。"""
     j = json.loads(_get(EM_SUGGEST.format(q=urllib.parse.quote(q)), timeout=8)
@@ -668,35 +691,76 @@ def _search_em(q):
     return out
 
 
-def _search_tx(q):
-    """腾讯 smartbox 兜底搜索：v_hint="sh~600519~贵州茅台~mtgz~GP^hk~00700~腾讯控股~..."
+# ---------------------------------------------------------------- v3.9.58 股票日K历史（sparkline 用）
 
-    记录格式：市场前缀~代码~名称~拼音~类型，^ 分隔多条。
-    """
+# 腾讯日K接口：web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=<txcode>,day,,,<n>,qfq
+# A股/港股/美股同一入口；返回 JSON data.<txcode>.qfqday 或 .day（[[date,open,close,high,low,volume],...]）
+_TX_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=%s,day,,,%d,qfq"
+# 进程内缓存：secid -> (取数时刻, 收盘价列表)。日K一天变一次，缓存 6h 足够；
+# sparkline 只看形态不看精确值，盘中最后一根用实时价补也行（App 端不补，简单为上）。
+_KLINE_CACHE = {}
+_KLINE_CACHE_TTL = 6 * 3600
+_KLINE_CACHE_LOCK = threading.Lock()
+
+
+def stock_history(market, code, days=30):
+    """近 N 日收盘价列表（旧→新），sparkline 用。失败返回空列表（App 画不出线就不画）。"""
+    market, code = str(market), str(code)
+    tx = _tx_code(market, code)
+    if not tx:
+        return []
+    secid = "%s.%s" % (market, code)
+    now = time.time()
+    with _KLINE_CACHE_LOCK:
+        hit = _KLINE_CACHE.get(secid)
+        if hit and now - hit[0] < _KLINE_CACHE_TTL:
+            return list(hit[1])
     try:
-        raw = _get(TX_SUGGEST % urllib.parse.quote(q), timeout=8)
+        raw = _get(_TX_KLINE_URL % (tx, max(5, min(int(days), 90))), timeout=HTTP_TIMEOUT)
+        j = json.loads(raw.decode("utf-8", "ignore"))
+        node = (j.get("data") or {}).get(tx) or {}
+        rows = node.get("qfqday") or node.get("day") or []
+        closes = []
+        for r in rows:
+            # 每行 [date, open, close, high, low, ...]；收盘在第 3 列（index 2）
+            c = _num(r[2]) if isinstance(r, (list, tuple)) and len(r) > 2 else None
+            if c is not None and c > 0:
+                closes.append(round(c, 3))
+        closes = closes[-int(days):]
+        with _KLINE_CACHE_LOCK:
+            if len(_KLINE_CACHE) > 64:
+                _KLINE_CACHE.clear()   # 简单防爆（与 life 其他缓存同款策略）
+            _KLINE_CACHE[secid] = (now, closes)
+        return list(closes)
     except Exception:
         return []
-    try:
-        text = raw.decode("gbk", "ignore")
-    except Exception:
-        text = raw.decode("utf-8", "ignore")
-    body = text.split('"', 2)[1] if '"' in text else ""
-    out = []
-    for rec in body.split("^"):
-        f = rec.split("~")
-        if len(f) < 3:
-            continue
-        prefix = _s(f[0], 6)
-        code = _s(f[1], 16)
-        name = _s(f[2], 40)
-        if not code or not name or prefix not in TX_MARKET_BACK:
-            continue
-        out.append({"code": code.upper(), "market": TX_MARKET_BACK[prefix],
-                    "marketName": dict(MARKETS).get(TX_MARKET_BACK[prefix], prefix),
-                    "name": name, "type": _s(f[4], 20) if len(f) > 4 else ""})
-        if len(out) >= 10:
-            break
+
+
+# ---------------------------------------------------------------- RSS / Atom
+
+
+def _fetch_stock(item, index=0):
+    """行情取数：腾讯源优先（NAS 容器网络下东财 push2 被拒连），东财备援。"""
+    market, code = item["market"], item["code"]
+    r = _fetch_tx(item, index)
+    if isinstance(r, dict) and r.get("ok"):
+        return r
+    em = _fetch_em(item, index)
+    if isinstance(em, dict) and em.get("ok"):
+        return em
+    # 两边都失败：给更能指导用户的错误文案（腾讯先失败的原因 + 东财的结果）
+    return em if isinstance(em, dict) and em.get("error") else r
+
+
+
+def _collect_stocks(cfg):
+    wl = cfg["stocks"]
+    out = _collect_one(_fetch_stock, wl, HTTP_TIMEOUT + COLLECT_SLACK, "stock")
+    for i, r in enumerate(out):
+        if not isinstance(r, dict) or "kind" not in r:
+            base = _mk_stock(wl[i]["market"], wl[i]["code"])
+            base["error"] = (r or {}).get("_error") or "超时"
+            out[i] = base
     return out
 
 
@@ -968,83 +1032,6 @@ def _collect_express(cfg):
     bad = [p["no"] for p in norm if not p.get("ok")]
     return {"kind": "express", "id": "express", "title": "快递", "ok": ok,
             "packages": norm, "error": "" if ok else ("查询失败: %s" % "、".join(bad[:3]))}
-
-
-# ---------------------------------------------------------------- 价格监控
-def _extract_price(text, item, src):
-    if item.get("extract") == "json":
-        try:
-            j = json.loads(text)
-        except Exception as e:
-            return None, "返回不是 JSON: %s" % e
-        v = _dig(j, item.get("path") or "")
-        p = _num(v)
-        return (p, "" if p is not None else "JSON 路径未取到数值: %s" % item.get("path"))
-    pat = item.get("pattern") or ""
-    if not pat:
-        return None, "未配置提取规则"
-    try:
-        m = re.search(pat, text, re.S)
-    except re.error as e:
-        return None, "正则错误: %s" % e
-    if not m:
-        return None, "页面里没匹配到（规则需按该页面实际内容调整）"
-    g = item.get("group") or 0
-    try:
-        raw = m.group(g)
-    except Exception:
-        return None, "分组号 %d 不存在" % g
-    digits = re.findall(r"\d+(?:\.\d+)?", (raw or "").replace(",", ""))
-    if not digits:
-        return None, "匹配到「%s」但里面没有数字" % _clean(raw, 30)
-    return float(digits[0]), ""
-
-
-def _fetch_price(item, index=0):
-    cfg = load_config()
-    src = cfg["price"]["source"]
-    base = {"name": item.get("name") or "", "url": item.get("url") or "",
-            "price": None, "currency": item.get("currency") or "CNY",
-            "target": item.get("target"), "hit": False, "ok": False, "error": ""}
-    # v3.6.3：未完成项（URL 还没填）给友好提示，别去请求空地址
-    if not (item.get("url") or "").strip():
-        base["error"] = "未填写商品 URL"
-        return base
-    try:
-        raw = _get(item["url"], timeout=src.get("timeout") or 8, headers=src.get("headers") or {})
-    except Exception as e:
-        base["error"] = "抓取失败: %s" % e
-        return base
-    text = raw.decode("utf-8", "ignore")
-    price, err = _extract_price(text, item, src)
-    if price is None:
-        base["error"] = err
-        return base
-    base["price"] = round(price, 2)
-    base["ok"] = True
-    if item.get("target") is not None:
-        base["hit"] = price <= float(item["target"])
-    return base
-
-
-def _collect_price(cfg):
-    items = cfg["price"]["items"]
-    if not items:
-        return {"kind": "price", "id": "price", "title": "价格监控", "ok": False,
-                "items": [], "error": "未添加监控商品", "hint": "设置 → 生活卡片 → 价格监控"}
-    out = _collect_one(_fetch_price, items, HTTP_TIMEOUT + COLLECT_SLACK * 3, "price")
-    norm = []
-    for i, r in enumerate(out):
-        if not isinstance(r, dict) or "url" not in r:
-            it = items[i]
-            norm.append({"name": it.get("name") or "", "url": it.get("url") or "", "price": None,
-                         "currency": it.get("currency") or "CNY", "target": it.get("target"),
-                         "hit": False, "ok": False, "error": (r or {}).get("_error") or "超时"})
-        else:
-            norm.append(r)
-    ok = any(p.get("ok") for p in norm)
-    return {"kind": "price", "id": "price", "title": "价格监控", "ok": ok,
-            "items": norm, "error": "" if ok else "全部商品获取失败"}
 
 
 # ---------------------------------------------------------------- v3.6.2 资讯正文
@@ -1506,10 +1493,6 @@ def _collect(fresh=False):
     cards.append(exp if isinstance(exp, dict) and "packages" in exp
                  else _placeholder("express", "快递", "快递查询失败"))
 
-    prc = _cached("price:" + sig, PRICE_TTL, lambda: _collect_price(cfg), fresh)
-    cards.append(prc if isinstance(prc, dict) and "items" in prc
-                 else _placeholder("price", "价格监控", "价格获取失败"))
-
     ok = any(c.get("ok") for c in cards)
     return {"ok": ok, "ts": int(time.time()), "cards": cards,
             "error": "" if ok else "全部数据源获取失败"}
@@ -1588,6 +1571,16 @@ class LifeHandler(BaseHTTPRequestHandler):
                 self._send(200, {"ok": True, "items": search_stocks(q)})
             elif parsed.path.startswith("/api/life/stock/history"):
                 # v3.9.58：sparkline 日K——/api/life/stock/history?market=1&code=601138&days=30
+                _m = (params.get("market") or [""])[0]
+                _c = (params.get("code") or [""])[0]
+                try:
+                    days = int((params.get("days") or ["30"])[0])
+                except ValueError:
+                    days = 30
+                closes = stock_history(_m, _c, days)
+                self._send(200, {"ok": bool(closes), "closes": closes})
+            elif parsed.path.startswith("/api/life/stock/history"):
+                # v3.9.58：sparkline 日K——/api/life/stock/history?market=1&code=601138&days=30
                 m = (params.get("market") or [""])[0]
                 c = (params.get("code") or [""])[0]
                 try:
@@ -1624,22 +1617,6 @@ class LifeHandler(BaseHTTPRequestHandler):
                 # v3.6.2：单条资讯正文（后端抓取 + 模型整理，按 URL 缓存）
                 self._send(200, _fetch_article(body.get("url"), body.get("title"),
                                                fresh=bool(body.get("fresh"))))
-            elif parsed.path.startswith("/api/life/price/test"):
-                src = load_config()["price"]["source"]
-                item = {"url": _s(body.get("url"), 800),
-                        "extract": "json" if _s(body.get("extract")) == "json" else "regex",
-                        "pattern": _s(body.get("pattern"), 400),
-                        "path": _s(body.get("path"), 200),
-                        "group": body.get("group") or 1}
-                ok, err = False, ""
-                try:
-                    raw = _get(item["url"], timeout=src.get("timeout") or 8,
-                               headers=src.get("headers") or {})
-                    price, err = _extract_price(raw.decode("utf-8", "ignore"), item, src)
-                    ok = price is not None
-                except Exception as e:
-                    price, err = None, "抓取失败: %s" % e
-                self._send(200, {"ok": ok, "price": price, "error": err})
             elif parsed.path.startswith("/api/life/expense"):
                 self._send(200, _expense_op(body))
             elif parsed.path.startswith("/api/life/weekly/report"):
@@ -1704,3 +1681,610 @@ if __name__ == "__main__":
     ThreadingHTTPServer(("127.0.0.1", port), LifeHandler).serve_forever()
 
 
+
+def _local(tag):
+    return str(tag).rsplit("}", 1)[-1].lower()
+
+
+def _text(el):
+    try:
+        return "".join(el.itertext()).strip()
+    except Exception:
+        return ""
+
+
+def _clean(s, limit=160):
+    s = re.sub(r"<[^>]+>", " ", s or "")
+    s = re.sub(r"\s+", " ", s).strip()
+    s = (s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+          .replace("&quot;", '"').replace("&#39;", "'"))
+    return s[:limit]
+
+
+def _iso(s):
+    """RSS pubDate(RFC822) / Atom published(ISO8601) → UTC ISO8601。"""
+    s = (s or "").strip()
+    if not s:
+        return ""
+    dt = None
+    try:
+        dt = parsedate_to_datetime(s)
+    except Exception:
+        dt = None
+    if dt is None:
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception:
+            return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_feed(raw):
+    root = ET.fromstring(raw)          # 传 bytes：让 ET 自行按 XML 声明解码
+    out = []
+    for el in root.iter():
+        if _local(el.tag) not in ("item", "entry"):
+            continue
+        title, link, date = "", "", ""
+        for ch in list(el):
+            n = _local(ch.tag)
+            if n == "title" and not title:
+                title = _text(ch)
+            elif n == "link" and not link:
+                href = ch.get("href")
+                if href:                # Atom
+                    if (ch.get("rel") or "alternate") == "alternate":
+                        link = href
+                elif (ch.text or "").strip():
+                    link = ch.text.strip()
+            elif n in ("pubdate", "published", "updated", "date") and not date:
+                date = _text(ch)
+        out.append({"title": _clean(title, 120), "link": link.strip(), "published": _iso(date)})
+    return out
+
+
+def _fetch_feed(feed, index=0):
+    name, url = feed.get("name") or "RSS", feed.get("url") or ""
+    try:
+        raw = _get(url, timeout=HTTP_TIMEOUT + COLLECT_SLACK)
+    except Exception as e:
+        return {"name": name, "ok": False, "error": "抓取失败: %s" % e, "entries": []}
+    items = []
+    try:
+        items = _parse_feed(raw)
+    except Exception:
+        # 声明编码非 UTF-8 且解析失败：按内容解码后再试一次（仅对「编码问题」有效）
+        try:
+            m = re.search(r'encoding=["\']([\w\-]+)["\']', raw[:200].decode("ascii", "ignore"))
+            enc = (m.group(1) if m else "utf-8")
+            items = _parse_feed(raw.decode(enc, "ignore").encode("utf-8"))
+        except Exception as e:
+            return {"name": name, "ok": False, "error": "解析失败(不符合 RSS/Atom): %s" % e,
+                    "entries": []}
+    if not items:
+        return {"name": name, "ok": False, "error": "无条目", "entries": []}
+    dated = sorted([i for i in items if i.get("published")],
+                   key=lambda x: x["published"], reverse=True)
+    undated = [i for i in items if not i.get("published")]
+    picked = (dated + undated)[:MAX_ENTRIES_PER_FEED]
+    for i in picked:
+        i["source"] = name
+    return {"name": name, "ok": True, "error": "", "entries": picked}
+
+
+def _collect_feeds(cfg):
+    feeds = cfg["rss"]
+    if not feeds:
+        return {"kind": "rss", "id": "rss", "title": "资讯", "ok": False,
+                "entries": [], "sources": [], "error": "未添加资讯源"}
+    out = _collect_one(_fetch_feed, feeds, HTTP_TIMEOUT + COLLECT_SLACK * 2, "rss")
+    norm = []
+    for i, r in enumerate(out):
+        if not isinstance(r, dict) or "entries" not in r:
+            norm.append({"name": feeds[i].get("name") or "RSS", "ok": False,
+                         "error": (r or {}).get("_error") or "超时", "entries": []})
+        else:
+            norm.append(r)
+    entries, sources = [], []
+    for f in norm:
+        sources.append({"name": f["name"], "ok": bool(f.get("ok")),
+                        "error": f.get("error") or "", "count": len(f.get("entries") or [])})
+        entries.extend(f.get("entries") or [])
+    entries.sort(key=lambda e: e.get("published") or "", reverse=True)
+    entries = entries[:MAX_ENTRIES]
+    ok = any(f.get("ok") for f in norm)
+    bad = [f["name"] for f in norm if not f.get("ok")]
+    return {"kind": "rss", "id": "rss", "title": "资讯", "ok": ok,
+            "entries": entries, "sources": sources,
+            "error": "" if ok else "全部订阅源获取失败（%s）" % "、".join(bad[:3])}
+
+
+# ---------------------------------------------------------------- 快递
+def _fetch_package(item, index=0):
+    cfg = load_config()
+    src = cfg["express"]["source"]
+    no = item.get("no") or ""
+    carrier = item.get("carrier") or ""
+    phone = item.get("phone") or ""
+    base = {"no": no, "carrier": carrier,
+            "carrierName": CARRIER_NAME.get(carrier, carrier or "快递"),
+            "name": item.get("name") or no, "ok": False, "error": "", "state": "",
+            "stateText": "", "latest": None}
+
+    if src.get("type") == "custom":
+        tpl = src.get("url_template") or ""
+        if not tpl or "{no}" not in tpl:
+            base["error"] = "自定义源未配置 URL 模板（需含 {no} 占位）"
+            return base
+        url = (tpl.replace("{no}", urllib.parse.quote(no))
+                  .replace("{carrier}", urllib.parse.quote(carrier))
+                  .replace("{key}", urllib.parse.quote(src.get("key") or ""))
+                  .replace("{phone}", urllib.parse.quote(phone)))
+        try:
+            j = json.loads(_get(url, timeout=HTTP_TIMEOUT + COLLECT_SLACK,
+                                headers=src.get("headers") or {}).decode("utf-8", "ignore") or "{}")
+        except Exception as e:
+            base["error"] = "查询失败: %s" % e
+            return base
+        rows = _dig(j, src.get("list_path") or "data") or []
+        state = _dig(j, src.get("state_path") or "state")
+        time_key = src.get("time_key") or "time"
+        ctx_key = src.get("context_key") or "context"
+    else:
+        url = KUAIDI100_FREE.format(carrier=urllib.parse.quote(carrier), no=urllib.parse.quote(no),
+                                    ts=round(time.time() % 1000, 3), phone=urllib.parse.quote(phone))
+        try:
+            j = json.loads(_get(url, timeout=HTTP_TIMEOUT + COLLECT_SLACK,
+                                headers={"Referer": "https://www.kuaidi100.com/"}).decode("utf-8", "ignore") or "{}")
+        except Exception as e:
+            base["error"] = "查询失败: %s" % e
+            return base
+        if str(j.get("status")) not in ("200", "0") or j.get("message") not in ("ok", "", None):
+            base["error"] = _s(j.get("message") or "查询失败", 60)
+            return base
+        rows = j.get("data") or []
+        state = j.get("state")
+        time_key, ctx_key = "time", "context"
+
+    if not isinstance(rows, list):
+        base["error"] = "返回结构无法识别（列表路径: %s）" % (src.get("list_path") or "data")
+        return base
+    if not rows:
+        base["error"] = "暂无物流信息"
+        return base
+    latest = rows[0] if isinstance(rows[0], dict) else {}
+    ctx = _clean(latest.get(ctx_key), 120)
+    # 快递100 对不存在的单号也会返回一条「查无结果」轨迹 + state=3，不能当成已签收
+    if "查无结果" in ctx or "无结果" in ctx or "no result" in ctx.lower():
+        base["error"] = "查无此单号（核对单号与快递公司）"
+        base["latest"] = {"time": _s(latest.get(time_key), 40), "context": ctx}
+        return base
+    base["ok"] = True
+    base["state"] = _s(state, 6)
+    base["stateText"] = STATE_TEXT.get(_s(state, 6), "已查询")
+    base["latest"] = {"time": _s(latest.get(time_key), 40), "context": ctx}
+    return base
+
+
+def _collect_express(cfg):
+    src = cfg["express"]
+    pkgs = src["packages"]
+    if not pkgs:
+        return {"kind": "express", "id": "express", "title": "快递", "ok": False,
+                "packages": [], "error": "未添加快递单号", "hint": "设置 → 生活卡片 → 快递"}
+    out = _collect_one(_fetch_package, pkgs, HTTP_TIMEOUT + COLLECT_SLACK * 3, "express")
+    norm = []
+    for i, r in enumerate(out):
+        if not isinstance(r, dict) or "no" not in r:
+            p = pkgs[i]
+            norm.append({"no": p.get("no", ""), "carrier": p.get("carrier", ""),
+                         "carrierName": CARRIER_NAME.get(p.get("carrier", ""), "快递"),
+                         "name": p.get("name") or p.get("no", ""), "ok": False,
+                         "error": (r or {}).get("_error") or "超时", "state": "",
+                         "stateText": "", "latest": None})
+        else:
+            norm.append(r)
+    ok = any(p.get("ok") for p in norm)
+    bad = [p["no"] for p in norm if not p.get("ok")]
+    return {"kind": "express", "id": "express", "title": "快递", "ok": ok,
+            "packages": norm, "error": "" if ok else ("查询失败: %s" % "、".join(bad[:3]))}
+
+
+# ---------------------------------------------------------------- 价格监控
+def _extract_price(text, item, src):
+    if item.get("extract") == "json":
+        try:
+            j = json.loads(text)
+        except Exception as e:
+            return None, "返回不是 JSON: %s" % e
+        v = _dig(j, item.get("path") or "")
+        p = _num(v)
+        return (p, "" if p is not None else "JSON 路径未取到数值: %s" % item.get("path"))
+    pat = item.get("pattern") or ""
+    if not pat:
+        return None, "未配置提取规则"
+    try:
+        m = re.search(pat, text, re.S)
+    except re.error as e:
+        return None, "正则错误: %s" % e
+    if not m:
+        return None, "页面里没匹配到（规则需按该页面实际内容调整）"
+    g = item.get("group") or 0
+    try:
+        raw = m.group(g)
+    except Exception:
+        return None, "分组号 %d 不存在" % g
+    digits = re.findall(r"\d+(?:\.\d+)?", (raw or "").replace(",", ""))
+    if not digits:
+        return None, "匹配到「%s」但里面没有数字" % _clean(raw, 30)
+    return float(digits[0]), ""
+
+
+def _fetch_price(item, index=0):
+    cfg = load_config()
+    src = cfg["price"]["source"]
+    base = {"name": item.get("name") or "", "url": item.get("url") or "",
+            "price": None, "currency": item.get("currency") or "CNY",
+            "target": item.get("target"), "hit": False, "ok": False, "error": ""}
+    # v3.6.3：未完成项（URL 还没填）给友好提示，别去请求空地址
+    if not (item.get("url") or "").strip():
+        base["error"] = "未填写商品 URL"
+        return base
+    try:
+        raw = _get(item["url"], timeout=src.get("timeout") or 8, headers=src.get("headers") or {})
+    except Exception as e:
+        base["error"] = "抓取失败: %s" % e
+        return base
+    text = raw.decode("utf-8", "ignore")
+    price, err = _extract_price(text, item, src)
+    if price is None:
+        base["error"] = err
+        return base
+    base["price"] = round(price, 2)
+    base["ok"] = True
+    if item.get("target") is not None:
+        base["hit"] = price <= float(item["target"])
+    return base
+
+
+def _collect_price(cfg):
+    items = cfg["price"]["items"]
+    if not items:
+        return {"kind": "price", "id": "price", "title": "价格监控", "ok": False,
+                "items": [], "error": "未添加监控商品", "hint": "设置 → 生活卡片 → 价格监控"}
+    out = _collect_one(_fetch_price, items, HTTP_TIMEOUT + COLLECT_SLACK * 3, "price")
+    norm = []
+    for i, r in enumerate(out):
+        if not isinstance(r, dict) or "url" not in r:
+            it = items[i]
+            norm.append({"name": it.get("name") or "", "url": it.get("url") or "", "price": None,
+                         "currency": it.get("currency") or "CNY", "target": it.get("target"),
+                         "hit": False, "ok": False, "error": (r or {}).get("_error") or "超时"})
+        else:
+            norm.append(r)
+    ok = any(p.get("ok") for p in norm)
+    return {"kind": "price", "id": "price", "title": "价格监控", "ok": ok,
+            "items": norm, "error": "" if ok else "全部商品获取失败"}
+
+
+# ---------------------------------------------------------------- v3.6.2 资讯正文
+_ARTICLE_CACHE = {}   # url_md5 -> (ts, payload)
+
+_SCRIPT_RE = re.compile(r"<(script|style|noscript|svg|iframe|template)\b.*?</\1>", re.S | re.I)
+_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+_TAG_RE = re.compile(r"<[^>]+>")
+_SPACE_RE = re.compile(r"[ \t\u00a0]+")
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.S | re.I)
+_ARTICLE_RE = re.compile(r"<article\b[^>]*>(.*?)</article>", re.S | re.I)
+_PARA_RE = re.compile(r"<p\b[^>]*>(.*?)</p>", re.S | re.I)
+
+
+def _extract_article(html):
+    """极简正文提取（纯标准库）：优先 <article> 块，退化到全页 <p> 段落。
+    返回 (页面标题, 正文文本)；只做去标签 + 丢弃导航短句，不做站点适配。"""
+    raw = html or ""
+    raw = _COMMENT_RE.sub(" ", raw)
+    raw = _SCRIPT_RE.sub(" ", raw)
+    m = _TITLE_RE.search(raw)
+    page_title = unescape(_TAG_RE.sub("", m.group(1))).strip() if m else ""
+    blocks = _ARTICLE_RE.findall(raw)
+    scope = max(blocks, key=len) if blocks else raw
+    paras = _PARA_RE.findall(scope)
+    if not paras:
+        paras = [scope]
+    out = []
+    for p in paras:
+        t = unescape(_TAG_RE.sub(" ", p))
+        t = _SPACE_RE.sub(" ", t).strip()
+        if len(t) >= 20:              # 丢导航/按钮/版权等短句
+            out.append(t)
+    text = "\n".join(out).strip()
+    return page_title, re.sub(r"\n{3,}", "\n\n", text)
+
+
+def _ai_tidy(title, text):
+    """把正文交给模型整理（去导航/广告、保留完整内容）。
+    模型不可用/判定失败 → 返回空串，调用方降级用清洗后的原文。"""
+    try:
+        import stream_api               # 同进程模块（qingliao_all.py 一并 import）
+        prompt = ("下面是从网页抓取并已去掉 HTML 标签的文章正文。请输出这篇文章的完整内容："
+                  "保留原文段落结构与全部信息、数据、人名，只删除导航、广告、版权声明、"
+                  "推荐阅读之类噪音。不要总结、不要评论、不要客套、不要加任何前缀说明。"
+                  "如果这段文本明显不是正文（乱码、只有登录或验证提示、内容过短），"
+                  "只回复四个字：无法提取。\n\n标题：" + (title or "(无)") + "\n正文：\n" + text)
+        body = {"model": stream_api.AGENT_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False, "max_tokens": 1400}
+        resp = stream_api._chat_once(body)
+        out = ((resp.get("choices") or [{}])[0].get("message", {}) or {}).get("content", "") or ""
+        out = out.strip()
+        if len(out) < ARTICLE_MIN_CHARS or "无法提取" in out[:12]:
+            return ""
+        return out
+    except Exception:
+        return ""
+
+
+def _fetch_article(url, title="", fresh=False):
+    """单条资讯正文：抓 HTML → 提正文 → 模型整理；按 URL 缓存（成功 6h / 失败 10min）。"""
+    url = _s(url, 1000)
+    title = _s(title, 200)
+    if not re.match(r"^https?://", url, re.I):
+        return {"ok": False, "error": "仅支持 http/https 链接"}
+    key = hashlib.md5(url.encode("utf-8")).hexdigest()[:12]
+    ts, val = _ARTICLE_CACHE.get(key, (0.0, None))
+    ttl = ARTICLE_TTL if (val or {}).get("ok") else ARTICLE_FAIL_TTL
+    if not fresh and val is not None and (time.time() - ts) < ttl:
+        return dict(val, cached=True)
+    try:
+        raw = _get(url, timeout=ARTICLE_FETCH_TIMEOUT,
+                   headers={"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"})
+    except Exception as e:
+        payload = {"ok": False, "url": url, "error": "抓取失败: %s" % str(e)[:120]}
+        _ARTICLE_CACHE[key] = (time.time(), payload)
+        return payload
+    html = raw.decode("utf-8", "ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    page_title, text = _extract_article(html)
+    if len(text) < ARTICLE_MIN_CHARS:
+        payload = {"ok": False, "url": url, "title": page_title or title,
+                   "error": "该页面抓不到正文（可能需 JS 渲染或反爬）"}
+        _ARTICLE_CACHE[key] = (time.time(), payload)
+        return payload
+    feed = text[:ARTICLE_MAX_CHARS]
+    ai = _ai_tidy(title or page_title, feed)
+    if ai:
+        payload = {"ok": True, "url": url, "title": title or page_title, "content": ai,
+                   "source": "ai", "raw_chars": len(text), "chars": len(ai),
+                   "truncated": len(text) > ARTICLE_MAX_CHARS, "ts": int(time.time())}
+    else:
+        payload = {"ok": True, "url": url, "title": title or page_title, "content": feed,
+                   "source": "raw", "raw_chars": len(text), "chars": len(feed),
+                   "truncated": len(text) > ARTICLE_MAX_CHARS, "ts": int(time.time())}
+    _ARTICLE_CACHE[key] = (time.time(), payload)
+    return payload
+
+
+# ---------------------------------------------------------------- 缓存 + 汇总
+_CACHE = {}
+
+
+def _cached(key, ttl, builder, fresh=False):
+    ts, val = _CACHE.get(key, (0.0, None))
+    if not fresh and val is not None and (time.time() - ts) < ttl:
+        return val
+    try:
+        val = builder()
+    except Exception as e:
+        val = {"_error": str(e)}
+    _CACHE[key] = (time.time(), val)
+    return val
+
+
+def _placeholder(kind, title, err, hint=""):
+    return {"kind": kind, "id": kind, "title": title, "ok": False,
+            "error": err, "hint": hint, "configured": False}
+
+
+def _collect(fresh=False):
+    cfg = load_config()
+    sig = _sig()
+    cards = []
+    stocks = _cached("stock:" + sig, STOCK_TTL, lambda: _collect_stocks(cfg), fresh)
+    if isinstance(stocks, list) and stocks:
+        cards.extend(stocks)
+    elif isinstance(stocks, list):
+        cards.append(_placeholder("stock", "股票行情", "未添加股票", "设置 → 生活卡片 → 股票"))
+    else:
+        cards.append(_placeholder("stock", "股票行情", "行情获取失败: %s" % stocks.get("_error", "")))
+
+    rss = _cached("rss:" + sig, RSS_TTL, lambda: _collect_feeds(cfg), fresh)
+    cards.append(rss if isinstance(rss, dict) and "entries" in rss
+                 else _placeholder("rss", "资讯", "订阅源获取失败"))
+
+    exp = _cached("express:" + sig, EXPRESS_TTL, lambda: _collect_express(cfg), fresh)
+    cards.append(exp if isinstance(exp, dict) and "packages" in exp
+                 else _placeholder("express", "快递", "快递查询失败"))
+
+    prc = _cached("price:" + sig, PRICE_TTL, lambda: _collect_price(cfg), fresh)
+    cards.append(prc if isinstance(prc, dict) and "items" in prc
+                 else _placeholder("price", "价格监控", "价格获取失败"))
+
+    ok = any(c.get("ok") for c in cards)
+    return {"ok": ok, "ts": int(time.time()), "cards": cards,
+            "error": "" if ok else "全部数据源获取失败"}
+
+
+def _presets():
+    return {
+        "stocks": [dict(x) for x in DEFAULT_STOCK_PRESETS],
+        "rss": [dict(x) for x in RSS_CATALOG],
+        "carriers": [{"code": c, "name": n} for c, n in CARRIERS],
+        "markets": [{"code": c, "name": n} for c, n in MARKETS],
+    }
+
+
+# ---------------------------------------------------------------- HTTP
+class LifeHandler(BaseHTTPRequestHandler):
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        # v4.0.7：长期目标的暂停/删除要 PATCH/DELETE
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Auth-Token")
+
+    def _send(self, code, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self._cors()
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _check_auth(self):
+        """与其他模块一致：复用 auth_api.check_auth（主进程内存 token / X-Auth-Token）。
+
+        auth_api 仅在部署容器内存在；本机自测（源码树直接跑）无该模块 →
+        退化为「未设置 QL_PASSWORD 时放行」，设置了密码则拒绝（不放口子）。
+        """
+        try:
+            import auth_api
+        except Exception:
+            return not os.environ.get("QL_PASSWORD")
+        return auth_api.check_auth(self.headers, "X-Life-Password",
+                                   os.environ.get("QL_PASSWORD", ""))
+
+    def _body(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except Exception:
+            n = 0
+        if n <= 0:
+            return {}
+        try:
+            return json.loads(self.rfile.read(n).decode("utf-8", "ignore") or "{}")
+        except Exception:
+            return {}
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._cors()
+        self.end_headers()
+
+    def do_GET(self):
+        if not self._check_auth():
+            self._send(401, {"ok": False, "error": "未授权"})
+            return
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+        try:
+            if parsed.path.startswith("/api/life/cards"):
+                fresh = params.get("fresh", ["0"])[0] in ("1", "true", "yes")
+                self._send(200, _collect(fresh=fresh))
+            elif parsed.path.startswith("/api/life/config"):
+                self._send(200, {"ok": True, "config": load_config(), "presets": _presets(),
+                                 "path": CONFIG_PATH})
+            elif parsed.path.startswith("/api/life/goal"):
+                if goal_module is None:
+                    self._send(501, {"ok": False, "error": "goal 模块未部署"})
+                else:
+                    self._send(200, {"ok": True, "goals": goal_module.goals_list()})
+            elif parsed.path.startswith("/api/life/stock/search"):
+                q = (params.get("q") or [""])[0]
+                self._send(200, {"ok": True, "items": search_stocks(q)})
+            else:
+                self._send(404, {"ok": False, "error": "Not Found"})
+        except Exception as e:
+            self._send(200, {"ok": False, "error": "内部错误: %s" % e})
+
+    def do_POST(self):
+        if not self._check_auth():
+            self._send(401, {"ok": False, "error": "未授权"})
+            return
+        parsed = urllib.parse.urlparse(self.path)
+        body = self._body()
+        try:
+            if parsed.path.startswith("/api/life/config"):
+                cfg = save_config(body.get("config") if "config" in body else body)
+                self._send(200, {"ok": True, "config": cfg, "presets": _presets()})
+            elif parsed.path.startswith("/api/life/article"):
+                # v3.6.2：单条资讯正文（后端抓取 + 模型整理，按 URL 缓存）
+                self._send(200, _fetch_article(body.get("url"), body.get("title"),
+                                               fresh=bool(body.get("fresh"))))
+            elif parsed.path.startswith("/api/life/goal/report"):
+                if goal_module is None:
+                    self._send(501, {"ok": False, "error": "goal 模块未部署"})
+                else:
+                    code, obj = goal_module.goals_report(body)
+                    self._send(code, obj)
+            elif parsed.path.startswith("/api/life/goal"):
+                if goal_module is None:
+                    self._send(501, {"ok": False, "error": "goal 模块未部署"})
+                else:
+                    code, obj = goal_module.goals_create(body)
+                    self._send(code, obj)
+            elif parsed.path.startswith("/api/life/price/test"):
+                src = load_config()["price"]["source"]
+                item = {"url": _s(body.get("url"), 800),
+                        "extract": "json" if _s(body.get("extract")) == "json" else "regex",
+                        "pattern": _s(body.get("pattern"), 400),
+                        "path": _s(body.get("path"), 200),
+                        "group": body.get("group") or 1}
+                ok, err = False, ""
+                try:
+                    raw = _get(item["url"], timeout=src.get("timeout") or 8,
+                               headers=src.get("headers") or {})
+                    price, err = _extract_price(raw.decode("utf-8", "ignore"), item, src)
+                    ok = price is not None
+                except Exception as e:
+                    price, err = None, "抓取失败: %s" % e
+                self._send(200, {"ok": ok, "price": price, "error": err})
+            else:
+                self._send(404, {"ok": False, "error": "Not Found"})
+        except Exception as e:
+            self._send(200, {"ok": False, "error": "内部错误: %s" % e})
+
+    def do_PATCH(self):
+        """v4.0.7 长期目标：暂停/恢复、改进度、改时间。"""
+        if not self._check_auth():
+            self._send(401, {"ok": False, "error": "未授权"})
+            return
+        parsed = urllib.parse.urlparse(self.path)
+        if not parsed.path.startswith("/api/life/goal") or goal_module is None:
+            self._send(404, {"ok": False, "error": "Not Found"})
+            return
+        code, obj = goal_module.goals_update(self._body())
+        self._send(code, obj)
+
+    def do_DELETE(self):
+        """v4.0.7 删目标 —— 服务端连带删掉它的 cron job。"""
+        if not self._check_auth():
+            self._send(401, {"ok": False, "error": "未授权"})
+            return
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+        if not parsed.path.startswith("/api/life/goal") or goal_module is None:
+            self._send(404, {"ok": False, "error": "Not Found"})
+            return
+        gid = (params.get("id") or [""])[0]
+        code, obj = goal_module.goals_delete(gid)
+        self._send(code, obj)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+if __name__ == "__main__":
+    # 本地自测：python3 life_api.py [--fresh] [--config] [端口]
+    import sys
+    if "--fresh" in sys.argv:
+        print(json.dumps(_collect(fresh=True), ensure_ascii=False, indent=2))
+        raise SystemExit(0)
+    if "--config" in sys.argv:
+        print(json.dumps({"config": load_config(), "presets": _presets()},
+                         ensure_ascii=False, indent=2))
+        raise SystemExit(0)
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 9136
+    print("life_api v2 配置: %s" % CONFIG_PATH)
+    ThreadingHTTPServer(("127.0.0.1", port), LifeHandler).serve_forever()

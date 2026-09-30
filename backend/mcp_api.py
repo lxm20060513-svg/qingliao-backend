@@ -24,14 +24,12 @@ import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler
 
-# Hermes config.yaml 路径（QL_HERMES_CONFIG 指向 Hermes config.yaml）
-# BE23：统一由 provider_admin 解析——compose 只注入 QL_CONFIG_YAML，原来这里净部署必读到空路径
-try:
-    import provider_admin as _pa
-    HERMES_CONFIG_PATH = _pa.hermes_cfg_path()
-except Exception:
-    HERMES_CONFIG_PATH = os.environ.get("QL_HERMES_CONFIG", "/data/hermes_config.yaml")
-HERMES_CONTAINER = os.environ.get("QL_HERMES_CONTAINER", "hermes-container")
+# Hermes config.yaml 路径（qingliao 容器已挂载 /volume1，hermes-data 同一宿主目录）
+# ⚠️ 生产口径：本值是 Hermes 网关真正读取的 config.yaml（mcp_servers 写在这里），
+# 不能改成 QL_HERMES_CONFIG（那是轻聊侧 provider key 台账，Hermes 不读）——否则
+# App「MCP 工具服务」的保存会写进没人读的文件而静默失效。
+HERMES_CONFIG_PATH = "/volume1/docker/hermes/hermes-data/config.yaml"
+HERMES_CONTAINER = "hermes-hermes-1"
 RESTART_STATUS_FILE = "/data/streams_data/mcp_restart_status.json"
 
 # 预置 MCP 模板（App 端展示用；key 由用户填入 URL 的 {key} 占位）
@@ -62,9 +60,12 @@ def _read_config_text():
 def _write_config_text(text):
     # BE20：唯一 tmp + fsync，权限沿用原文件（config.yaml 含 API key，且 Hermes 侧要能读）
     try:
-        _mode = os.stat(HERMES_CONFIG_PATH).st_mode & 0o777
+        _st = os.stat(HERMES_CONFIG_PATH)
+        _mode = _st.st_mode & 0o777
+        _uid, _gid = _st.st_uid, _st.st_gid
     except OSError:
         _mode = 0o644
+        _uid = _gid = None
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(HERMES_CONFIG_PATH) or ".", suffix=".tmp")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(text)
@@ -75,6 +76,13 @@ def _write_config_text(text):
     except OSError:
         pass
     os.replace(tmp, HERMES_CONFIG_PATH)
+    # 2026-09-21 修：mkstemp 产物属 root，replace 后 owner 变 root → Hermes(uid 10000)读不了
+    # 只沿用 mode 不够，必须复原 owner（否则 Hermes 报 config.yaml corrupt / EACCES）
+    if _uid is not None:
+        try:
+            os.chown(HERMES_CONFIG_PATH, _uid, _gid)
+        except OSError:
+            pass
 
 
 def _render_servers_yaml(servers):
