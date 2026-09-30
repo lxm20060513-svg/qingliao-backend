@@ -63,6 +63,30 @@ docker compose up -d
 >
 > ⚠️ **场景动作 service 格式**：动作里存 `climate.turn_off`（点分隔），执行时后端自动拆为 HA 路径 `/api/services/climate/turn_off`（斜杠），勿直接拼接点号字符串（会 404）。
 
+## 🔄 一键更新
+
+已装好的实例，在**仓库目录**里跑：
+
+```bash
+./update.sh            # 更新到最新 + 重建容器（推荐）
+./update.sh --check    # 只看有没有新版，不改任何东西
+./update.sh --version v4.0.13   # 更新到指定 tag（配套某个 App 版本）
+```
+
+`update.sh` 会依次做：检查版本 → 列出待更新提交 → **自动备份 `data/` 到 `backups/`** →
+`git pull` → `docker compose up -d --build` → 轮询等待 9127 就绪 → 提示有无报错。
+
+**不会动你的数据**：`.env`（访问密码/token 都在里面）和 `data/`（会话、配置、凭据）始终保留，
+只替换 `backend/` 代码。万一新版本有问题：
+
+```bash
+git checkout -        # 代码回退
+docker compose up -d --build
+# 数据如需恢复：tar xzf backups/data-<时间戳>.tar.gz
+```
+
+App 与后端版本无需严格对应：后端向前兼容，App 旧版连新后端也能跑。
+
 ## 📖 踩坑记录在哪
 
 完整踩坑实录（sudo/nginx/systemd/后端 patch/鉴权 token/PWA 缓存/ASR 自愈/docker 解析/看门狗）沉淀在 Hermes 技能 `qingliao-webui`（开发/调试/部署轻聊必读）与 NAS `轻聊app/避坑指南.md`（iOS 端）。

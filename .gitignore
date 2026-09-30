@@ -31,3 +31,7 @@ __be_backup_*/
 _be_backup_*/
 _archived_baks_*/
 .wtest
+
+# update.sh 自动生成的升级前数据备份
+backups/
+backups/*
