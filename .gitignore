@@ -35,3 +35,5 @@ _archived_baks_*/
 # update.sh 自动生成的升级前数据备份
 backups/
 backups/*
+# 运行时生成：update.sh 每次更新后写入（不入库，入库会永远显示旧值）
+backend/QL_VERSION

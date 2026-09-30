@@ -41,7 +41,11 @@ _CACHE_TTL = 60   # 60 秒：update.sh 更新后最多 1 分钟生效，避免�
 
 
 def _read_version_file():
-    """从 VERSION 文件读版本（内容形如 `4.0.13` 或 `4.0.13\nbfe45a0\n2026-09-30`）"""
+    """从 QL_VERSION 文件读版本（内容形如 `4.0.13` 或 `4.0.13\nbfe45a0\n2026-09-30`）
+
+    文件名带 QL_ 前缀是必须的：轻聊后端目录里本来就有个裸 `VERSION` 文件
+    （mail 模块的 IMAP 客户端标识，内容 "1.0.0"），读到它会把后端版本误报成 1.0.0。
+    """
     for path in _VERSION_FILES:
         try:
             with open(path, encoding="utf-8") as f:

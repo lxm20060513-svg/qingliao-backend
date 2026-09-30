@@ -150,6 +150,15 @@ else
   ok "版本信息将随构建注入（$_git_commit）"
 fi
 
+# 无论上面走哪条路，都写一份 QL_VERSION 文件到 backend/：
+#   - bind mount 部署（镜像里没有 .git、build args 也可能没生效）时，文件是唯一真值来源
+#   - 版本接口读它只需一次 open，比容器里跑 git 快得多
+# 文件名带 QL_ 前缀：backend/ 下本来就有裸 VERSION 文件（mail IMAP 客户端标识 "1.0.0"），
+# 复用裸名会被版本接口读到并误报成 1.0.0。
+printf '%s\n%s\n%s\n' "${_git_ver:-unknown}" "$_git_commit" "$_git_built" \
+  > backend/QL_VERSION
+ok "版本信息已写入 backend/QL_VERSION（${_git_ver:-unknown} / $_git_commit）"
+
 docker compose up -d --build 2>&1 | tail -5 | sed 's/^/  /'
 
 # ── 健康检查 ───────────────────────────────────────────────
