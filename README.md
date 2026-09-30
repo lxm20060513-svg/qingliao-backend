@@ -85,6 +85,14 @@ docker compose up -d
 | `QL_ROUTER_USER` | | `root` | 路由器 SSH 用户 |
 | `QL_ROUTER_PASSWORD` | | 空 | 路由器 SSH 密码 |
 | `QL_DOCKER_ROOT` | | `/data/docker` | Docker Compose 项目目录 |
+| `QL_LIFE_DIR` | | `$QL_DATA_DIR` | 生活/目标数据目录（goals、express_watch） |
+| `QL_DIAG_DIR` | | `$QL_DATA_DIR/diag` | 诊断落盘目录（不可写则退 `/tmp/qingliao_diag`） |
+| `QL_HERMES_CONTAINER` | | `hermes-container` | 目标 Hermes 容器名（重启网关/查日志用） |
+| `QL_HERMES_DATA_DIR` | | — | Hermes 容器 `/opt/data` 对应的宿主目录（媒体/文件路径映射） |
+| `QL_HOST_SKILLS_DIR` | | `$QL_HERMES_DATA_DIR/skills` | 宿主 skills 目录（网盘技能包安装目标） |
+| `QL_HERMES_STATE_DB` | | — | Hermes `state.db` 路径（token 用量统计读取） |
+| `QL_HERMES_PYTHON` | | `sys.executable` | 目标容器内 Python 解释器（路由器 SSH 用） |
+| `QL_PARAMIKO_PATH` | | 空 | 目标容器内 paramiko 的 site-packages（留空则不注入 `PYTHONPATH`） |
 | `STREAM_DATA_DIR` | | `$QL_DATA_DIR/streams_data` | 流式任务数据 |
 | `STREAM_DOC_INLINE_MAX` | | `30000` | 聊天附件正文注入上限（字）：最新一条用户消息里引用的文件按此截断注入（`doc_ref.py`） |
 | `STREAM_DOC_OLDER_MAX` | | `800` | 更早历史轮里同一附件只注入这么长的节选（跨轮记得文件但不重复付全文 token） |

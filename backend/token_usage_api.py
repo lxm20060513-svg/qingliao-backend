@@ -2,7 +2,7 @@
 """轻聊 · token 用量聚合（v3.9.82 · 看板「模型用量」栏第二块）
 
 数据源：Hermes 生产库 state.db 的 `sessions` 表（**只读**）。
-  容器内可见路径 `/volume1/docker/hermes/hermes-data/state.db`
+  容器内可见路径 <QL_HERMES_STATE_DB>
   （= 宿主 `/opt/data/state.db` = NAS 挂载 `/opt/hermes_host/hermes-data/state.db`，同一 inode）。
 
 口径（与 App 卡片标签一致，均为**自然日/自然月**，非滚动 24 小时）：
@@ -26,7 +26,7 @@ import time
 # 环境变量优先（便于换库/测试），否则按容器 → 宿主顺序探测
 DB_CANDIDATES = [
     os.environ.get("QL_STATE_DB") or "",
-    "/volume1/docker/hermes/hermes-data/state.db",
+    os.environ.get("QL_HERMES_STATE_DB","/data/hermes/state.db"),
     "/opt/data/state.db",
     "/opt/hermes_host/hermes-data/state.db",
 ]

@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 
-MEMORY_PATH = "/volume1/docker/hermes/微信文件/轻聊web/data/memory.json"
+MEMORY_PATH = os.path.join(os.environ.get("QL_DATA_DIR", "/volume1/docker/hermes/微信文件/轻聊web/data"),"memory.json")
 MAX_ENTRIES = 50
 
 # v3.0.6 review fix：记忆 JSON 高并发读写（每条流式消息 inject→add_entry），

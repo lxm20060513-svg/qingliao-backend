@@ -1,5 +1,5 @@
 import sys, time
-sys.path.insert(0, '/volume1/docker/hermes/微信文件/轻聊web/backend')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import stream_api
 task_id='eval-stream-1'
 st={'sessionId':'eval-stream-sess','model':'deepseek-v4-flash','messages':[{'role':'user','content':'帮我查一下本机内存占用'}],'content':'','status':'streaming','agentEnabled':True,'provider':'','createdAt':time.time(),'updatedAt':time.time()}

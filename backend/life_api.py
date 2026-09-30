@@ -1134,7 +1134,7 @@ def _fetch_article(url, title="", fresh=False):
 # ---------------------------------------------------------------- 待办 / 记账 / 周报
 def _notes_file():
     """便签文件（App 可用 X-Notes-Dir 改目录，周报侧只读默认位——取不到就当 0 条）。"""
-    return os.path.join(os.environ.get("QL_DATA_DIR", "/data"), "notes.json")
+    return os.path.join(os.environ.get("QL_DATA_DIR", "/volume1/docker/hermes/微信文件/轻聊web/data"), "notes.json")
 
 
 def _collect_todo():
@@ -1315,7 +1315,7 @@ def _weekly_report(days=7, push=False):
 
 
 # ---------------------------------------------------------------- 快递状态变化订阅
-_WATCH_FILE = os.path.join(os.environ.get("QL_DATA_DIR", "/data"), "express_watch.json")
+_WATCH_FILE = os.path.join(os.environ.get("QL_DATA_DIR", "/volume1/docker/hermes/微信文件/轻聊web/data"), "express_watch.json")
 _WATCH_LOCK = threading.Lock()
 
 

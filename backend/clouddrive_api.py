@@ -16,7 +16,7 @@
 
 为什么 CLI 要 docker exec：官方 skill 的 CLI 是 node 程序，而 node 只装在 hermes 容器里
 （qingliao 容器只有 python3）。skills 目录是同一宿主目录
-（/volume1/docker/hermes/hermes-data/skills → hermes 容器内 /opt/data/skills），
+（宿主 <QL_HOST_SKILLS_DIR> → hermes 容器内 /opt/data/skills），
 所以这里统一「qingliao 容器内 docker exec hermes-hermes-1 node ...」。
 探活顺序固定：install.sh → login --token → get-user-info → 一个最轻的读操作（browse 根目录），
 三段都拿到 code:0 才算接入成功（只到 install.sh 不算数）。
@@ -37,7 +37,7 @@ from http.server import BaseHTTPRequestHandler
 # ── 环境 ──
 HERMES_CONTAINER = os.environ.get("QL_HERMES_CONTAINER", "hermes-hermes-1")
 # 宿主 skills 目录（qingliao 容器挂载 /volume1；hermes 容器内对应 /opt/data/skills）
-HOST_SKILLS_DIR = os.environ.get("QL_HOST_SKILLS_DIR", "/volume1/docker/hermes/hermes-data/skills")
+HOST_SKILLS_DIR = os.environ.get("QL_HOST_SKILLS_DIR", "/data/hermes/skills")
 HERMES_SKILLS_DIR = "/opt/data/skills"
 DRIVE_REGISTRY = os.environ.get("QL_DRIVE_REGISTRY", "/data/cloud_drives.json")
 DL_DIR = os.environ.get("QL_CLOUDDRIVE_DL", "/data/clouddrive_dl")

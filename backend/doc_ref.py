@@ -20,7 +20,7 @@ DEFAULT_NEWEST_MAX = 30000       # 最新 user 轮：单文件注入正文上限
 DEFAULT_OLDER_MAX = 800          # 更早的 user 轮：只给节选，防历史每轮重付全文
 MAX_DOC_BYTES = 20 * 1024 * 1024  # 超过此大小不读原件（在请求线程里解析大文件会拖慢整条流）
 MAX_DOCS_PER_MSG = 3             # 单条消息最多展开几个附件
-CACHE_DIR = os.path.join(os.environ.get("QL_DATA_DIR", "/data"), "doc_cache")
+CACHE_DIR = os.path.join(os.environ.get("QL_DATA_DIR", "/volume1/docker/hermes/微信文件/轻聊web/data"), "doc_cache")
 
 # App 侧格式：[文件: xxx.pdf]（已上传 NAS：doc=xxx_1737.pdf）
 DOC_REF_RE = re.compile(r"（已上传 NAS：doc=([^）\n]{1,160})）")

@@ -28,7 +28,7 @@ from http.server import BaseHTTPRequestHandler
 # ⚠️ 生产口径：本值是 Hermes 网关真正读取的 config.yaml（mcp_servers 写在这里），
 # 不能改成 QL_HERMES_CONFIG（那是轻聊侧 provider key 台账，Hermes 不读）——否则
 # App「MCP 工具服务」的保存会写进没人读的文件而静默失效。
-HERMES_CONFIG_PATH = "/volume1/docker/hermes/hermes-data/config.yaml"
+HERMES_CONFIG_PATH = os.environ.get("QL_HERMES_CONFIG","/volume1/docker/hermes/hermes-data/config.yaml")
 HERMES_CONTAINER = "hermes-hermes-1"
 RESTART_STATUS_FILE = "/data/streams_data/mcp_restart_status.json"
 
