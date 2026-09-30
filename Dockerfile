@@ -14,6 +14,17 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 COPY backend/ /app/
 
+# v4.0.13：构建时把 git 版本信息烧进镜像，供 /api/version 读取
+# （镜像里没有 .git，运行时读不到 commit，只能构建期注入）
+# QL_BACKEND_COMMIT 取不到时不写入 ARG/ENV（Dockerfile 里 ARG 未定义会展开为空串，
+#  代码侧用 os.environ.get(...) or "" 兜底，见 version_api.py）
+ARG QL_BACKEND_VERSION=""
+ARG QL_BACKEND_COMMIT=""
+ARG QL_BACKEND_BUILT=""
+ENV QL_BACKEND_VERSION=${QL_BACKEND_VERSION}
+ENV QL_BACKEND_COMMIT=${QL_BACKEND_COMMIT}
+ENV QL_BACKEND_BUILT=${QL_BACKEND_BUILT}
+
 # 数据目录（挂载卷，存放会话/上传/日志/密钥等）
 VOLUME ["/data"]
 

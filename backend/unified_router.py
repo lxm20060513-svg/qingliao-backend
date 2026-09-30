@@ -56,6 +56,8 @@ ROUTE_TABLE = {
     "/api/mcp":      ("mcp_api",     "Handler"),
     "/api/clouddrive": ("clouddrive_api", "Handler"),
     "/api/diag":     ("diag_api",    "DiagHandler"),
+    # v4.0.13：后端版本查询（免鉴权，App「关于」页用；详见 version_api.py 头注释）
+    "/api/version":  ("version_api",  "Handler"),
     "/api/life":      ("life_api",    "LifeHandler"),
     "/api/mail":      ("mail_api",    "MailHandler"),
     # v3.9.18 危险操作确认闸门：Hermes pre_tool_call 插件 ↔ 本后端 ↔ App 三方链路

@@ -120,6 +120,36 @@ docker compose version >/dev/null 2>&1 || die "未安装 docker compose 插件"
 
 say ""
 say "→ 重建并启动容器..."
+# v4.0.13：把版本信息注入镜像，供 /api/version 读取（用户零感知，不用改 .env）
+_git_ver="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+_git_commit="$(git rev-parse --short HEAD)"
+_git_built="$(git log -1 --format=%cd --date=short)"
+export QL_BACKEND_VERSION="$_git_ver"
+export QL_BACKEND_COMMIT="$_git_commit"
+export QL_BACKEND_BUILT="$_git_built"
+
+# 两种部署方式都覆盖：
+#   a) compose 里是 build:（从源码构建）→ build args 生效
+#   b) compose 里是 image:（用预构建镜像）→ 只能走 environment，
+#      顺带把值写进 .env，这样下次 docker compose up 仍然有效
+if grep -qE '^\s*image:' docker-compose.yml 2>/dev/null; then
+  _touch_env() {
+    local k="$1" v="$2"
+    if grep -q "^${k}=" .env 2>/dev/null; then
+      # 已有则就地替换（保持顺序，避免重复键）
+      sed -i "s|^${k}=.*|${k}=${v}|" .env
+    else
+      printf '%s=%s\n' "$k" "$v" >> .env
+    fi
+  }
+  _touch_env QL_BACKEND_VERSION "$_git_ver"
+  _touch_env QL_BACKEND_COMMIT "$_git_commit"
+  _touch_env QL_BACKEND_BUILT "$_git_built"
+  ok "版本信息已写入 .env（后端版本：${_git_ver:-无 tag} / $_git_commit）"
+else
+  ok "版本信息将随构建注入（$_git_commit）"
+fi
+
 docker compose up -d --build 2>&1 | tail -5 | sed 's/^/  /'
 
 # ── 健康检查 ───────────────────────────────────────────────

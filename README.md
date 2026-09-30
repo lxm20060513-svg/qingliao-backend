@@ -87,6 +87,26 @@ docker compose up -d --build
 
 App 与后端版本无需严格对应：后端向前兼容，App 旧版连新后端也能跑。
 
+## 📋 查询后端版本
+
+```bash
+curl http://127.0.0.1:9127/api/version
+# {"ok": true, "version": "v4.0.13", "commit": "8f2e181", "built": "2026-10-01", "modules": 32}
+```
+
+`GET /api/version` **免鉴权**（只返回版本号，不含任何配置/路径/凭据），App「关于」页用它显示
+后端版本。`./update.sh` 会自动把版本信息写进 `.env`，用户不用手动配。
+
+| 字段 | 含义 |
+|---|---|
+| `version` | 版本号（tag）。无 tag 时为空字符串 |
+| `commit` | 短 commit hash，精确定位代码 |
+| `built` | 构建/提交日期 |
+| `modules` | 后端 `_api.py` 模块数，粗略反映版本新旧 |
+
+版本号来源按此顺序回退：环境变量 `QL_BACKEND_VERSION` → `QL_VERSION` 文件 → `.git`。
+三者都没有时各字段返回空字符串（**接口仍返回 200**，不报错）。
+
 ## 📖 踩坑记录在哪
 
 完整踩坑实录（sudo/nginx/systemd/后端 patch/鉴权 token/PWA 缓存/ASR 自愈/docker 解析/看门狗）沉淀在 Hermes 技能 `qingliao-webui`（开发/调试/部署轻聊必读）与 NAS `轻聊app/避坑指南.md`（iOS 端）。

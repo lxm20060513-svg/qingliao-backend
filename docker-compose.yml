@@ -1,6 +1,13 @@
 services:
   qingliao:
-    build: .
+    build:
+      context: .
+      # v4.0.13：版本信息构建期注入（update.sh 会自动传入；手动 build 时留空不影响运行，
+      # /api/version 会回退读 VERSION 文件或 .git，都读不到则 version=""）
+      args:
+        QL_BACKEND_VERSION: ${QL_BACKEND_VERSION:-}
+        QL_BACKEND_COMMIT: ${QL_BACKEND_COMMIT:-}
+        QL_BACKEND_BUILT: ${QL_BACKEND_BUILT:-}
     container_name: qingliao
     restart: unless-stopped
     ports:
