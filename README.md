@@ -69,6 +69,9 @@ docker compose up -d
 
 ```bash
 ./update.sh            # 更新到最新 + 重建容器（推荐）
+
+也可以在轻聊 App 里一键更新：设置 →「后端更新」→ 一键更新（走 /api/selfupdate，
+效果等同在 NAS 上跑 ./update.sh；老版本后端没有此接口时 App 会显示手动命令）。
 ./update.sh --check    # 只看有没有新版，不改任何东西
 ./update.sh --version v4.0.13   # 更新到指定 tag（配套某个 App 版本）
 ```
