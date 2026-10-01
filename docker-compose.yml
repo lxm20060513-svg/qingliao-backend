@@ -25,6 +25,9 @@ services:
       
       # === 数据目录 ===
       QL_DATA_DIR: ${QL_DATA_DIR:-/data}
+
+      # v4.0.14：宿主 git 仓根（install.sh 自动写入 .env）；selfupdate 一键更新用
+      QL_REPO_DIR: ${QL_REPO_DIR:-}
       QL_UPLOAD_DIR: ${QL_UPLOAD_DIR:-/data/uploads}
       QL_HERMES_DATA_DIR: ${QL_HERMES_DATA_DIR:-/data/hermes}
       QL_HERMES_HOST_DIR: ${QL_HERMES_HOST_DIR:-/data/hermes_host}

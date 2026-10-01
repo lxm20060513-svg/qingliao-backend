@@ -41,6 +41,10 @@ for _v in QL_INBOX_TOKEN QL_PUSH_TOKEN; do
     fi
 done
 
+# v4.0.14：写入宿主仓根绝对路径（selfupdate 一键更新要挂载宿主仓目录；新老 .env 都补）
+_repo_dir="$(cd "$(dirname "$0")" && pwd)"
+grep -q "^QL_REPO_DIR=" .env || echo "QL_REPO_DIR=${_repo_dir}" >> .env
+
 read -r -p "上游 LLM 端点（OpenAI 兼容，回车=host.docker.internal:9123）: " LLM
 if [ -n "$LLM" ]; then
     grep -q "^QL_HERMES_URL=" .env || echo "QL_HERMES_URL=${LLM}" >> .env
