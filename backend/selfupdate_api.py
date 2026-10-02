@@ -22,8 +22,10 @@ GET  /api/selfupdate                               → 当前状态（idle/runni
    从文件恢复状态；App 侧轮询 502/超时视为「正在重启」，继续等即可。
 4. **防并发**：同一时刻只允许一个更新任务（状态文件里 running 标记 + 开始时间；
    超过 15 分钟的 running 视为僵尸，允许重新发起）。
-5. **非 git 部署**（手动拷代码跑）：check 阶段就会报「非 git 部署，请手动更新」，
-   不会做任何破坏性动作。
+5. **非 git 部署**（手动拷代码跑，无 QL_REPO_DIR）：check 阶段不做任何破坏性动作，
+   且**返回 ok:true / update_available:false**（不是 ok:false）—— 见 _manual_deploy_result：
+   App 侧把 ok:false 一律渲染成红字「无法自动更新」，对版本已最新的手动实例是假警报。
+   run（一键更新）仍然明确报错，不假装成功。
 """
 import json
 import os
@@ -128,9 +130,44 @@ def _host_repo_exists():
 
 # ────────────────────────── check（同步） ──────────────────────────
 
+def _manual_deploy_result(detail=""):
+    """非 git 装法（bind mount / 手动部署）的 check 结论 —— ok:True 而不是报错。
+
+    这类部署没有宿主 git 仓可查、`update.sh` 也跑不了：旧逻辑回 ok:false，
+    而 App 侧（BackendUpdate.swift preciseCheck）把 ok:false 一律渲染成红字
+    「无法自动更新」，对"版本本来就是最新"的实例是假警报（实测：手动装法 +
+    /api/version 已 v4.0.22，设置页仍挂着红字「未配置 QL_REPO_DIR」）。
+
+    改回 ok:true / update_available:false 的含义是「没有可自动执行的更新」，
+    并在 log 里如实说明"查不了远端、请按本机装法手动更新"——不假装比对过。
+    run（一键更新）路径不动：真去点仍然会明确报错，不会静默假装成功。
+    """
+    try:
+        import version_api
+        cur = version_api.get_version_info().get("version", "") or "未知"
+    except Exception:
+        cur = "未知"
+    lines = []
+    if detail:
+        lines.append(detail.strip())
+    lines += [
+        "本部署是手动装法（未配置 QL_REPO_DIR），没有宿主 git 仓可查，"
+        "无法自动核对远端是否有新提交。",
+        f"当前后端版本：{cur}",
+        "要更新请按本机原有方式手动执行（本机不支持 App 一键更新）。",
+    ]
+    return {"ok": True, "update_available": False, "behind": 0,
+            "manual": True, "log": "\n".join(lines)}
+
+
 def _run_check():
     ok, err = _env_check()
     if not ok:
+        if not REPO_DIR:
+            # 非 git 装法：不是故障，别让 App 报红（详见 _manual_deploy_result）
+            # 不带原始 env 报错文本：那句"请重装 install.sh"对手动装法的用户是误导
+            return _manual_deploy_result()
+        # 其余（docker CLI / docker.sock 缺失）是真故障，照旧报错
         return {"ok": False, "error": err}
     try:
         r = subprocess.run(
