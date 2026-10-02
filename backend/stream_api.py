@@ -353,7 +353,7 @@ def _collect_nas_status():
         if os.path.isdir("/host_root"):
             # 宿主候选挂载点（系统盘 + 数据盘；/tmp 相对次要）
             cands = ["/boot", "/rootfs", "/ugreen", "/mnt/factory", "/overlay",
-                     "/volume1", "/volume2", "/volume3"]
+                     "/data", "/volume2", "/volume3"]
             df = subprocess.run(["df", "-B1"] + ["/host_root" + c for c in cands],
                                 capture_output=True, text=True, timeout=10)
         else:
@@ -436,7 +436,7 @@ def _collect_nas_status():
         # v3.0.36 fix：容器极简镜像无 pgrep/ps（FileNotFoundError 曾致整个 try 异常 → hermes 恒 null）
         #           内存改 docker exec hermes 容器内 ps -eo rss（Hermes 容器是完整镜像，ps 可用）
         try:
-            p = subprocess.run(["docker", "exec", "hermes-hermes-1", "ps", "-eo", "pid,rss,comm"],
+            p = subprocess.run(["docker", "exec", os.environ.get("QL_HERMES_CONTAINER", "hermes-container"), "ps", "-eo", "pid,rss,comm"],
                                capture_output=True, text=True, timeout=10)
             rss = 0
             for ln in (p.stdout or "").splitlines()[1:]:
@@ -451,7 +451,7 @@ def _collect_nas_status():
             services["hermes_mem"] = None
         # v3.0.8：Hermes 容器版本（docker exec hermes --version 首行，如 "Hermes Agent v0.20.4 ..."）
         try:
-            v = subprocess.run(["docker", "exec", "hermes-hermes-1", "hermes", "--version"],
+            v = subprocess.run(["docker", "exec", os.environ.get("QL_HERMES_CONTAINER", "hermes-container"), "hermes", "--version"],
                                capture_output=True, text=True, timeout=10)
             first = (v.stdout or "").strip().splitlines()[0] if v.stdout else ""
             services["hermes_version"] = first if first else None
@@ -495,7 +495,7 @@ def _collect_diagnose():
     else:
         add("svc_hermes", "Hermes Agent", "ok" if h_up else "error",
             "9123 健康检查通过" if h_up else "9123 健康检查失败",
-            "Hermes 容器异常，等看门狗自动重启，或 docker restart hermes-hermes-1")
+            "Hermes 容器异常，等看门狗自动重启，或 docker restart hermes-container")
 
     # v3.4.x：轻聊后端端口自检——9127 统一路由 / 9132 流式直连（App 长连接独立端口）
     # 容器内对本机端口 TCP 连通探测：通=监听中；拒=服务挂；超时=异常
@@ -874,7 +874,8 @@ def _maybe_push_app(st, task_id=None):
                 _dedup["ts"] = time.time()
             except Exception as _e:
                 print("[push] 推送去重异常(放行):", str(_e)[:120], flush=True)
-        ok, msg = inbox_api.push(content, task_id=task_id, task_type="reply")
+        ok, msg = inbox_api.push(content, task_id=task_id, task_type="reply",
+                                 session_id=str(st.get("sessionId") or ""))
         if ok and task_id and _sig:
             try:
                 _APP_PUSH_DEDUP.setdefault(task_id, {}).update({"sig": _sig, "ts": time.time()})
@@ -1456,6 +1457,39 @@ QCARD_PROMPT = (
 # v3.9.95：ql-action 本地动作卡协议（App 端 v3.9.95 起 AgentActionParser 已解析渲染）。
 # ⚠️ 与 QCARD_PROMPT 的本质区别：ql-card 只是「展示信息」，ql-action 会**真的改动用户设备**
 #    （建/删日历事件、往相册存图、发系统通知）。所以纪律段必须比 ql-card 严得多。
+def _goal_auto_detect_enabled():
+    """v4.0.20（#2）：长期目标自动判定开关（设置 → 主动 Agent）。
+
+    关掉后 AI 不再收到 goal.create / goal.step_done 的动作说明，闲聊就不会被误判成
+    「长期目标」；**已经建好的目标照常推进**（那是 cron 的活，与这个开关无关）。
+    配置读不到时保持原行为（True），别把功能静默关掉。
+    """
+    try:
+        import proactive_agent
+        return bool(proactive_agent.get_config().get("goalAutoDetect", True))
+    except Exception:
+        return True
+
+
+# v4.0.20（#2）：抽出来的目标动作说明（原内联在 QLACTION_PROMPT 中段）。
+# 抽出来是为了能按开关整段门控；内联时没法只摘这一段。
+_GOAL_ACTION_DOC = (
+    "goal.create（title 必填【目标标题】、steps 必填【拆出的步骤，JSON 数组字符串，例 \"[\\\"定产品线\\\",\\\"备货5000\\\"]\"】、"
+    "morningHour 可选【每天几点推进，默认 9】）—— "
+    "判定用户说的是**长期目标**（要花几天到几周、需要分多步推进的事）时用它："
+    "App 会弹一张建目标卡，用户点确认后才真建，并自动把步骤灌进待办清单、每天早上自动推进一小步并汇报。"
+    "【判定要克制，别误伤普通闲聊】只在满足下面**全部**条件时才发这个动作："
+    "①用户话里明确出现目标/筹备类表达（筹备、准备、计划做、要办、打算开展、推进……这类**长期**意味，"
+    "不是「帮我查下」「今天中午吃什么」这种一次性事）；②这件事明显要分多步、跨天；"
+    "③用户是在陈述一件要持续做的事，而不是在问问题、不是在让你做一次性操作。"
+    "任何一条不满足就**不要**发这个动作，正常聊天即可。"
+    "闲聊、问天气、问代码、问「现在几点」、抱怨吐槽、已经完成的事，都绝对不要发。"
+    "步骤要拆得具体可执行（每步都是今天/明天就能动手的一件事），3-6 步为宜，不要写「完成XX」这种空话。"
+    "goal.step_done（goalId 必填、stepId 必填、done 必填 true/false）—— "
+    "用户说某一步做完了 / 搞定了时勾掉那一步；用户改口说还没做完时 done=false 恢复。"
+)
+
+
 QLACTION_PROMPT = (
     "\n\n【本地设备操作（可选）】当且仅当用户**明确要求**你操作他手机上的数据时"
     "（记到日历/改个日程/我明天几点有空/到点提醒我/我有什么待办/查某人的电话/我在哪/"
@@ -1481,20 +1515,10 @@ QLACTION_PROMPT = (
     "mail.send（to 必填【收件人邮箱】、subject 必填、body 必填、account 可选【多账号时指定用哪个发】）—— "
     "用轻聊已授权的邮箱代用户发信；App 会先弹一张明细卡，用户点确认后才真发，"
     "发送结果回执会写回会话。只有用户明确说「发邮件给谁」时才用，别拿它当自己的沟通渠道。"
-    "goal.create（title 必填【目标标题】、steps 必填【拆出的步骤，JSON 数组字符串，例 \"[\\\"定产品线\\\",\\\"备货5000\\\"]\"】、"
-    "morningHour 可选【每天几点推进，默认 9】）—— "
-    "判定用户说的是**长期目标**（要花几天到几周、需要分多步推进的事）时用它："
-    "App 会弹一张建目标卡，用户点确认后才真建，并自动把步骤灌进待办清单、每天早上自动推进一小步并汇报。"
-    "【判定要克制，别误伤普通闲聊】只在满足下面**全部**条件时才发这个动作："
-    "①用户话里明确出现目标/筹备类表达（筹备、准备、计划做、要办、打算开展、推进……这类**长期**意味，"
-    "不是「帮我查下」「今天中午吃什么」这种一次性事）；②这件事明显要分多步、跨天；"
-    "③用户是在陈述一件要持续做的事，而不是在问问题、不是在让你做一次性操作。"
-    "任何一条不满足就**不要**发这个动作，正常聊天即可。"
-    "闲聊、问天气、问代码、问「现在几点」、抱怨吐槽、已经完成的事，都绝对不要发。"
-    "步骤要拆得具体可执行（每步都是今天/明天就能动手的一件事），3-6 步为宜，不要写「完成XX」这种空话。"
-    "goal.step_done（goalId 必填、stepId 必填、done 必填 true/false）—— "
-    "用户说某一步做完了 / 搞定了时勾掉那一步；用户改口说还没做完时 done=false 恢复。"
-    "【时间格式铁律】start/end/due 必须是 ISO8601 且**带时区偏移**，例如 2026-09-28T15:00:00+08:00；"
+    # v4.0.20（#2）：目标动作说明按「长期目标自动判定」开关整段门控 ——
+    # 关掉后 AI 收不到这些说明，自然就不会把闲聊误判成长期目标
+    + (_GOAL_ACTION_DOC if _goal_auto_detect_enabled() else "")
+    + "【时间格式铁律】start/end/due 必须是 ISO8601 且**带时区偏移**，例如 2026-09-28T15:00:00+08:00；"
     "绝对不要写「明天下午三点」这种自然语言，也不要省略时区（客户端不猜时区，写错必然失败）。"
     "【围栏纪律】```ql-action 另起一行、独占一行；收尾的三反引号必须另起一行、独占一行"
     "（前面不许粘 JSON 的结尾花括号或任何字符），否则客户端认不出闭合，整块会被当代码块原样显示。"
@@ -1517,7 +1541,7 @@ QLACTION_PROMPT = (
     "JSON 必须合法（解析失败客户端会原样显示文本，不会报错）。"
     "【任务中途追问（可选）】执行多步骤任务时若卡在必须用户拍板的岔路口"
     "（选方案、定范围、确认删哪些、补缺失参数），不要自己猜，用本地脚本问用户：\n"
-    "python3 /opt/data/scripts/ql_ask/ask_user.py --question \"问题正文\" --options \"选项A|选项B\" --timeout 600\n"
+    "python3 /data/hermes/scripts/ql_ask/ask_user.py --question \"问题正文\" --options \"选项A|选项B\" --timeout 600\n"
     "它在 App 任务中心发一张问题卡，用户在卡片上作答后答案会打到 stdout，你据此继续；"
     "能给选项就给选项（App 渲染成按钮）；退出码 2=超时未答（按缺省方案继续并在回复里说明），"
     "3=接口出错（改用文字提问不要卡死）。拿到答案先复述一句再动手。"
@@ -1807,6 +1831,24 @@ def _worker(task_id, task):
         new_rule = agent_rules.extract_from_text(last_user_text)
         if new_rule:
             agent_rules.add_rule(new_rule)
+        # v4.0.120「AI 记住瞬间」（第 2 项）：把「记住…」类消息**当场落盘**并回报给 App。
+        # 🚨 事故背景（代码审查）：memory_store.check_and_save() 一直只被同文件的 inject() 调用，
+        # 而 inject() 全仓**零调用点**（stream_api 只用 prompt_block() 读记忆）→ 用户在聊天里说
+        # 「记住我喜欢喝美式」从来没存过，记忆页里也永远不会多出一条；App 侧更是没有任何
+        # 「刚记住了」的可挂载点。这与记忆页的增删改（三处 API 都活着）不冲突，缺的是**自动写入**
+        # 这条链路 + 写入瞬间的用户可见反馈。
+        # 口径：只报 check_and_save **本次真正新增**的条目（去重命中返回空列表，天然不重复弹气泡）。
+        # 存失败/无新增都不写 st["memoAdded"]，App 侧不显示任何东西（静默不误导）。
+        try:
+            _memo_new = memory_store.check_and_save(
+                last_user_text, session_id=str(st.get("sessionId") or "")) or []
+            if _memo_new:
+                _memo_seen = st.setdefault("memoAdded", [])
+                for _p in _memo_new[:3]:          # 一条消息最多冒 3 个气泡，超出静默（防刷屏）
+                    if _p not in _memo_seen:
+                        _memo_seen.append(_p)
+        except Exception as e:
+            print("[memory] 自动写入失败：%s" % str(e)[:200], flush=True)
         agent_on = st.get("agentEnabled", True)
         # v2.0.105d：分流诊断日志（排查用户侧 agentEnabled 实际值）
         # v2.0.116 review：日志限 500 行轮转（防 /tmp 占满）
@@ -2126,7 +2168,8 @@ def _hermes_responses_worker(task_id, task, req_body, headers, last_write):
                 if not text:
                     continue
                 import inbox_api
-                ok, msg = inbox_api.push(text, task_id=task_id, task_type="progress")
+                ok, msg = inbox_api.push(text, task_id=task_id, task_type="progress",
+                                         session_id=str(st.get("sessionId") or ""))
                 print("[progress] push ok=%s %s" % (ok, str(msg)[:120]), flush=True)
             except Exception as e:
                 print("[progress] push fail:", str(e)[:200], flush=True)
@@ -2642,7 +2685,7 @@ class StreamHandler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "not found"})
 
     def do_GET(self):
-        # v2.0.130：免鉴权 AI 图片端点（App 渲染 MEDIA: 路径时加载）——只允许 /opt/data(hermes-data) 下图片
+        # v2.0.130：免鉴权 AI 图片端点（App 渲染 MEDIA: 路径时加载）——只允许 /data/hermes(hermes-data) 下图片
         if self.path.startswith("/api/stream/media"):
             _serve_media(self)
             return
@@ -2917,6 +2960,9 @@ class StreamHandler(BaseHTTPRequestHandler):
                 "error": st.get("error", ""),
                 "agent": st.get("agent", False),   # v2.0.98：Agent 回复标记（设置页开关关闭时恒 false）
                 "inbox": inbox_payload,             # v3.4.23：搭载的收件箱待推消息（可为空）
+                # v4.0.120：本流**本次新记住**的条目（供 App 弹「已记住」气泡 + 一键撤销）。
+                # 与 toolNames 同为纯增量键：老 App 忽略即可。整流只增不减（幂等重发无害）。
+                "memoAdded": [str(x) for x in (st.get("memoAdded") or [])],
                 "toolSeq": int(st.get("toolSeq") or 0),
                 "lastTool": _TOOL_NAME_ZH.get(str(st.get("lastTool") or ""),
                                               str(st.get("lastTool") or "")),
@@ -2930,7 +2976,7 @@ class StreamHandler(BaseHTTPRequestHandler):
 def _serve_media(self):
     """v2.0.130：免鉴权图片服务——MEDIA:路径 → 图片字节。
     v3.0.28 security note：免鉴权设计（App 本地 localhost 调用），白名单限制只读允许目录下的图片扩展名。
-    query: p=<base64url(宿主绝对路径)>；仅允许图片扩展名 + 容器 /opt/data 映射目录。
+    query: p=<base64url(宿主绝对路径)>；仅允许图片扩展名 + 容器 /data/hermes 映射目录。
     """
     import urllib.parse as _up
     q = _up.parse_qs(_up.urlparse(self.path).query)
@@ -3059,6 +3105,8 @@ def _relay_query(self):
             "/api/router/", "/api/agent", "/api/tasks", "/api/mcp","/api/router/", "/api/agent", "/api/tasks", "/api/mcp", "/api/clouddrive",
             "/api/diag",
             "/api/life", "/api/mail",
+            # v4.0.15：App 内后端更新 + 版本比对（relay 复验通道需要）
+            "/api/selfupdate", "/api/version",
             "/api/nas/", "/api/hw/", "/api/channel/",
             "/api/inbox", "/api/history", "/api/tts",
         )
@@ -3169,6 +3217,8 @@ if __name__ == "__main__":
     srv = ThreadingHTTPServer(("0.0.0.0", 9132), StreamHandler)
     print("[stream] listening on 9132, dir:", STREAM_DIR, flush=True)
     srv.serve_forever()
+
+
 
 
 

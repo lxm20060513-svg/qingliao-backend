@@ -109,6 +109,7 @@ def _archive(entries, reason=None):
                     "status": it.get("status"),
                     "source_task_id": it.get("source_task_id"),
                     "task_type": it.get("task_type", "reply"),
+                    "session_id": it.get("session_id"),
                     "text": it.get("text", ""),
                 }
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -116,7 +117,7 @@ def _archive(entries, reason=None):
         print("[inbox] 归档失败（不影响主流程）:", str(e)[:120], flush=True)
 
 
-def push(text, task_id=None, task_type="reply", want_id=False):
+def push(text, task_id=None, task_type="reply", want_id=False, session_id=None):
     """Hermes 事件方调用：推送一条消息到轻聊 App 收件箱。
     v3.4.8：task_id 为该回复的流式任务 id（source_task_id），App 端用作不可变去重标识。
     v3.4.x：task_type 区分来源（reply/cron/system）→ App 端任务中心分类。
@@ -139,7 +140,8 @@ def push(text, task_id=None, task_type="reply", want_id=False):
         items = _load()
         items.append({"id": mid, "text": text,
                       "ts": time.time(), "status": "pending",
-                      "source_task_id": task_id, "task_type": task_type})
+                      "source_task_id": task_id, "task_type": task_type,
+                      "session_id": (session_id or "").strip() or None})
         if len(items) > QUEUE_LIMIT:
             items = items[-QUEUE_LIMIT:]
         _save(items)
@@ -287,6 +289,7 @@ def peek_pending():
                 "id": it["id"], "text": it.get("text", ""), "ts": ts,
                 "source_task_id": it.get("source_task_id"),
                 "task_type": it.get("task_type", "reply"),
+                "session_id": it.get("session_id"),
             })
     return out
 
@@ -406,7 +409,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "items": [{
                 "id": it["id"], "text": it["text"], "ts": it.get("ts", 0),
                 "source_task_id": it.get("source_task_id"),
-                "task_type": it.get("task_type", "reply")
+                "task_type": it.get("task_type", "reply"),
+                "session_id": it.get("session_id")
             } for it in items]})
         else:
             self._send(404, {"ok": False, "error": "not found"})
@@ -456,7 +460,8 @@ class Handler(BaseHTTPRequestHandler):
                 d = json.loads(self.rfile.read(n) or b"{}")
                 want_id = bool(d.get("want_id"))   # v3.9.83：追问链路要 id；老调用方不传 → 响应体不变
                 ok, msg = push(d.get("text", ""), d.get("source_task_id"),
-                               d.get("task_type", "reply"), want_id=want_id)
+                               d.get("task_type", "reply"), want_id=want_id,
+                               session_id=d.get("session_id"))
                 resp = {"ok": ok, "message": msg}
                 if ok and want_id:
                     resp["id"] = msg
