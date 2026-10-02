@@ -11,10 +11,13 @@ GET /api/version → {"ok": true, "version": "4.0.13", "commit": "bfe45a0",
 设计要点：
 1. **免鉴权**。这是纯信息接口，返回的只有版本号，不含任何配置/路径/凭据。
    未登录时也要能看到（App 登录页也要显示后端版本才能排查"连不上"）。
-2. 版本号来源三级回退，任何一种部署方式都能拿到真值：
-   - QL_BACKEND_VERSION 环境变量（Dockerfile 构建时注入，最可靠）
-   - /app/VERSION 或 backend/VERSION 文件（手动部署可写）
-   - 读 .git（源码直接跑、非镜像部署时有效）
+2. 版本号真值优先级：**backend/QL_VERSION 文件 > QL_BACKEND_VERSION 环境变量 > .git**。
+   文件优先是给 bind mount / 手动部署用的：部署脚本写一次 backend/QL_VERSION 即生效
+   （读盘带 60 秒缓存），**不必 `docker compose up -d` 重建容器去刷 env**；
+   镜像部署（Dockerfile 注入 env、盘上无该文件）时自动回落到环境变量。
+   - backend/QL_VERSION：update.sh（git 装法）会写；手动/bind mount 部署自行写一份即可
+     （第一行版本号，可选第二行 commit、第三行日期）
+   - QL_BACKEND_COMMIT / QL_BACKEND_BUILT 同序遍历（各自缺失则单独回落）
    都没有则返回 version=""，App 侧显示"未知"而不是报错。
 3. 只加字段不改语义，与任何现有接口零耦合。
 """
@@ -100,10 +103,11 @@ def get_version_info():
     data = _read_version_file() or _read_git() or {}
     info = {
         "ok": True,
-        # 环境变量优先于文件/Dockerfile
-        "version": os.environ.get(VERSION_ENV) or data.get("version", ""),
-        "commit": os.environ.get(COMMIT_ENV) or data.get("commit", ""),
-        "built": os.environ.get(BUILT_ENV) or data.get("built", ""),
+        # 真值优先级：文件（最贴近"当前跑着的这份代码"）> 环境变量（镜像构建时注入）> .git
+        # 逐字段回落：文件只给了 version 时，commit/built 仍可用 env 补
+        "version": data.get("version") or os.environ.get(VERSION_ENV, ""),
+        "commit": data.get("commit") or os.environ.get(COMMIT_ENV, ""),
+        "built": data.get("built") or os.environ.get(BUILT_ENV, ""),
         "modules": _module_count(),
     }
     _info_cache["ts"] = now
