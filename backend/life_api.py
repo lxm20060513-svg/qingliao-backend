@@ -1399,10 +1399,166 @@ def check_express_changes(push=True):
             "watching": len(new)}
 
 
+# ---------------------------------------------------------------- 价格监控（变更播报）
+# v4.0.37（OpenMuse 借鉴②）：对齐快递 watch 的三条口径 —— 首轮只建基线、只在"真的变了"时推一次、
+# 固定 task_id 幂等。补掉此前的三个洞：①无状态 → 每次采集都把当前价当"新变化"；②失败无退避 →
+# 抓不到就按周期疯抓；③阈值/币种写死（美元正则老路）→ 这里一律用商品自己的 currency 出符号。
+_PRICE_STATE_FILE = os.path.join(os.environ.get("QL_DATA_DIR", "/data"), "price_watch.json")
+_PRICE_LOCK = threading.Lock()
+_PRICE_BACKOFF_BASE = 60          # 失败退避起点（秒）
+_PRICE_BACKOFF_MAX = 1800         # 退避上限（连续失败最多等 30 分钟再试）
+_PRICE_PAUSE_AFTER = 5            # 连续失败达此数 → 推一次"已暂停"提示，之后长期退避
+
+_CUR_SYM = {"CNY": "¥", "RMB": "¥", "USD": "$", "HKD": "HK$", "JPY": "¥", "JPY_": "¥",
+            "EUR": "€", "GBP": "£", "KRW": "₩", "TWD": "NT$", "SGD": "S$", "AUD": "A$"}
+
+
+def _cur_sym(c):
+    """币种符号：认识的给符号，不认识的原样带出（绝不假设美元）。"""
+    s = str(c or "CNY").upper()
+    return _CUR_SYM.get(s, s + " ")
+
+
+def _price_key(item):
+    return "%s|%s" % (item.get("name") or "", item.get("url") or "")
+
+
+def _load_price_state():
+    try:
+        with open(_PRICE_STATE_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_price_state(d):
+    tmp = _PRICE_STATE_FILE + ".tmp"
+    os.makedirs(os.path.dirname(_PRICE_STATE_FILE) or ".", exist_ok=True)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, _PRICE_STATE_FILE)
+    try:
+        os.chmod(_PRICE_STATE_FILE, 0o644)
+    except Exception:
+        pass
+
+
+def check_price_changes(push=True, force=False):
+    """比对价格快照，只在价格**真的变了**（或首次跌破目标价）时推一次。
+
+    三条硬口径（对齐快递 watch）：
+      1. 首轮只建基线不推 —— 订阅瞬间不刷屏；
+      2. 失败指数退避 60s→1800s，退避期内不再抓（force=True 强制检查）；连续失败 5 次只推一次
+         「已暂停」，抓到价自动清零恢复；
+      3. 变化用「价格|币种」签名比对，文案用商品自己的币种符号，不写死美元。
+    未填写 URL 的商品既不算失败也不进退避（否则一堆空项互相拖累）。
+    """
+    cfg = load_config()
+    items = cfg["price"]["items"] or []
+    now = time.time()
+    with _PRICE_LOCK:
+        old = _load_price_state()
+        new, changed, failed, skipped, paused = {}, [], [], [], []
+        for it in items:
+            url = (it.get("url") or "").strip()
+            k = _price_key(it)
+            prev = old.get(k) if isinstance(old.get(k), dict) else {}
+            if not url:
+                new[k] = {"name": it.get("name") or "", "url": "", "crit": True,
+                          "note": "未填写商品 URL", "ts": int(now)}
+                continue
+            if not force and float(prev.get("nextAt") or 0) > now:
+                skipped.append(k)
+                new[k] = prev                  # 退避中：原样保留，不再抓
+                continue
+            r = _fetch_price(it)
+            sym = _cur_sym(r.get("currency") or it.get("currency"))
+            base = {"name": r.get("name") or "", "url": url,
+                    "currency": r.get("currency") or it.get("currency") or "CNY",
+                    "target": r.get("target"), "ts": int(now),
+                    "last": prev.get("last"), "sig": prev.get("sig"),
+                    "hit": prev.get("hit", False), "fail": int(prev.get("fail") or 0),
+                    "nextAt": prev.get("nextAt", 0),
+                    "pausedNotified": prev.get("pausedNotified", False)}
+            if not r.get("ok"):
+                base["fail"] = int(prev.get("fail") or 0) + 1
+                base["lastError"] = _s(r.get("error"), 120)
+                base["nextAt"] = now + min(_PRICE_BACKOFF_BASE * (2 ** (base["fail"] - 1)),
+                                           _PRICE_BACKOFF_MAX)
+                failed.append({"name": base["name"], "fail": base["fail"],
+                               "error": base["lastError"]})
+                if base["fail"] >= _PRICE_PAUSE_AFTER and not prev.get("pausedNotified"):
+                    base["pausedNotified"] = True
+                    paused.append(base)
+                new[k] = base
+                continue
+            new_sig = "%s|%s" % (r.get("price"), base["currency"])
+            hit_now = bool(r.get("hit"))
+            # v4.0.37 修正：成功检出后必须把 hit 落进状态。否则下一轮 prev["hit"] 恒为 False，
+            # 「首次跌破目标价」会每轮重推一次 —— 正是本条要治的重复播报（探针 L 步暴露）。
+            base.update({"last": r.get("price"), "sig": new_sig, "fail": 0, "nextAt": 0,
+                         "pausedNotified": False, "hit": hit_now})
+            if prev.get("sig") and prev.get("sig") != new_sig:
+                changed.append({"key": k, "name": base["name"], "old": prev.get("last"),
+                                "new": r.get("price"), "sym": sym, "hit": hit_now,
+                                "target": r.get("target"), "currency": base["currency"]})
+            elif prev.get("sig") and hit_now and not prev.get("hit"):
+                changed.append({"key": k, "name": base["name"], "old": prev.get("last"),
+                                "new": r.get("price"), "sym": sym, "hit": True,
+                                "target": r.get("target"), "currency": base["currency"],
+                                "justHit": True})   # 首次跌破目标价，报一次
+            new[k] = base
+        _save_price_state(new)
+
+    pushed, perr = 0, ""
+    if push and (changed or paused):
+        try:
+            import inbox_api
+            for c in changed:
+                if c.get("justHit"):
+                    msg = "🎯 已到目标价：%s\n%s%s ≤ %s%s" % (
+                        c["name"], c["sym"], c["new"], c["sym"], c["target"])
+                else:
+                    tgt = ""
+                    if c.get("target") is not None:
+                        tgt = "（目标 ≤%s%s%s）" % (
+                            c["sym"], c["target"], "，已达标 ✓" if c.get("hit") else "")
+                    msg = "💹 价格变动：%s\n%s%s → %s%s%s" % (
+                        c["name"], c["sym"], c["old"], c["sym"], c["new"], tgt)
+                ok, e = inbox_api.push(
+                    msg, task_id="price-%s" % hashlib.md5(c["key"].encode("utf-8")).hexdigest()[:10],
+                    task_type="system")
+                if ok:
+                    pushed += 1
+                else:
+                    perr = e
+            for p in paused:
+                ok, e = inbox_api.push(
+                    "⚠️ 价格监控已暂停：%s 连续 %d 次抓取失败（%s）。修好 URL 或规则后自动恢复。"
+                    % (p["name"], p["fail"], p.get("lastError") or "原因未知"),
+                    task_id="price-pause-%s" % hashlib.md5(
+                        (p.get("url") or p["name"]).encode("utf-8")).hexdigest()[:10],
+                    task_type="system")
+                if ok:
+                    pushed += 1
+                else:
+                    perr = e
+        except Exception as e:
+            perr = "推送失败: %s" % e
+    return {"ok": True, "checked": len(items) - len(skipped), "changed": len(changed),
+            "pushed": pushed, "failed": len(failed), "skipped": len(skipped),
+            "paused": len(paused), "error": perr,
+            "changes": [{"name": c["name"], "old": c["old"], "new": c["new"],
+                         "currency": c["currency"], "hit": c.get("hit")} for c in changed]}
+
+
+
 # ---------------------------------------------------------------- 进程内调度线程
 # 之前 expressWatchEvery / weeklyReport 只是配置项，没有任何循环去读它们（形同虚设）。
 # 这里起一个 daemon 线程：快递轮询 + 每周固定时刻推周报，只依赖本进程，不依赖 Hermes 在线。
-_SCHED_STATE = {"lastWeekly": 0, "lastExpress": 0.0, "ticks": 0, "lastError": ""}
+_SCHED_STATE = {"lastWeekly": 0, "lastExpress": 0.0, "lastPrice": 0.0,
+                "ticks": 0, "lastError": ""}
 _SCHED_LOCK = threading.Lock()
 # 生产容器时区是 UTC，但用户口径是北京时间（固定 +8，无夏令时）。
 # 若直接用 time.localtime() 判周几/几点，周报会差 8 小时（周日20:00 实际周一04:00 才触发）。
@@ -1429,6 +1585,14 @@ def _sched_loop():
                         _SCHED_STATE["lastExpress"] = now
                         r = check_express_changes(push=True)
                         print("[sched] express: %s" % json.dumps(r, ensure_ascii=False), flush=True)
+
+                # 价格监控变更播报（首轮只建基线、失败退避；默认关，notify.priceWatch 开）
+                if n.get("priceWatch"):
+                    every = max(300, int(_to_int(n.get("priceWatchEvery"), 1800)))
+                    if now - _SCHED_STATE["lastPrice"] >= every:
+                        _SCHED_STATE["lastPrice"] = now
+                        r = check_price_changes(push=True)
+                        print("[sched] price: %s" % json.dumps(r, ensure_ascii=False), flush=True)
 
                 # 生活周报：到点触发，一周只推一次（用 ISO 周 key 去重，进程重启不重复也不漏）
                 # 注意：Python 的 time.struct_time.tm_wday 已是 0=周一…6=周日，与配置口径一致，不换算
@@ -1598,6 +1762,10 @@ class LifeHandler(BaseHTTPRequestHandler):
             elif parsed.path.startswith("/api/life/express/watch"):
                 self._send(200, check_express_changes(
                     push=(params.get("push", ["0"])[0] in ("1", "true", "yes"))))
+            elif parsed.path.startswith("/api/life/price/watch"):
+                self._send(200, check_price_changes(
+                    push=(params.get("push", ["0"])[0] in ("1", "true", "yes")),
+                    force=(params.get("force", ["0"])[0] in ("1", "true", "yes"))))
             else:
                 self._send(404, {"ok": False, "error": "Not Found"})
         except Exception as e:
@@ -1623,12 +1791,16 @@ class LifeHandler(BaseHTTPRequestHandler):
                 self._send(200, _weekly_report(days=body.get("days") or 7, push=True))
             elif parsed.path.startswith("/api/life/express/check"):
                 self._send(200, check_express_changes(push=bool(body.get("push", True))))
+            elif parsed.path.startswith("/api/life/price/check"):
+                self._send(200, check_price_changes(push=bool(body.get("push", True)),
+                                                    force=bool(body.get("force", False))))
             elif parsed.path.startswith("/api/life/sched"):
                 n = load_config().get("notify", {}) or {}
                 alive = any(t.name == "life-sched" for t in threading.enumerate())
                 self._send(200, {"ok": True, "threadAlive": alive,
                                  "scheduler": n.get("scheduler", True),
                                  "expressWatch": n.get("expressWatch"),
+                                 "priceWatch": n.get("priceWatch"),
                                  "expressWatchEvery": n.get("expressWatchEvery"),
                                  "weeklyReport": n.get("weeklyReport"),
                                  "weeklyReportDay": n.get("weeklyReportDay"),
