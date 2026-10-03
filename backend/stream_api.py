@@ -635,6 +635,56 @@ _tasks_lock = threading.Lock()
 _ql_stream_task = {}           # sessionId -> taskId (ingest 帧增量路由)
 _ql_stream_lock = threading.Lock()
 
+# ==== v4.0.37（OpenMuse 借鉴 ①/③/⑤ 最小子集）====
+# ① 心跳判死：worker 里已有的「进度推送线程」（3s 一拍）顺手刷 st["heartbeatAt"]，
+#    与"内容静默时长"（updatedAt）解耦。旧口径只看 updatedAt，长思考（零输出）只能靠
+#    ZOMBIE_SILENT=1800s 大阈值兜底：既可能误杀慢任务，又要干等 30 分钟才回收真死的僵尸。
+HEARTBEAT_STALE = 120      # 心跳 >120s 没刷新 = 心跳线程已停（不是"在思考"）
+CLEANUP_INTERVAL = 30      # 清理线程一轮秒数（原 300s）：判死由此从 ≤300s 降到 ≤30s
+
+# ③ per-session 串行链：同会话后一个任务等前一个收尾再开工（防两个 Agent 同时跑工具 →
+#    回复交错/串答）。刻意**不用 Lock**：worker 体量大、异常路径多，锁泄漏会把整个会话
+#    永久卡死；轮询版无状态、超时必放行、用户点停止也能立刻放行。
+SESSION_CHAIN_TIMEOUT = 600.0     # 排队上限（秒），超时放行绝不卡死
+
+
+def _await_session_chain(session_id, task, timeout=SESSION_CHAIN_TIMEOUT):
+    """等同会话里"更早的 streaming 任务"收尾；返回等待秒数（0 = 无需等待）。"""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return 0.0
+    try:
+        _my_created = float((task.get("state") or {}).get("createdAt") or 0)
+    except Exception:
+        _my_created = 0.0
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        blocker = None
+        with _tasks_lock:
+            for _tid, _t in _tasks.items():
+                _st = _t.get("state") or {}
+                if _st.get("status") != "streaming":
+                    continue
+                if str(_st.get("sessionId") or "").strip() != sid:
+                    continue
+                try:
+                    _c = float(_st.get("createdAt") or 0)
+                except Exception:
+                    _c = 0.0
+                if _c and _my_created and _c < _my_created:
+                    blocker = _tid
+                    break
+        if blocker is None:
+            return time.time() - t0
+        time.sleep(0.5)
+    return time.time() - t0
+
+
+# ⑤ 启动对账 + 每 60s 补发未送达结果
+_maintain_started = False
+_MAINTAIN_SINCE = time.time()      # 只补发本进程起来之后完成的任务，绝不翻旧账刷屏
+_MAINTAIN_TRIES = {}               # task_id -> {"n": 尝试次数, "ts": 上次尝试}
+
 # ---- v3.4.23 任务中心后台任务登记 ----
 # background_jobs: jobId -> {"jobId","title","detail","status":running|done|error,
 #                            "createdAt","updatedAt","result"}
@@ -766,6 +816,35 @@ def _write_state(task_id, task):
             pass
 
 
+def _persist_state(task_id, st):
+    """只把 st 落盘（原子），**不碰 updatedAt/heartbeatAt 语义**。
+
+    v4.0.37：心跳与"已发布"标记共用。为什么不复用 _write_state：那个函数会把
+    updatedAt 刷成"现在"，而 updatedAt 是"内容静默时长"的真值（进度卡片
+    _stream_progress_detail 与推送闸门都读它）——心跳一旦借它，静默判定全废。
+    """
+    if not task_id:
+        return
+    try:
+        tmp = os.path.join(STREAM_DIR, task_id + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False)
+        os.replace(tmp, os.path.join(STREAM_DIR, task_id + ".json"))
+    except Exception:
+        pass
+
+
+def _touch_state(task_id, task):
+    """v4.0.37 心跳落盘：刷 st["heartbeatAt"] + 文件 mtime（防磁盘侧把"还在跑的长任务"
+    当僵尸删掉），但**不动 updatedAt**（见 _persist_state 注释）。"""
+    try:
+        task["state"]["heartbeatAt"] = time.time()
+    except Exception:
+        return
+    with task["lock"]:
+        _persist_state(task_id, task["state"])
+
+
 def _maybe_push(st):
     """V1.4 微信接力推送：pushEnabled && done && 有内容 && 用户≥30s 未轮询。
     经 Hermes webhook deliver-only 直发微信（零 LLM 成本）。"""
@@ -876,6 +955,14 @@ def _maybe_push_app(st, task_id=None):
                 print("[push] 推送去重异常(放行):", str(_e)[:120], flush=True)
         ok, msg = inbox_api.push(content, task_id=task_id, task_type="reply",
                                  session_id=str(st.get("sessionId") or ""))
+        if ok and task_id:
+            # v4.0.37（借鉴⑤）：落"结果已发布"标记 —— 补发线程（maintain_undelivered）
+            # 据此绝不重复推同一份结果。
+            try:
+                st["finalPushedAt"] = time.time()
+                _persist_state(task_id, st)
+            except Exception:
+                pass
         if ok and task_id and _sig:
             try:
                 _APP_PUSH_DEDUP.setdefault(task_id, {}).update({"sig": _sig, "ts": time.time()})
@@ -1814,6 +1901,22 @@ def _do_qingliao_post(req):
 def _worker(task_id, task):
     st = task["state"]
     last_write = time.time()
+    # ---- v4.0.37（借鉴①）：登记 worker 线程 + 起手先打一次心跳 ----
+    # 清理线程据此区分「真在跑」（线程存活）与「线程已死」（立刻判死，不必等 30 分钟静默）。
+    try:
+        task["thread"] = threading.current_thread()
+        st["heartbeatAt"] = time.time()
+    except Exception:
+        pass
+    # ---- v4.0.37（借鉴③）：per-session 串行链 —— 同会话前序任务没跑完就先排队 ----
+    try:
+        _cw = _await_session_chain(st.get("sessionId"), task)
+        if _cw > 0.5:
+            st["chainWait"] = round(_cw, 1)
+            _write_state(task_id, task)
+            print("[chain] 会话 %s 排队 %.1fs 后开工" % (str(st.get("sessionId"))[:14], _cw), flush=True)
+    except Exception as _ce:
+        print("[chain] 排队异常(放行): %s" % str(_ce)[:120], flush=True)
     try:
         # v3.2.7（方案C）：统一走 Hermes 会话托管。上下文由 Hermes 按 sessionId 管理，
         # 轻聊不再自己拼历史+防复读（复读根因）。_apply_bot 已在方案C移除（bot 模式废除）。
@@ -2160,10 +2263,19 @@ def _hermes_responses_worker(task_id, task, req_body, headers, last_write):
         # ⚠️ 绝不修改 st["content"]：App 轮询是 offset 增量协议，只能追加不能改/删。
         ps = {"last_len": len(st.get("content") or ""), "last_grow": time.time(),
               "last_push": 0, "last_push_len": 0, "pushes": 0}
+        _hb_n = 0
         while not hb_stop.wait(3):
             try:
                 if st.get("status") != "streaming":
                     break          # 已收尾（done/cancelled/error）→ 线程退出，绝不给已结束的任务推"进行中"
+                # v4.0.37（借鉴①）：心跳独立于 content。内存侧每拍刷 heartbeatAt（判死依据），
+                # 每 10 拍（≈30s）落一次盘刷文件 mtime（防磁盘侧把"还在跑的长任务"当僵尸删掉）。
+                # 只写 heartbeatAt，绝不碰 updatedAt —— 那是"内容静默时长"的真值。
+                _hb_n += 1
+                if _hb_n % 10 == 1:
+                    _touch_state(task_id, task)
+                else:
+                    st["heartbeatAt"] = time.time()
                 text = _progress_tick(st, ps)
                 if not text:
                     continue
@@ -3155,19 +3267,39 @@ def cleanup_old_tasks():
     # → 判死，标 error，进入正常回收。30 分钟 = 上游 HTTP timeout=900s（15 分钟）
     # 的 2 倍余量，真任务单请求不会静默超过它；v3.9.28 首版 7200s 太宽，实测期间
     # 又出现一条僵尸挂着灵动岛 100 分钟才等到回收（用户拍板收紧）。
-    ZOMBIE_SILENT = 1800
+    ZOMBIE_SILENT = 1800   # v4.0.37：降级为"旧口径兜底"（无 thread/heartbeat 证据时才用）
     # v3.9.56：已完成（非 streaming）任务文件的保留期，与 TASK_TTL 内存侧 2 小时口径区分开
     STREAM_FILE_TTL = 7200
+    # v4.0.37（借鉴①）：周期 300s → CLEANUP_INTERVAL(30s)。判死要"快"才有意义——真死的
+    # 任务 30s 内回收，App 才不会对着幽灵任务一直转圈。磁盘扫描同步变 30s 一轮
+    # （streams 目录文件数是个位数，读几个小 JSON 的开销可忽略）。
     while True:
-        time.sleep(300)
+        time.sleep(CLEANUP_INTERVAL)
         now = time.time()
         with _tasks_lock:
             for tid in list(_tasks.keys()):
                 t = _tasks[tid]
                 st = t["state"]
-                if st["status"] != "streaming" and now - st["updatedAt"] > TASK_TTL:
+                if st["status"] != "streaming":
+                    if now - st["updatedAt"] > TASK_TTL:
+                        del _tasks[tid]
+                    continue
+                # ---- v4.0.37：streaming 判死三档（先看证据，再退旧口径）----
+                _hb = float(st.get("heartbeatAt") or 0)
+                _th = t.get("thread")
+                _alive = bool(_th is not None and _th.is_alive())
+                _silent = now - float(st.get("updatedAt") or now)
+                if _th is not None and not _alive and _hb and now - _hb > HEARTBEAT_STALE:
+                    # 证据齐全：worker 线程已退出 + 心跳停 → 立刻判死（旧口径要干等 30 分钟）
+                    st["status"] = "error"
+                    st["error"] = "任务中断（worker 线程已退出，心跳停 %.0fs）" % (now - _hb)
+                    print("[zombie] 判死 %s：线程已退出/心跳停 %.0fs" % (tid, now - _hb), flush=True)
                     del _tasks[tid]
-                elif st["status"] == "streaming" and now - st["updatedAt"] > ZOMBIE_SILENT:
+                elif _alive and _hb and now - _hb <= HEARTBEAT_STALE and _silent > ZOMBIE_SILENT:
+                    # 线程活着 + 心跳新鲜 = 真在跑（长思考 / 排队等前序任务）→ 旧口径会误杀，保留
+                    print("[zombie] %s 内容静默 %.0fs 但心跳新鲜（线程存活），保留" % (tid, _silent), flush=True)
+                elif _silent > ZOMBIE_SILENT:
+                    # 旧口径兜底（无 thread/heartbeat 字段的历史任务，或线程活着但心跳也停）
                     st["status"] = "error"
                     st["error"] = "任务静默超时（worker 异常终止）"
                     del _tasks[tid]
@@ -3208,8 +3340,141 @@ def cleanup_old_tasks():
             pass
 
 
+def reconcile_streams_on_startup():
+    """v4.0.37（借鉴⑤）：启动对账。
+
+    内存侧 _tasks 是空的（进程刚起），磁盘上仍标 streaming 的任务 = 被重启/异常切断的
+    孤儿。这里主动落地判死（status=error + 保留已生成内容 + 标 outcome_unknown），
+    **绝不自动重放**——重放会重复干活、重复推送。v3.9.80 只在 App 调 recover 时兜底，
+    本函数把它提前到启动时：App 一进来就是终态，不会再对着幽灵任务转圈。
+    """
+    n = 0
+    try:
+        if os.path.isdir(STREAM_DIR):
+            for fn in list(os.listdir(STREAM_DIR)):
+                if not fn.endswith(".json"):
+                    continue
+                fp = os.path.join(STREAM_DIR, fn)
+                try:
+                    with open(fp, encoding="utf-8") as f:
+                        _st = json.load(f)
+                except Exception:
+                    continue
+                if not isinstance(_st, dict) or _st.get("status") != "streaming":
+                    continue
+                _st["status"] = "error"
+                _st["error"] = "任务中断（服务重启或异常），已保留已生成内容"
+                _st["outcome"] = "outcome_unknown"
+                _st["finishedAt"] = time.time()
+                try:
+                    _tmp = fp + ".tmp"
+                    with open(_tmp, "w", encoding="utf-8") as f:
+                        json.dump(_st, f, ensure_ascii=False)
+                    os.replace(_tmp, fp)
+                    n += 1
+                except Exception:
+                    pass
+    except Exception as e:
+        print("[reconcile] 启动对账异常：%s" % str(e)[:200], flush=True)
+    if n:
+        print("[reconcile] 启动对账：%d 条在途任务判为结果未知（不重放）" % n, flush=True)
+    return n
+
+
+def maintain_undelivered(limit_hours=6):
+    """v4.0.37（借鉴⑤）：每 60s 补发"已完成但结果从没送达 App"的回复。
+
+    补发判据（全满足才补）：
+      ① status == done 且内容 ≥ 4 字（error/半截内容不补，避免把失败当答复推过去）；
+      ② updatedAt ≥ _MAINTAIN_SINCE（本进程启动之后完成的）——老任务一律不碰，防翻旧账刷屏；
+      ③ 6 小时内的（更早的不再打扰）；
+      ④ 没推过（无 finalPushedAt）且 App 没取全（deliveredLen < len(content)）。
+    幂等：推成功后立刻在文件里写 finalPushedAt；固定用 source_task_id=task_id
+    （App 端按该字段不可变去重）；失败 60s 后重试、连续 5 次放弃（防失败风暴）。
+    """
+    if not os.path.isdir(STREAM_DIR):
+        return 0
+    now = time.time()
+    n = 0
+    for fn in list(os.listdir(STREAM_DIR)):
+        if not fn.endswith(".json"):
+            continue
+        fp = os.path.join(STREAM_DIR, fn)
+        tid = fn[:-5]
+        try:
+            with open(fp, encoding="utf-8") as f:
+                _st = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(_st, dict):
+            continue
+        if _st.get("status") != "done":
+            continue
+        content = (_st.get("content") or "").strip()
+        if len(content) < 4:
+            continue
+        if _st.get("finalPushedAt"):
+            continue
+        _ts = float(_st.get("updatedAt") or 0)
+        if _ts < _MAINTAIN_SINCE or now - _ts > limit_hours * 3600:
+            continue
+        try:
+            if int(_st.get("deliveredLen") or 0) >= len(content):
+                continue          # App 已经把内容取全了 → 不算"未送达"
+        except Exception:
+            pass
+        _d = _MAINTAIN_TRIES.get(tid) or {}
+        if _d.get("n", 0) >= 5 or now - float(_d.get("ts") or 0) < 60:
+            continue
+        try:
+            import inbox_api
+            ok, msg = inbox_api.push(content, task_id=tid, task_type="reply",
+                                     session_id=str(_st.get("sessionId") or ""))
+        except Exception as e:
+            ok, msg = False, str(e)[:120]
+        _MAINTAIN_TRIES[tid] = {"n": _d.get("n", 0) + 1, "ts": now}
+        if len(_MAINTAIN_TRIES) > 500:
+            for _k in sorted(_MAINTAIN_TRIES, key=lambda k: _MAINTAIN_TRIES[k].get("ts", 0))[:200]:
+                _MAINTAIN_TRIES.pop(_k, None)
+        print("[maintain] 补发 %s ok=%s %s" % (tid, ok, str(msg)[:80]), flush=True)
+        if ok:
+            _st["finalPushedAt"] = now
+            try:
+                _tmp = fp + ".tmp"
+                with open(_tmp, "w", encoding="utf-8") as f:
+                    json.dump(_st, f, ensure_ascii=False)
+                os.replace(_tmp, fp)
+            except Exception:
+                pass
+            n += 1
+    return n
+
+
+def _start_maintain():
+    """启动 60s 补发线程（模块级只起一次）。"""
+    global _maintain_started
+    if _maintain_started:
+        return
+    _maintain_started = True
+
+    def _loop():
+        while True:
+            time.sleep(60)
+            try:
+                maintain_undelivered()
+            except Exception as e:
+                print("[maintain] 异常：%s" % str(e)[:200], flush=True)
+
+    threading.Thread(target=_loop, daemon=True).start()
+
+
 # 模块级启动清理线程（import 与 __main__ 两条路径都覆盖，防重复）
 _start_cleanup()
+
+# v4.0.37（借鉴⑤）：启动对账 + 补发线程（顺序重要：先对账把孤儿判死落盘，
+# 再起补发线程，否则补发线程可能读到"还在 streaming"的孤儿文件）。
+reconcile_streams_on_startup()
+_start_maintain()
 
 
 if __name__ == "__main__":
