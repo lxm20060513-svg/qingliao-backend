@@ -751,6 +751,31 @@ def bg_update(job_id, status=None, detail=None, result=None):
         return True
 
 
+def _task_plan(st):
+    """v4.0.37：任务中心的**结构化步骤数组**（OpenMuse 借鉴⑧，真缺口：进度只有一行拼出来的字符串）。
+
+    零新增采集——全部复用流式过程中已有的工具埋点：
+      · `toolSpans` = [{n: 英文名, s: 秒}]，按收口（output_item.done）顺序追加，上限 20；
+      · `toolSeq`   = function_call 全量计数（每个 added 事件 +1，不受 20 步裁剪影响）；
+      · 判「还有在跑的步」：`toolSeq > len(toolSpans)` → 取 `lastTool` 追加一条 running。
+    步骤名一律给中文（与 toolNames/toolSpans 同源 `_TOOL_NAME_ZH`，App 不必再维护一份映射表）。
+    老 App 读到不认识的键会忽略；`planSeq` 给 App 判断明细是否被裁（与 toolSteps 同一口径）。
+    """
+    try:
+        spans = [x for x in (st.get("toolSpans") or []) if isinstance(x, dict)]
+        plan = [{"n": _TOOL_NAME_ZH.get(str(x.get("n") or ""), str(x.get("n") or "")),
+                 "st": "done",
+                 "s": x.get("s") if isinstance(x.get("s"), (int, float)) else 0}
+                for x in spans]
+        seq = int(st.get("toolSeq") or 0)
+        if seq > len(spans) and st.get("lastTool"):
+            plan.append({"n": _TOOL_NAME_ZH.get(str(st.get("lastTool")), str(st.get("lastTool"))),
+                         "st": "running"})
+        return plan
+    except Exception:
+        return []
+
+
 def _collect_active_tasks():
     """任务中心数据源：进行中的流式任务 + 登记的后台作业。"""
     now = time.time()
@@ -773,6 +798,10 @@ def _collect_active_tasks():
                     "kind": "stream",
                     "title": (last_user.strip()[:80] or "正在处理"),
                     "detail": _stream_progress_detail(st, now),   # v3.7.1：字数 + 静默时长 + 最近片段
+                    # v4.0.37：结构化步骤数组（任务中心把「跑到哪了」画成步骤清单，而不是只读一行字符串）
+                    # planSeq = 全量步数（toolSeq）；plan 最多 21 条（后端埋点上限 20 done + 1 running）
+                    "plan": _task_plan(st),
+                    "planSeq": int(st.get("toolSeq") or 0),
                     "status": "running",
                     "createdAt": st.get("createdAt", now),
                     "updatedAt": st.get("updatedAt", now),
