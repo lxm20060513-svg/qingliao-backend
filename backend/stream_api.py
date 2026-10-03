@@ -754,23 +754,28 @@ def bg_update(job_id, status=None, detail=None, result=None):
 def _task_plan(st):
     """v4.0.37：任务中心的**结构化步骤数组**（OpenMuse 借鉴⑧，真缺口：进度只有一行拼出来的字符串）。
 
+    只服务**流式任务**（`kind=="stream"` 那条分支；后台作业 bg 没有可枚举的工具步骤，不带此键）。
     零新增采集——全部复用流式过程中已有的工具埋点：
       · `toolSpans` = [{n: 英文名, s: 秒}]，按收口（output_item.done）顺序追加，上限 20；
-      · `toolSeq`   = function_call 全量计数（每个 added 事件 +1，不受 20 步裁剪影响）；
-      · 判「还有在跑的步」：`toolSeq > len(toolSpans)` → 取 `lastTool` 追加一条 running。
+      · `toolSpanStart` / `toolSpanStartSolo` = 未收口工具的**在跑标记**（added 记、done 清）。
+    「在跑」判据必须用**在跑标记**，不能用 `toolSeq > len(toolSpans)` ——后者是
+    「无上限计数 − 被裁到 20 条的明细」，任务跑过 20 步后差值恒 >0，会把**已经收口**的
+    末步永远挂一条假的「正在…」（v4.0.37 双路审查抓到的真实缺陷）。
     步骤名一律给中文（与 toolNames/toolSpans 同源 `_TOOL_NAME_ZH`，App 不必再维护一份映射表）。
     老 App 读到不认识的键会忽略；`planSeq` 给 App 判断明细是否被裁（与 toolSteps 同一口径）。
     """
     try:
         spans = [x for x in (st.get("toolSpans") or []) if isinstance(x, dict)]
-        plan = [{"n": _TOOL_NAME_ZH.get(str(x.get("n") or ""), str(x.get("n") or "")),
-                 "st": "done",
-                 "s": x.get("s") if isinstance(x.get("s"), (int, float)) else 0}
-                for x in spans]
-        seq = int(st.get("toolSeq") or 0)
-        if seq > len(spans) and st.get("lastTool"):
-            plan.append({"n": _TOOL_NAME_ZH.get(str(st.get("lastTool")), str(st.get("lastTool"))),
-                         "st": "running"})
+        plan = []
+        for x in spans:
+            _n = str(x.get("n") or "")
+            _e = {"n": _TOOL_NAME_ZH.get(_n, _n), "st": "done"}
+            if isinstance(x.get("s"), (int, float)):
+                _e["s"] = x.get("s")     # 非数值/缺值**不给键**：App 解析成 nil → 不显示假的 0.0s
+            plan.append(_e)
+        if (st.get("toolSpanStart") or st.get("toolSpanStartSolo")) and st.get("lastTool"):
+            _n = str(st.get("lastTool"))
+            plan.append({"n": _TOOL_NAME_ZH.get(_n, _n), "st": "running"})
         return plan
     except Exception:
         return []
@@ -799,7 +804,7 @@ def _collect_active_tasks():
                     "title": (last_user.strip()[:80] or "正在处理"),
                     "detail": _stream_progress_detail(st, now),   # v3.7.1：字数 + 静默时长 + 最近片段
                     # v4.0.37：结构化步骤数组（任务中心把「跑到哪了」画成步骤清单，而不是只读一行字符串）
-                    # planSeq = 全量步数（toolSeq）；plan 最多 21 条（后端埋点上限 20 done + 1 running）
+                    # planSeq = 全量步数（toolSeq）；plan 最多 21 条（已收口明细上限 20 + 至多 1 条在跑）
                     "plan": _task_plan(st),
                     "planSeq": int(st.get("toolSeq") or 0),
                     "status": "running",
