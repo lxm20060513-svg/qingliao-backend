@@ -17,9 +17,12 @@
 #
 # 仅标准库。
 
+import hashlib
 import json
 import os
+import re
 import threading
+import time
 import urllib.parse
 import urllib.request
 import uuid
@@ -35,6 +38,14 @@ GOALS_PATH = os.path.normpath(GOALS_PATH)
 # 写锁：iOS 端是 FIFO 串行写，服务端同样不能并发覆盖
 _goals_lock = threading.Lock()
 MAX_STEPS = 12          # 别让 AI 拆出 50 步，12 步足够覆盖一个季度
+
+# v4.0.40：待办联动的真值落点（与 iOS 端 TodoStore 同一个文件，GoalTodoBridge 的标记口径）
+TODOS_PATH = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           "..", "data", "todos.json"))
+_todos_lock = threading.Lock()
+
+# v4.0.40：手动「现在开始推进」的单次执行上限（秒）。超时按 error 收尾，不留僵尸 running。
+PUSH_NOW_TIMEOUT = 180
 
 
 def _goals_read():
@@ -118,6 +129,11 @@ def _goal_morning_prompt(goal):
         "你在帮用户推进一个长期目标（每天这个时段提醒一次）。\n\n"
         "目标：%s\n当前进度：%d/%d\n步骤清单：\n%s\n\n"
         "今天要推进的一步：%s\n\n"
+        # v4.0.20（#11）：第一行必须是机器可解析的进度行 —— 任务中心靠它显示
+        # 「后台自主推进到第几步」（此前只有正文，App 只能看到一段散文）
+        "【硬性格式】回复**第一行**必须原样输出下面这一行，不要加任何前缀、不要换行：\n"
+        "【目标推进 %d/%d】\n"
+        "这一行之后才可以写正文。\n\n"
         "请用中文输出今天的推进提醒，三部分：\n"
         "1) 今天推进哪一步 —— 具体到动作，不要只说「继续努力」\n"
         "2) 需要用户本人做什么 —— 最多 1 件事，一句话说清（没有就写「无」）\n"
@@ -129,7 +145,8 @@ def _goal_morning_prompt(goal):
         "需要你做：<一句话>\n"
         "##END##"
     ) % (goal.get("title", ""), done_n, len(steps),
-         _steps_digest(steps) or "  （未拆步骤）", nxt_txt)
+         _steps_digest(steps) or "  （未拆步骤）", nxt_txt,
+         min(done_n + 1, len(steps)) if steps else 0, len(steps))
 
 
 def _goal_evening_prompt(goal):
@@ -138,6 +155,10 @@ def _goal_evening_prompt(goal):
     return (
         "你在帮用户复盘一个长期目标的今天（每天这个时段复盘一次）。\n\n"
         "目标：%s\n当前进度：%d/%d\n步骤清单：\n%s\n\n"
+        # v4.0.20（#11）：同早推进，第一行给机器可解析的进度
+        "【硬性格式】回复**第一行**必须原样输出下面这一行，不要加任何前缀、不要换行：\n"
+        "【目标推进 %d/%d】\n"
+        "这一行之后才可以写正文。\n\n"
         "请用中文输出今晚复盘，三部分：\n"
         "1) 今天做了什么 —— 没推进就直说没推进，不要编\n"
         "2) 还剩多少 —— %d 步\n"
@@ -149,7 +170,8 @@ def _goal_evening_prompt(goal):
         "明日：<一句话>\n"
         "##END##"
     ) % (goal.get("title", ""), done_n, len(steps),
-         _steps_digest(steps) or "  （未拆步骤）", len(steps) - done_n)
+         _steps_digest(steps) or "  （未拆步骤）",
+         done_n, len(steps), len(steps) - done_n)
 
 
 def _auto_split(title):
@@ -178,6 +200,7 @@ def goals_create(payload):
         raw_steps = [{"id": uuid.uuid4().hex, "title": t} for t in _auto_split(title)]
 
     steps = []
+    now = datetime.now().isoformat()
     for s in raw_steps[:MAX_STEPS]:
         st = (s.get("title", "") if isinstance(s, dict) else str(s)).strip()
         if not st:
@@ -188,6 +211,8 @@ def goals_create(payload):
             "todoLinked": bool(s.get("todoLinked")) if isinstance(s, dict) else False,
             "done": False,
             "doneAt": None,
+            # v4.0.40（#5）：首步建目标即视为已开始（后续步骤由 goals_report 打戳）
+            "startedAt": now if not steps else None,
         })
 
     morning_on = bool(payload.get("morningEnabled", True))
@@ -198,7 +223,6 @@ def goals_create(payload):
     eh = min(max(int(payload.get("eveningHour", 21)), 0), 23)
 
     gid = str(payload.get("id") or uuid.uuid4().hex)
-    now = datetime.now().isoformat()
     stub = {"title": title, "steps": steps}
     job_ids, errs = [], []
 
@@ -228,6 +252,12 @@ def goals_create(payload):
         "morningHour": mh, "eveningHour": eh,
         "createdAt": now, "updatedAt": now,
         "lastReport": "", "lastPushedAt": None, "paused": False,
+        # v4.0.40（#3）：建目标时那条会话 —— 后台推进遇到「需要你确认」推回这里，
+        # 而不是落到 App 当前打开的会话（否则用户停在别的会话就永远看不到）
+        "originSessionId": str(payload.get("sessionId") or payload.get("originSessionId") or "").strip(),
+        # v4.0.20（#6）：后台推进留痕（倒序时间线），由 goals_report / Agent 追加。
+        # lastReport 是覆盖写 —— 历史留不下，用户「不知道后台到底跑过几次」。
+        "reports": [],
     }
     with _goals_lock:
         goals = _goals_read()
@@ -254,17 +284,55 @@ def goals_report(payload):
         if not g:
             return 404, {"ok": False, "error": "目标不存在"}
         now = datetime.now().isoformat()
+        # v4.0.37（OpenMuse 借鉴②）：同一份汇报正文重复回写不再往时间线塞重复条目
+        # （cron 重试、早晚两段跑出同样内容都会走到这里），但"上次汇报时间"照常刷新。
+        # 用整串 md5 比对：lastReport 截断到 2000 字，直接比正文对长汇报会漏判。
+        _sig = hashlib.md5(report.encode("utf-8")).hexdigest()
+        _dup = (g.get("lastReportSig") == _sig)
+        g["lastReportSig"] = _sig
         g["lastReport"] = report[:2000]
         g["lastPushedAt"] = now
         g["updatedAt"] = now
+        # v4.0.20（#6）：推进留痕滚动保留最近 50 条（App 详情页倒序渲染时间线）
+        reps = g.setdefault("reports", [])
+        if not _dup:
+            reps.insert(0, {"at": now, "text": report[:1000], "kind": "report"})
+            del reps[50:]
         # 只认后端明确传来的 doneStepIds —— 不从汇报正文里猜哪步做完了
         for sid in (payload.get("doneStepIds") or [])[:MAX_STEPS]:
             for s in g.get("steps", []):
                 if s.get("id") == sid and not s.get("done"):
                     s["done"] = True
                     s["doneAt"] = now
+                    # v4.0.40（#5）：被勾上的步骤若还没开始时间，用「本次推进时刻」兜底打戳
+                    s.setdefault("startedAt", s.get("startedAt") or now)
+        # v4.0.40（#5）：当前待推的那一步第一次被后台列为「今天推这一步」时打开始时间。
+        # 判据用 startedAt 缺失（幂等）—— 已打过的不覆盖，用户看到的时间才是真实起点。
+        for s in g.get("steps", []):
+            if not s.get("done") and not s.get("startedAt"):
+                s["startedAt"] = now
+                break
+        # v4.0.40（#4）：全部步骤完成 → 记 finishedAt（App 据此折叠 + 停 cron）
+        finished = _apply_finish(g, now)
         _goals_write(goals)
-    return 200, {"ok": True}
+    if finished:
+        _sync_todos_finish(gid)
+    return 200, {"ok": True, "finished": bool(finished)}
+
+
+def _apply_finish(g, now):
+    """全部步骤完成时标 finishedAt；返回 True 表示**这次**才刚完成（用于触发待办联动）。
+
+    幂等：已 finished 的目标重复回写不再联动（否则每次汇报都去改 todos.json）。
+    """
+    steps = g.get("steps") or []
+    if not steps or not all(s.get("done") for s in steps):
+        return False
+    if g.get("finishedAt"):
+        return False
+    g["finishedAt"] = now
+    g["stepsFinished"] = True
+    return True
 
 
 def goals_update(payload):
@@ -272,6 +340,7 @@ def goals_update(payload):
     gid = str(payload.get("id") or "")
     if not gid:
         return 400, {"ok": False, "error": "缺少 id"}
+    now = datetime.now().isoformat()
     with _goals_lock:
         goals = _goals_read()
         g = goals.get(gid)
@@ -289,7 +358,6 @@ def goals_update(payload):
             if k in payload:
                 g[k] = min(max(int(payload[k]), 0), 23)
         if "doneStepIds" in payload:
-            now = datetime.now().isoformat()
             want = set(payload.get("doneStepIds") or [])
             for s in g.get("steps", []):
                 if s.get("id") in want and not s.get("done"):
@@ -298,9 +366,16 @@ def goals_update(payload):
                 elif s.get("id") not in want and s.get("done"):
                     s["done"] = False
                     s["doneAt"] = None
-        g["updatedAt"] = datetime.now().isoformat()
+        finished = _apply_finish(g, now)
+        if not finished:
+            # 用户手动取消勾选 → 完成态要收回，否则 App 会一直折叠着它
+            g["finishedAt"] = None
+            g["stepsFinished"] = False
+        g["updatedAt"] = now
         _goals_write(goals)
-    return 200, {"ok": True, "goal": g}
+    if finished:
+        _sync_todos_finish(gid)
+    return 200, {"ok": True, "goal": g, "finished": bool(finished)}
 
 
 def goals_delete(goal_id):
@@ -323,3 +398,257 @@ def goals_list():
     with _goals_lock:
         return sorted(_goals_read().values(),
                       key=lambda g: g.get("updatedAt", ""), reverse=True)
+
+
+# ══════════════════════════════════════════════════════════════
+# v4.0.40 · 手动推进（App 卡片「现在开始推进」胶囊）+ 会话归属 + 待办联动
+#
+# ① 「现在开始推进」：POST /api/life/goal/push_now {id}
+#    复用早推进提示词在后台跑一次 → 解析 ##GOAL_REPORT## → 回写卡片 → 推送
+#    同步在 /api/tasks/bg 登记一条作业 → 任务中心实时可见（用户第②条要求）
+# ② 「需要你确认」：汇报里「需要你做」非空 → 除轻聊投递外再推回建目标时的原会话
+#    （复用 inbox_api.push 的 session_id 字段，App 侧 v4.0.21 已有归属渲染）
+# ③ 全部步骤完成：把 todos.json 里属于本目标的待办全部划掉（用户第④条要求）
+# ④ 每个步骤的开始时间：后台第一次把它列为「今天推这一步」时打戳（用户第⑤条要求）
+# ══════════════════════════════════════════════════════════════
+
+
+def _agent_chat(prompt, timeout=120):
+    """容器内直调 Hermes 跑一次 agent（绕开 9127 的 token 门）。
+
+    走 /v1/chat/completions 的非流式形态：只要 final content，不做流式拆段。
+    ⚠️ 上游超时会抛，调用方必须自己兜住（push_now 里按 error 收尾，不留僵尸 running）。
+    """
+    body = {"model": os.environ.get("QL_GOAL_PUSH_MODEL") or "default",
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "model_options": {"reasoning": {"enabled": False}}}
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        HERMES_API + "/v1/chat/completions", data=data,
+        headers={"Authorization": "Bearer %s" % HERMES_KEY,
+                 "Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = json.loads(resp.read().decode("utf-8", "replace"))
+    # 上游不同版本的正文出口不一样，逐个认（chat/completions 只有 choices）
+    try:
+        return (raw.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+    except Exception:
+        return ""
+
+
+_REPORT_RE = re.compile(r"##GOAL_REPORT##(.*?)##END##", re.S)
+_PROGRESS_RE = re.compile(r"【目标推进\s*(\d+)\s*/\s*(\d+)\s*】")
+
+
+def _parse_push_output(text):
+    """从模型输出里抠出 (正文, 回写段)。回写段缺失 → 正文原样、report 空（不编造）。"""
+    m = _REPORT_RE.search(text or "")
+    if not m:
+        return (text or "").strip(), ""
+    body = (text[:m.start()] + text[m.end():]).strip()
+    lines = [ln.strip() for ln in m.group(1).strip().splitlines() if ln.strip()]
+    report = "\n".join(lines).strip()
+    return body, report
+
+
+def _report_needs_user(report):
+    """汇报里「需要你做」是否真的要用户回应。
+
+    口径：空 / 无 / 无需 / 不用 / 不需要 / - / 0 等一律视为「不需要」，不算待确认 ——
+    否则每天早上都弹一条「请确认」，用户会直接把它当噪声（宁可漏推不滥推）。
+    """
+    if not report:
+        return ""
+    for ln in report.splitlines():
+        if not ln.startswith("需要你做"):
+            continue
+        val = ln.split("：", 1)[-1].split(":", 1)[-1].strip()
+        val = val.strip("。．.！!，,、 ")
+        if not val or val in ("无", "无需", "不用", "不需要", "无。", "-", "—", "0", "无额外"):
+            return ""
+        # v4.0.40：白名单是逐字枚举，「无需额外操作」「没有要你做的事」这类自然说法会漏网
+        # 被当成真需要确认 → 每天早上都弹一条「请确认」，用户直接当噪声。
+        # 口径改为：否定词开头（无/没/不用/不需要/不必）或整句含否定收尾，一律视为「不需要」。
+        if re.match(r"^(无|没|不用|不需要|不必|不必再|暂时不)", val):
+            return ""
+        if re.search(r"(无需额外|没有需要|没有要你|不用回复|无需回复|不需要回复|无额外)", val):
+            return ""
+        return val
+    return ""
+
+
+def _push_to_origin(goal, text, task_type="agent"):
+    """把需要用户回应的一条推回建目标时的原会话。
+
+    老目标没有 originSessionId → 回落推「轻聊主动」固定会话（删不掉、可直接回复）。
+    ⚠️ 只推需要确认的那条：普通推进正文仍走轻聊投递/微信，不重复刷屏。
+    """
+    if not text:
+        return False
+    sid = str(goal.get("originSessionId") or "").strip()
+    fallback = not sid
+    if fallback:
+        sid = "qingliao_proactive"
+    try:
+        import inbox_api
+        ok, _ = inbox_api.push(text, task_id="goal-%s-%d" % (goal.get("id", "")[:8], int(time.time())),
+                               task_type=task_type, session_id=sid)
+        print("[goals] 推原会话 goal=%s sid=%s%s ok=%s"
+              % (goal.get("id", "")[:8], sid, "(回落主动会话)" if fallback else "", ok), flush=True)
+        return bool(ok)
+    except Exception as e:
+        print("[goals] 推原会话失败 goal=%s: %s" % (goal.get("id", "")[:8], e), flush=True)
+        return False
+
+
+def _bg_register(job_id, title, detail=""):
+    """登记后台作业到任务中心。拿不到 stream_api 就静默跳过（任务中心只是可见性，不该拖垮推进）。"""
+    try:
+        import stream_api
+        return stream_api.bg_register(title, job_id=job_id, detail=detail)
+    except Exception as e:
+        print("[goals] bg_register 失败（忽略）: %s" % e, flush=True)
+        return ""
+
+
+def _bg_update(job_id, status=None, detail=None, result=None):
+    try:
+        import stream_api
+        return stream_api.bg_update(job_id, status=status, detail=detail, result=result)
+    except Exception:
+        return False
+
+
+def _run_push_now(gid):
+    """后台线程：跑一次早推进 → 回写 goals.json → 推送。返回 (ok, 结果摘要)。"""
+    with _goals_lock:
+        g = _goals_read().get(gid)
+        if not g:
+            return False, "目标不存在"
+    job_id = "goal-%s" % gid[:16]
+    _bg_register(job_id, "目标推进 · %s" % (g.get("title", "")[:40]), "正在后台推进…")
+    started = time.time()
+    try:
+        text = _agent_chat(_goal_morning_prompt(g), timeout=PUSH_NOW_TIMEOUT)
+    except Exception as e:
+        msg = "推进失败：%s" % str(e)[:150]
+        _bg_update(job_id, status="error", detail="失败", result=msg)
+        return False, msg
+    body, report = _parse_push_output(text)
+    if not body and not report:
+        msg = "推进失败：模型没有返回可解析内容"
+        _bg_update(job_id, status="error", detail="失败", result=msg)
+        return False, msg
+
+    # 🚨 不要在 _goals_lock 里调 goals_report —— 它自己也拿同一把**非重入**锁，会自死锁。
+    # goals_report 自己读-改-写 goals.json，所以额外字段必须在它之后再单独加锁写。
+    goals_report({"goalId": gid, "report": report or body[:2000]})
+    now = datetime.now().isoformat()
+    m = _PROGRESS_RE.search(text or "")
+    with _goals_lock:
+        goals = _goals_read()
+        cur = goals.get(gid)
+        if not cur:
+            _goals_write(goals)
+            msg = "推进中途目标被删除，结果丢弃"
+            _bg_update(job_id, status="error", detail="已删除", result=msg)
+            return False, msg
+        cur["manualPushAt"] = now
+        cur["updatedAt"] = now
+        if m:
+            cur["lastProgressText"] = "【目标推进 %s/%s】" % (m.group(1), m.group(2))
+        _goals_write(goals)
+        finished = bool(cur.get("finishedAt"))
+
+    need = _report_needs_user(report)
+    summary = body.strip()
+    if need:
+        summary = (summary + "\n\n需要你做：%s" % need).strip()
+    # ① 需要用户回应 → 推回原会话（用户第③条要求）
+    _push_to_origin(g, summary if need else body.strip())
+    if finished:
+        # 目标在这次推进中被勾完全部步骤 → 明确告诉用户「已完成、待办已划掉」
+        _push_to_origin(g, "✅ 目标「%s」全部步骤已完成，相关待办已自动划掉。"
+                          % g.get("title", ""), task_type="agent")
+    _bg_update(job_id, status="done", detail="完成", result=summary[:300])
+    print("[goals] push_now 完成 goal=%s 用时=%.1fs 需要用户=%s"
+          % (gid[:8], time.time() - started, bool(need)), flush=True)
+    return True, summary
+
+
+def goals_push_now(payload):
+    """POST /api/life/goal/push_now —— App 卡片「现在开始推进」。
+
+    立即返回（后台线程跑），任务中心随后可见进度。返回 (code, body)。
+    """
+    gid = str(payload.get("id") or "").strip()
+    if not gid:
+        return 400, {"ok": False, "error": "缺少 id"}
+    with _goals_lock:
+        g = _goals_read().get(gid)
+    if not g:
+        return 404, {"ok": False, "error": "目标不存在"}
+    if (g.get("steps") or []) and all(s.get("done") for s in g["steps"]):
+        return 200, {"ok": True, "skipped": True, "reason": "目标已完成，无需推进"}
+    t = threading.Thread(target=_run_push_now, args=(gid,), daemon=True)
+    t.start()
+    return 200, {"ok": True, "started": True, "jobId": "goal-%s" % gid[:16]}
+
+
+def _todos_read():
+    if not os.path.exists(TODOS_PATH):
+        return []
+    try:
+        with open(TODOS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _todos_write(items):
+    d = os.path.dirname(TODOS_PATH)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    tmp = TODOS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False)
+    os.replace(tmp, TODOS_PATH)
+
+
+def _sync_todos_finish(gid):
+    """目标全部步骤完成 → 把待办里属于它的条目全部划掉（用户第④条要求）。
+
+    匹配口径与 iOS 端 GoalTodoBridge 完全一致：标题前缀 `［目标·<目标标题>］`。
+    🚨 整个函数 try/except：写用户数据失败绝不能让 goals.json 的回写跟着炸。
+    🚨 只置 done/doneAt，不删条目 —— 用户要能看到「它曾经是个待办、现在做完了」。
+    """
+    try:
+        with _goals_lock:
+            g = _goals_read().get(gid)
+        if not g:
+            return 0
+        marker = "［目标·%s］" % g.get("title", "")
+        now = datetime.now().isoformat()
+        n = 0
+        with _todos_lock:
+            items = _todos_read()
+            changed = False
+            for t in items:
+                if not isinstance(t, dict):
+                    continue
+                if str(t.get("content") or "").startswith(marker) and not t.get("done"):
+                    t["done"] = True
+                    t["doneAt"] = now
+                    t["updatedAt"] = now
+                    n += 1
+                    changed = True
+            if changed:
+                _todos_write(items)
+        print("[goals] 目标完成联动待办 goal=%s 划掉 %d 条" % (gid[:8], n), flush=True)
+        return n
+    except Exception as e:
+        print("[goals] 待办联动失败 goal=%s: %s" % (gid[:8], e), flush=True)
+        return 0
+

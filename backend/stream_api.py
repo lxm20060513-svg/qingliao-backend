@@ -697,6 +697,50 @@ _background_jobs = {}
 _background_jobs_lock = threading.Lock()
 _BGJOB_TTL = 2 * 3600        # 完成作业保留 2h 供查看
 _BGJOB_KEEP = 50             # 完成作业最多保留条数，防无限膨胀
+# v4.0.40（#2 任务中心显示后台推进任务）：作业原本只在内存，容器一重启
+# 「正在推进」就凭空消失。落盘 data/bgjobs.json，原子写 + 启动回填。
+_BGJOBS_PATH = os.path.normpath(os.path.join(DATA_DIR, "bgjobs.json"))
+_BGJOB_LOADED = False
+
+
+def _bgjobs_load():
+    """把落盘的后台作业回填进内存（幂等；坏文件当空，不阻断服务启动）。"""
+    global _BGJOB_LOADED
+    if _BGJOB_LOADED:
+        return
+    _BGJOB_LOADED = True
+    try:
+        with open(_BGJOBS_PATH, "r", encoding="utf-8") as f:
+            items = json.load(f)
+        if not isinstance(items, list):
+            return
+        now = time.time()
+        with _background_jobs_lock:
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                jid = str(it.get("jobId") or "")
+                if not jid or now - float(it.get("updatedAt") or 0) > _BGJOB_TTL:
+                    continue          # 超 TTL 的收尾作业不回填，避免开机就一屏僵尸
+                _background_jobs[jid] = it
+    except Exception:
+        pass
+
+
+def _bgjobs_flush():
+    """把后台作业原子写回磁盘（只写 running + TTL 内的收尾作业）。"""
+    try:
+        now = time.time()
+        with _background_jobs_lock:
+            keep = [j for j in _background_jobs.values()
+                    if now - float(j.get("updatedAt") or 0) <= _BGJOB_TTL]
+        os.makedirs(os.path.dirname(_BGJOBS_PATH), exist_ok=True)
+        tmp = _BGJOBS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(keep, f, ensure_ascii=False)
+        os.replace(tmp, _BGJOBS_PATH)
+    except Exception:
+        pass
 
 
 def _bgjob_register(job_id, title, detail=""):
@@ -714,6 +758,7 @@ def _bgjob_register(job_id, title, detail=""):
         if len(done_jobs) > _BGJOB_KEEP:
             for k, _ in sorted(done_jobs, key=lambda kv: kv[1])[:len(done_jobs) - _BGJOB_KEEP]:
                 _background_jobs.pop(k, None)
+    _bgjobs_flush()   # v4.0.40（#2）：登记即落盘，重启后任务中心仍能看到
 
 
 def _bgjob_finish(job_id, ok=True, result=""):
@@ -725,6 +770,7 @@ def _bgjob_finish(job_id, ok=True, result=""):
         job["updatedAt"] = time.time()
         if result:
             job["result"] = str(result)[:2000]
+    _bgjobs_flush()   # v4.0.40（#2）：收尾状态同样落盘，否则「已完成」活不过一次重启
 
 
 def bg_register(title, job_id=None, detail=""):
@@ -737,18 +783,21 @@ def bg_register(title, job_id=None, detail=""):
 
 def bg_update(job_id, status=None, detail=None, result=None):
     """v3.4.25：更新后台作业状态/详情。running→done/error 或刷新 detail。"""
+    ok = False
     with _background_jobs_lock:
         job = _background_jobs.get(job_id)
-        if not job:
-            return False
-        if detail is not None:
-            job["detail"] = str(detail)[:200]
-        if result is not None:
-            job["result"] = str(result)[:2000]
-        if status in ("done", "error"):
-            job["status"] = status
-        job["updatedAt"] = time.time()
-        return True
+        if job:
+            if detail is not None:
+                job["detail"] = str(detail)[:200]
+            if result is not None:
+                job["result"] = str(result)[:2000]
+            if status in ("done", "error"):
+                job["status"] = status
+            job["updatedAt"] = time.time()
+            ok = True
+    if ok:
+        _bgjobs_flush()   # v4.0.40（#2）：更新也落盘
+    return ok
 
 
 def _task_plan(st):
@@ -783,6 +832,7 @@ def _task_plan(st):
 
 def _collect_active_tasks():
     """任务中心数据源：进行中的流式任务 + 登记的后台作业。"""
+    _bgjobs_load()      # v4.0.40（#2）：首次调用时把落盘作业回填进内存
     now = time.time()
     tasks = []
     with _tasks_lock:

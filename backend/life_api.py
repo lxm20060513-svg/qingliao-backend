@@ -1134,7 +1134,7 @@ def _fetch_article(url, title="", fresh=False):
 # ---------------------------------------------------------------- 待办 / 记账 / 周报
 def _notes_file():
     """便签文件（App 可用 X-Notes-Dir 改目录，周报侧只读默认位——取不到就当 0 条）。"""
-    return os.path.join(os.environ.get("QL_DATA_DIR", "/volume1/docker/hermes/微信文件/轻聊web/data"), "notes.json")
+    return os.path.join(os.environ.get("QL_DATA_DIR", "/data"), "notes.json")
 
 
 def _collect_todo():
@@ -1199,6 +1199,186 @@ def _collect_expense():
             "income": income, "net": round(income - spend, 2), "top": top,
             "recent": week[-MAX_ITEMS:],
             "error": "" if items else "还没有记账条目"}
+
+
+# ------------------------------------------------- v4.0.x 记账周报（App records.json）
+# App 的记账数据由 iOS 端 RecordStore 经 /api/files/pin_write 写到 QL_DATA_DIR/records.json，
+# **不是** life_config.expense.items（那个段 App 从不写、一直空置——所以旧周报的「记账」段
+# 永远是 ¥0）。周报在这里读 records.json 做周汇总：总收入/总支出/结余、支出分类 Top、
+# 与上周对比、异常/超支提醒；无数据时给友好空态，而不是「支出 ¥0」的垃圾行。
+#
+# 周界一律按**北京时间**算（CST=UTC+8，容器是 UTC，与调度线程同口径）；只算 unit=="元"
+# 的条目（度/kWh 是读数不是钱），收入按 kind=="income" 单列、绝不并进支出。
+RECORDS_NAME = "records.json"
+
+
+def _records_path():
+    """App 记账快照路径（与 notes/memos/pins 同目录 = QL_DATA_DIR）。"""
+    return os.path.join(os.environ.get("QL_DATA_DIR", "/data"), RECORDS_NAME)
+
+
+def _load_records():
+    """读 App 记账快照。文件缺失/损坏一律当空表（周报给空态，不抛）。"""
+    try:
+        with open(_records_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _rec_ts(v):
+    """RecordItem.createdAt/updatedAt（App 用 .iso8601 → '2026-10-02T01:23:45Z'）→ epoch。
+
+    兼容 'Z' / '+00:00' / 小数秒 / 纯数字；解析失败返回 None（该条不进任何周）。
+    """
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = _s(v, 40)
+    if not s:
+        return None
+    try:
+        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d.timestamp()
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return time.mktime(time.strptime(s[:19], fmt)) - CST_OFFSET
+        except Exception:
+            continue
+    return None
+
+
+def _rec_amount(r):
+    """金额（只认数；NaN/越界当无）。返回 float 或 None。"""
+    try:
+        a = float(r.get("amount"))
+    except Exception:
+        return None
+    if a != a or abs(a) > 1e9:
+        return None
+    return a
+
+
+def _cst_monday(now_ts):
+    """now_ts 所在「北京时间自然周」周一 00:00（CST）对应的 epoch。"""
+    shifted = now_ts + CST_OFFSET
+    days = int(shifted // 86400)
+    wd = time.gmtime(shifted).tm_wday          # 0=周一
+    return days * 86400 - wd * 86400 - CST_OFFSET
+
+
+def _week_of_records(items, a, b):
+    """[a, b) 内的记账汇总：收入/支出/分类/笔数/最大一笔。纯函数。"""
+    inc = exp = 0.0
+    by_cat = {}
+    n = 0
+    biggest = None
+    for r in items:
+        if not isinstance(r, dict):
+            continue
+        if _s(r.get("unit"), 8) != "元":
+            continue                            # 度/kWh 是读数不是钱，绝不进汇总
+        amt = _rec_amount(r)
+        if amt is None:
+            continue
+        ts = _rec_ts(r.get("createdAt"))
+        if ts is None or not (a <= ts < b):
+            continue
+        n += 1
+        if _s(r.get("kind"), 12) == "income":
+            inc += amt
+        else:
+            exp += amt
+            cat = _s(r.get("category"), 24) or "未分类"
+            by_cat[cat] = by_cat.get(cat, 0.0) + amt
+            if biggest is None or amt > biggest[1]:
+                biggest = (_s(r.get("title"), 40) or "一笔支出", amt)
+    return {"income": round(inc, 2), "expense": round(exp, 2), "count": n,
+            "byCat": sorted(by_cat.items(), key=lambda kv: -kv[1]),
+            "biggest": biggest}
+
+
+def _summarize_records(items, now_ts=None):
+    """纯函数：records 列表 → 本周/上周汇总 + 周对比 + 异常提醒（可单测、不碰文件）。"""
+    now_ts = now_ts if now_ts is not None else time.time()
+    this_start = _cst_monday(now_ts)
+    cur = _week_of_records(items, this_start, this_start + 7 * 86400)
+    prev = _week_of_records(items, this_start - 7 * 86400, this_start)
+    cur["net"] = round(cur["income"] - cur["expense"], 2)
+
+    # 异常 / 超支提醒。服务端拿不到 App 的「月预算」（存在端侧 UserDefaults），
+    # 故口径为「相对上周」与「绝对大额」，不臆造预算概念。
+    alerts = []
+    d = round(cur["expense"] - prev["expense"], 2)
+    if prev["expense"] > 0 and d >= 100 and cur["expense"] >= prev["expense"] * 1.5:
+        alerts.append("支出比上周多 ¥%s（+%d%%）"
+                      % (_money(d), round(d * 100.0 / prev["expense"])))
+    if cur["income"] > 0 and cur["expense"] > cur["income"]:
+        alerts.append("本周入不敷出，超支 ¥%s" % _money(cur["expense"] - cur["income"]))
+    if cur["biggest"] and cur["biggest"][1] >= 500:
+        alerts.append("最大一笔「%s」¥%s" % (cur["biggest"][0], _money(cur["biggest"][1])))
+    if cur["byCat"] and cur["expense"] > 0:
+        cat, v = cur["byCat"][0]
+        if v >= 300 and v >= cur["expense"] * 0.6:
+            alerts.append("「%s」占本周支出 %d%%" % (cat, round(v * 100.0 / cur["expense"])))
+
+    return {"hasData": cur["count"] > 0 or prev["count"] > 0,
+            "weekCount": cur["count"], "income": cur["income"], "expense": cur["expense"],
+            "net": cur["net"], "top": cur["byCat"][:3], "biggest": cur["biggest"],
+            "prevIncome": prev["income"], "prevExpense": prev["expense"],
+            "diffExpense": d, "alerts": alerts,
+            "startTs": this_start, "endTs": this_start + 7 * 86400}
+
+
+def _money(v):
+    """金额文案：整数不带小数，非整留两位（周报可读性）。"""
+    try:
+        v = float(v)
+    except Exception:
+        return "0"
+    return str(int(round(v))) if abs(v - round(v)) < 0.005 else ("%.2f" % v)
+
+
+def _week_label(ts):
+    return time.strftime("%m-%d", time.gmtime(ts + CST_OFFSET))
+
+
+def _records_expense_block(legacy=None, now_ts=None):
+    """周报「记账」段。返回 (lines, summary, has_data)。
+
+    records.json 无数据 → 友好空态；仅当旧 life_config.expense.items 本周有数据时才回退
+    （App 从不写那个段，留这条只为不静默丢弃历史数据）。
+    """
+    s = _summarize_records(_load_records(), now_ts)
+    head = "💰 记账周报（%s ~ %s）" % (_week_label(s["startTs"]),
+                                      _week_label(s["endTs"] - 86400))
+    if not s["hasData"]:
+        lw = legacy or {}
+        if lw.get("weekCount"):
+            return ([head, "  · 本周支出 ¥%s ｜ 收入 ¥%s（旧账本口径）"
+                     % (_money(lw.get("spend")), _money(lw.get("income")))],
+                    {"legacy": True, "hasData": True}, True)
+        return ([head, "  · 本周还没记账，随手记一笔就能在这里看到收支啦～"], s, False)
+
+    lines = [head, "  · 收入 ¥%s ｜ 支出 ¥%s ｜ 结余 ¥%s"
+             % (_money(s["income"]), _money(s["expense"]), _money(s["net"]))]
+    if s["top"]:
+        lines.append("  · 支出 Top：" + "、".join("%s ¥%s" % (c, _money(v)) for c, v in s["top"]))
+    if s["prevExpense"] > 0 or s["prevIncome"] > 0:
+        arrow = "↑" if s["diffExpense"] > 0 else ("↓" if s["diffExpense"] < 0 else "→")
+        pct = ("%d%%" % round(abs(s["diffExpense"]) * 100.0 / s["prevExpense"])) \
+            if s["prevExpense"] > 0 else "—"
+        lines.append("  · 对比上周：支出 %s ¥%s（%s）"
+                     % (arrow, _money(abs(s["diffExpense"])), pct))
+    else:
+        lines.append("  · 上周暂无记录，本期无可比")
+    for a in s["alerts"]:
+        lines.append("  ⚠️ " + a)
+    return (lines, s, True)
 
 
 def _expense_op(body):
@@ -1288,17 +1468,22 @@ def _weekly_report(days=7, push=False):
     for t in [x for x in todo.get("items", []) if x["state"] == "open"][:5]:
         lines.append("  · %s" % t["text"][:40])
 
-    lines.append("💰 本周支出 ¥%s（收入 ¥%s，%d 笔）" % (
-        exp.get("spend", 0), exp.get("income", 0), exp.get("weekCount", 0)))
-    for n, v in (exp.get("top") or [])[:3]:
-        lines.append("  · %s ¥%s" % (n, v))
+    # v4.0.x：记账段改用 App 真实数据源 records.json（旧的 life_config.expense 仅作回退）
+    acc_lines, acc, acc_has = _records_expense_block(legacy=exp)
+    lines.extend(acc_lines)
 
     text = chr(10).join(lines)
     allowed = bool(load_config().get("notify", {}).get("weeklyReport", True))
+    # v4.0.x 空态护栏：快递/股票/待办/记账**全空**时不推 ——
+    # 避免每周推一条只有空壳的垃圾周报（「支出 ¥0」那种，正是本次要修的缺口）。
+    has_content = bool(pkgs) or any(r.get("ok") for r in rows) \
+        or bool(todo.get("ok")) or bool(acc_has)
     pushed, perr = False, ""
     if push:
         if not allowed:
             perr = "notify.weeklyReport=false，已跳过推送"
+        elif not has_content:
+            perr = "各板块均无内容，已跳过推送（避免空壳周报）"
         else:
             try:
                 import inbox_api
@@ -1309,13 +1494,14 @@ def _weekly_report(days=7, push=False):
                 perr = "推送失败: %s" % e
     return {"ok": True, "days": days, "generatedAt": int(time.time()),
             "text": text, "pushed": pushed, "pushError": perr,
+            "account": acc,
             "parts": {"express": exp_c.get("ok", False), "todo": todo.get("ok", False),
-                      "expense": exp.get("ok", False),
+                      "expense": bool(acc_has),
                       "stock": any(r.get("ok") for r in rows)}}
 
 
 # ---------------------------------------------------------------- 快递状态变化订阅
-_WATCH_FILE = os.path.join(os.environ.get("QL_DATA_DIR", "/volume1/docker/hermes/微信文件/轻聊web/data"), "express_watch.json")
+_WATCH_FILE = os.path.join(os.environ.get("QL_DATA_DIR", "/data"), "express_watch.json")
 _WATCH_LOCK = threading.Lock()
 
 
@@ -2384,6 +2570,14 @@ class LifeHandler(BaseHTTPRequestHandler):
                 # v3.6.2：单条资讯正文（后端抓取 + 模型整理，按 URL 缓存）
                 self._send(200, _fetch_article(body.get("url"), body.get("title"),
                                                fresh=bool(body.get("fresh"))))
+            elif parsed.path.startswith("/api/life/goal/push_now"):
+                # v4.0.40：App 卡片「现在开始推进」—— 必须排在下面两个分支之前
+                # （startswith 前缀匹配，push_now 与 report/create 不同名，安全）
+                if goal_module is None:
+                    self._send(501, {"ok": False, "error": "goal 模块未部署"})
+                else:
+                    code, obj = goal_module.goals_push_now(body)
+                    self._send(code, obj)
             elif parsed.path.startswith("/api/life/goal/report"):
                 if goal_module is None:
                     self._send(501, {"ok": False, "error": "goal 模块未部署"})
@@ -2460,3 +2654,4 @@ if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 9136
     print("life_api v2 配置: %s" % CONFIG_PATH)
     ThreadingHTTPServer(("127.0.0.1", port), LifeHandler).serve_forever()
+
