@@ -117,7 +117,7 @@ def _archive(entries, reason=None):
         print("[inbox] 归档失败（不影响主流程）:", str(e)[:120], flush=True)
 
 
-def push(text, task_id=None, task_type="reply", want_id=False, session_id=None):
+def push(text, task_id=None, task_type="reply", want_id=False, session_id=None, goal_report=None):
     """Hermes 事件方调用：推送一条消息到轻聊 App 收件箱。
     v3.4.8：task_id 为该回复的流式任务 id（source_task_id），App 端用作不可变去重标识。
     v3.4.x：task_type 区分来源（reply/cron/system）→ App 端任务中心分类。
@@ -138,13 +138,28 @@ def push(text, task_id=None, task_type="reply", want_id=False, session_id=None):
     mid = uuid.uuid4().hex[:12]
     with _lock:
         items = _load()
-        items.append({"id": mid, "text": text,
-                      "ts": time.time(), "status": "pending",
-                      "source_task_id": task_id, "task_type": task_type,
-                      "session_id": (session_id or "").strip() or None})
-        if len(items) > QUEUE_LIMIT:
-            items = items[-QUEUE_LIMIT:]
-        _save(items)
+        # v4.0.44 审查修复：question 卡按 task_id **幂等复用**。
+        # 目标追问卡的 task_id 是「目标+当前步序号」（稳定），cron 每轮重推时若同一步的卡还挂着，
+        # 必须复用同一张：否则同一步出两张卡（App 按 source_task_id 去重后只显示一张，
+        # 而 watcher 盯的是另一张的 id → 用户答了也落不回目标时间线）。
+        _reused = False
+        if task_id and task_type == "question":
+            for it in items:
+                if it.get("source_task_id") == task_id and it.get("status") in ("pending", "sending"):
+                    mid = it.get("id") or mid
+                    it["ts"] = time.time()      # 刷新滞留计时（用户还没答，别被 STALE_TTL 清掉）
+                    _save(items)
+                    _reused = True
+                    print('[inbox] question 卡幂等复用 id=%s task=%s' % (mid, task_id), flush=True)
+                    break
+        if not _reused:
+            items.append({"id": mid, "text": text,
+                          "ts": time.time(), "status": "pending",
+                          "source_task_id": task_id, "task_type": task_type,
+                          "session_id": (session_id or "").strip() or None})
+            if len(items) > QUEUE_LIMIT:
+                items = items[-QUEUE_LIMIT:]
+            _save(items)
     # v3.9.71 delivery: cron/system 类投递详情同步写入固定会话「轻聊投递」；
     # reply/progress 是正常 AI 回复链路，刻意不进（用户要求）
     if task_type in ("cron", "system"):
@@ -163,6 +178,31 @@ def push(text, task_id=None, task_type="reply", want_id=False, session_id=None):
             sessions_api.append_proactive_message(text, task_type=task_type)
         except Exception as e:
             print('[proactive] 主动会话写入异常: %s' % e, flush=True)
+    # v4.0.44：长期目标报告回写 —— Hermes 侧 cron 桥（ql_task_push.py）把 cron 输出一并带过来，
+    # 同进程直调 goal_module（不新增路由、不用再穿 nginx）；失败如实回报 goal_ok=False，
+    # 桥据此**不推进游标** → 下一分钟重试，汇报不会静默丢。
+    goal_ok, goal_err = True, ""
+    if isinstance(goal_report, dict) and goal_report.get("jobId"):
+        try:
+            import goal_module
+            code, res = goal_module.goals_report_from_cron(
+                goal_report.get("jobId"), goal_report.get("report") or text,
+                goal_report.get("doneSteps") or [])
+            goal_ok = bool(res.get("ok")) or bool(res.get("skipped"))
+            if not goal_ok:
+                goal_err = str(res.get("error") or code)[:120]
+            print('[inbox] goal 回写 job=%s ok=%s %s' % (goal_report.get("jobId"), goal_ok, res), flush=True)
+        except Exception as e:
+            goal_ok, goal_err = False, str(e)[:120]
+            print('[inbox] goal 回写异常: %s' % e, flush=True)
+    # v4.0.44 审查修复：goal_report 分支必须**排在 want_id 之前**。
+    # 否则「want_id=True + goal_report」的调用方拿到的是纯 mid 字符串 → HTTP 层 isinstance(msg, dict) 为假
+    # → goal_ok 恒为默认 True → 桥误判「回写成功」推进游标，静默丢汇报（开关×路径型 100% 失真）。
+    if goal_report:
+        out = {"goal_ok": goal_ok, "goal_error": goal_err}
+        if want_id:
+            out["mid"] = mid
+        return True, out
     if want_id:
         return True, mid
     return True, "已推送"
@@ -461,10 +501,19 @@ class Handler(BaseHTTPRequestHandler):
                 want_id = bool(d.get("want_id"))   # v3.9.83：追问链路要 id；老调用方不传 → 响应体不变
                 ok, msg = push(d.get("text", ""), d.get("source_task_id"),
                                d.get("task_type", "reply"), want_id=want_id,
-                               session_id=d.get("session_id"))
+                               session_id=d.get("session_id"),
+                               goal_report=d.get("goal_report"))
+                goal_ok, goal_err = True, ""
+                if isinstance(msg, dict):      # v4.0.44：带 goal_report 时 push 回的是回写结果（可能同时带 mid）
+                    goal_ok = bool(msg.get("goal_ok", True))
+                    goal_err = str(msg.get("goal_error") or "")
+                    msg = msg.get("mid") or "已推送"
                 resp = {"ok": ok, "message": msg}
                 if ok and want_id:
                     resp["id"] = msg
+                if d.get("goal_report"):
+                    resp["goal_ok"] = goal_ok
+                    resp["goal_error"] = goal_err
                 self._send(200, resp)
             except Exception as e:
                 self._send(400, {"ok": False, "error": str(e)[:200]})
@@ -473,3 +522,4 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *a):
         pass
+
