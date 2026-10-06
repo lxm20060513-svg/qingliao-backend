@@ -46,6 +46,8 @@ ROUTE_TABLE = {
     # /api/agent/usage、/api/agent/tts 这几条更长前缀仍优先命中，不受影响。
     "/api/agent/proactive": ("proactive_agent", "Handler"),
     "/api/agent/tool": ("stream_api",  "StreamHandler"),
+    # v4.0.52 待做池 8：链接预览抓取（借 /api/agent 前缀 → nginx/lucky/relay 零改动）
+    "/api/agent/linkpreview": ("linkpreview_api", "Handler"),
     "/api/automations": ("automation_api", "Handler"),
     "/api/push":      ("push_api",     "Handler"),
     "/api/local":     ("local_api",    "Handler"),
