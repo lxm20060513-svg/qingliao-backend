@@ -830,6 +830,134 @@ def _task_plan(st):
         return []
 
 
+# ── v4.0.79（P1 首屏结论条）：「昨夜任务」只读聚合（App: GET /api/agent/tasks/night）──────────
+# 数据源 = Hermes 定时任务的运行留档（<hermes-data>/cron/jobs.json + cron/output/<job_id>/<ts>.md）。
+#   为什么不用后端作业台账 data/bgjobs.json：只留 2 小时，跨夜必丢。
+#   为什么不用 cron/executions.db：按行数滚动（分钟级投递/看门狗把表刷满 1000 行）→ 只覆盖最近几小时。
+#   cron/output 每个作业各自滚动留 50 篇运行留档，一夜（本地 20:00 → 次日 09:00）稳稳够；
+#   留档首行自带 `(FAILED)` 标记 → 「失败 N」不用另立口径。
+# 只读：不写文件、不加写接口；任何读取失败一律降级为 0 条（App 那格走空态「无任务」，不报错）。
+import datetime  # noqa: E402  （本文件此前只用 time，聚合口要按北京时区算「昨夜」）
+
+NIGHT_TZ = datetime.timezone(datetime.timedelta(hours=8))   # 定时任务与窗口都按北京时间
+NIGHT_START_HOUR, NIGHT_END_HOUR = 20, 9                    # 昨夜 20:00 → 今晨 09:00
+NIGHT_ITEMS_MAX = 50
+CRON_DIR = os.environ.get("QL_HERMES_CRON_DIR") or os.path.join(
+    os.environ.get("QL_HERMES_DATA_DIR")
+    or os.path.join(os.environ.get("QL_HERMES_ROOT_DIR", "/volume1/docker/hermes"), "hermes-data"),
+    "cron")
+
+
+def _night_window(now=None):
+    """「昨夜窗口」：昨天 20:00 → 今天 09:00；今天 09:00 之前提前结束于此刻（不出现倒挂窗口）。"""
+    now = time.time() if now is None else float(now)
+    cur = datetime.datetime.fromtimestamp(now, NIGHT_TZ)
+    start = datetime.datetime.combine(cur.date() - datetime.timedelta(days=1),
+                                      datetime.time(NIGHT_START_HOUR),
+                                      tzinfo=NIGHT_TZ).timestamp()
+    cap = datetime.datetime.combine(cur.date(), datetime.time(NIGHT_END_HOUR),
+                                    tzinfo=NIGHT_TZ).timestamp()
+    return start, (cap if now >= cap else now)
+
+
+def _night_is_infra(sched):
+    """分钟级（<5 分钟）轮询属于基础设施（推送投递/看门狗），不是用户眼里的「任务」。"""
+    if not isinstance(sched, dict):
+        return False
+    if sched.get("kind") == "interval":
+        try:
+            return 0 < int(sched.get("minutes") or 0) < 5
+        except (TypeError, ValueError):
+            return False
+    expr = str(sched.get("expr") or "").strip()
+    if expr:
+        minute = expr.split()[0]
+        return minute == "*" or minute in ("*/1", "*/2", "*/3", "*/4")
+    return False
+
+
+def _night_job_titles():
+    """job_id → (作业名, 是否基础设施)。读不到 jobs.json 时返回 {}（标题退回留档首行）。"""
+    out = {}
+    try:
+        with open(os.path.join(CRON_DIR, "jobs.json"), encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return out
+    jobs = raw.get("jobs") if isinstance(raw, dict) else raw
+    if isinstance(jobs, dict):
+        jobs = list(jobs.values())
+    for j in jobs or []:
+        if isinstance(j, dict) and j.get("id"):
+            out[str(j["id"])] = (str(j.get("name") or "").strip(), _night_is_infra(j.get("schedule")))
+    return out
+
+
+def _night_runs_scan(start, end):
+    """扫 cron/output/<job_id>/*.md，mtime 落在窗口内的运行留档 → [{id,title,status,at}]（新到旧）。"""
+    runs = []
+    titles = _night_job_titles()
+    root = os.path.join(CRON_DIR, "output")
+    try:
+        job_dirs = os.listdir(root)
+    except Exception:
+        return runs
+    for jid in job_dirs:
+        name, infra = titles.get(jid, ("", False))
+        if infra or jid.startswith("."):
+            continue
+        d = os.path.join(root, jid)
+        try:
+            files = os.listdir(d)
+        except Exception:
+            continue
+        for fn in files:
+            if not fn.endswith(".md"):
+                continue
+            p = os.path.join(d, fn)
+            try:
+                mt = os.path.getmtime(p)
+            except OSError:
+                continue
+            if mt < start or mt > end:
+                continue
+            head = ""
+            try:
+                with open(p, encoding="utf-8", errors="replace") as f:
+                    head = f.read(400)
+            except Exception:
+                pass
+            first = head.split("\n", 1)[0].strip()
+            failed = "(FAILED)" in first.upper()
+            title = first.replace("# Cron Job:", "", 1).replace("(FAILED)", "").strip(" -—") or name or jid
+            at = mt
+            m = re.search(r"\*\*Run Time:\*\*\s*([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})", head)
+            if m:
+                try:
+                    at = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").replace(
+                        tzinfo=NIGHT_TZ).timestamp()
+                except ValueError:
+                    pass
+            runs.append({"id": "%s-%s" % (jid, fn[:-3]), "title": title[:80],
+                         "status": "error" if failed else "done", "at": int(at)})
+    runs.sort(key=lambda r: r["at"], reverse=True)
+    return runs
+
+
+def _collect_night_tasks(now=None):
+    """首屏「昨夜任务」聚合 → {ok, window:{start,end}, night:{total,failed,items}}。只读，读不到即空态。"""
+    try:
+        start, end = _night_window(now)
+        runs = _night_runs_scan(start, end)
+    except Exception as e:
+        return {"ok": False, "night": {"total": 0, "failed": 0, "items": []}, "error": str(e)[:200]}
+    return {"ok": True,
+            "window": {"start": int(start), "end": int(end)},
+            "night": {"total": len(runs),
+                      "failed": sum(1 for r in runs if r["status"] == "error"),
+                      "items": runs[:NIGHT_ITEMS_MAX]}}
+
+
 def _collect_active_tasks():
     """任务中心数据源：进行中的流式任务 + 登记的后台作业。"""
     _bgjobs_load()      # v4.0.40（#2）：首次调用时把落盘作业回填进内存
@@ -2902,6 +3030,9 @@ class StreamHandler(BaseHTTPRequestHandler):
             import provider_admin as _pa
             return self._send(200, _pa.custom_list())
         # v3.4.23 任务中心：进行中任务列表（流式任务 streaming 中 + 登记的后台作业）
+        # v4.0.79（P1 首屏结论条）：昨夜任务只读聚合（窗口 = 昨天 20:00 → 今天 09:00）
+        if self.path.split("?", 1)[0] in ("/api/tasks/night", "/api/agent/tasks/night"):
+            return self._send(200, _collect_night_tasks())
         if self.path.startswith("/api/tasks/active") or self.path.startswith("/api/agent/tasks/active"):
             return self._send(200, _collect_active_tasks())
         # V1.7.3：返回全部 provider 及可选模型聚合（app 通用渲染 + 新 provider 免改版）
