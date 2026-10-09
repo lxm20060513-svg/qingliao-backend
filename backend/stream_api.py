@@ -697,54 +697,63 @@ _background_jobs = {}
 _background_jobs_lock = threading.Lock()
 _BGJOB_TTL = 2 * 3600        # 完成作业保留 2h 供查看
 _BGJOB_KEEP = 50             # 完成作业最多保留条数，防无限膨胀
-# v4.0.40（#2 任务中心显示后台推进任务）：作业原本只在内存，容器一重启
-# 「正在推进」就凭空消失。落盘 data/bgjobs.json，原子写 + 启动回填。
+
+# v4.0.40（#2）：后台作业落盘 —— 原来只活在本进程内存里，容器一重启
+# 任务中心里「正在后台推进的目标」就凭空消失（用户看到的正是这个）。
+# 落 data/bgjobs.json：原子写 + 启动回填 + TTL 清理，重启后进行中的作业仍在列表。
 _BGJOBS_PATH = os.path.normpath(os.path.join(DATA_DIR, "bgjobs.json"))
 _BGJOB_LOADED = False
 
 
 def _bgjobs_load():
-    """把落盘的后台作业回填进内存（幂等；坏文件当空，不阻断服务启动）。"""
+    """启动时回填一次：把落盘的作业灌回内存，并清掉已过期的。"""
     global _BGJOB_LOADED
     if _BGJOB_LOADED:
         return
     _BGJOB_LOADED = True
     try:
+        if not os.path.exists(_BGJOBS_PATH):
+            return
         with open(_BGJOBS_PATH, "r", encoding="utf-8") as f:
             items = json.load(f)
         if not isinstance(items, list):
             return
         now = time.time()
         with _background_jobs_lock:
-            for it in items:
-                if not isinstance(it, dict):
+            for j in items:
+                if not isinstance(j, dict) or not j.get("jobId"):
                     continue
-                jid = str(it.get("jobId") or "")
-                if not jid or now - float(it.get("updatedAt") or 0) > _BGJOB_TTL:
-                    continue          # 超 TTL 的收尾作业不回填，避免开机就一屏僵尸
-                _background_jobs[jid] = it
-    except Exception:
-        pass
+                # running 且超过 TTL 的（重启前就挂死的）不复活 —— 与下发侧判据同口径
+                if j.get("status") == "running" and now - j.get("createdAt", now) > _BGJOB_TTL:
+                    continue
+                if j.get("status") != "running" and now - j.get("updatedAt", 0) >= _BGJOB_TTL:
+                    continue
+                _background_jobs[j["jobId"]] = j
+        print("[bgjobs] 回填 %d 条作业" % len(_background_jobs), flush=True)
+    except Exception as e:
+        print("[bgjobs] 回填失败（忽略）: %s" % e, flush=True)
 
 
 def _bgjobs_flush():
-    """把后台作业原子写回磁盘（只写 running + TTL 内的收尾作业）。"""
+    """把内存作业落盘。整段 try/except：写盘失败不该影响推进本身。"""
     try:
-        now = time.time()
         with _background_jobs_lock:
-            keep = [j for j in _background_jobs.values()
-                    if now - float(j.get("updatedAt") or 0) <= _BGJOB_TTL]
-        os.makedirs(os.path.dirname(_BGJOBS_PATH), exist_ok=True)
+            items = list(_background_jobs.values())
+        d = os.path.dirname(_BGJOBS_PATH)
+        if d:
+            os.makedirs(d, exist_ok=True)
         tmp = _BGJOBS_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(keep, f, ensure_ascii=False)
+            json.dump(items, f, ensure_ascii=False)
         os.replace(tmp, _BGJOBS_PATH)
-    except Exception:
-        pass
+    except Exception as e:
+        print("[bgjobs] 落盘失败（忽略）: %s" % e, flush=True)
 
 
 def _bgjob_register(job_id, title, detail=""):
-    """登记/刷新一条后台作业（已存在则更新标题，状态重置 running）。"""
+    """登记/刷新一条后台作业（已存在则更新标题，状态重置 running）。
+    v4.0.86（任务中心④）：带租约 —— leaseUntil 内不判死；过期 running 即僵尸，
+    收进历史时标 error，App 不再「永远在跑」。"""
     with _background_jobs_lock:
         old = _background_jobs.get(job_id)
         _background_jobs[job_id] = {
@@ -752,13 +761,15 @@ def _bgjob_register(job_id, title, detail=""):
             "status": "running",
             "createdAt": old.get("createdAt", time.time()) if old else time.time(),
             "updatedAt": time.time(),
+            # 租约：登记即授 30min；worker 推进时用 bg_update(detail/result) 续期。
+            "leaseUntil": time.time() + 1800,
         }
         done_jobs = [(k, v.get("updatedAt", 0)) for k, v in _background_jobs.items()
                      if v.get("status") != "running"]
         if len(done_jobs) > _BGJOB_KEEP:
             for k, _ in sorted(done_jobs, key=lambda kv: kv[1])[:len(done_jobs) - _BGJOB_KEEP]:
                 _background_jobs.pop(k, None)
-    _bgjobs_flush()   # v4.0.40（#2）：登记即落盘，重启后任务中心仍能看到
+    _bgjobs_flush()      # v4.0.40（#2）：登记即落盘 → 容器重启后任务中心不丢这条
 
 
 def _bgjob_finish(job_id, ok=True, result=""):
@@ -770,7 +781,7 @@ def _bgjob_finish(job_id, ok=True, result=""):
         job["updatedAt"] = time.time()
         if result:
             job["result"] = str(result)[:2000]
-    _bgjobs_flush()   # v4.0.40（#2）：收尾状态同样落盘，否则「已完成」活不过一次重启
+    _bgjobs_flush()      # v4.0.40（#2）
 
 
 def bg_register(title, job_id=None, detail=""):
@@ -793,12 +804,45 @@ def bg_update(job_id, status=None, detail=None, result=None):
                 job["result"] = str(result)[:2000]
             if status in ("done", "error"):
                 job["status"] = status
+                job.pop("leaseUntil", None)   # 收尾即撤销租约
+            else:
+                # v4.0.86（任务中心④）：running 期的任何推进都续租 30min
+                job["leaseUntil"] = time.time() + 1800
             job["updatedAt"] = time.time()
             ok = True
     if ok:
-        _bgjobs_flush()   # v4.0.40（#2）：更新也落盘
+        _bgjobs_flush()   # v4.0.40（#2）：更新也落盘，否则收尾状态活不过一次重启
     return ok
 
+
+# v4.0.86（任务中心③）：历史任务 —— bgjobs.json 里 done/error 的作业 + 最近流式收尾。
+# 背景：active 端点只吐「进行中 + 2h 内刚完成的 bg 作业」，跨夜全丢，失败原因无处看。
+# 口径：只读 bgjobs.json（落盘真源，重启也在），按 updatedAt 倒序，limit 上限 200。
+def _collect_task_history(limit=100):
+    _bgjobs_load()
+    try:
+        limit = max(1, min(int(limit), 200))
+    except Exception:
+        limit = 100
+    now = time.time()
+    items = []
+    with _background_jobs_lock:
+        for j in _background_jobs.values():
+            st = j.get("status", "running")
+            if st == "running":
+                continue
+            # 2h TTL 内的已完成作业 active 已下发；这里给全量历史（TTL 清理只发生在
+            # _bgjob_register 里的保 50 条 + load 侧过期过滤，历史读取不做二次过滤）
+            items.append({
+                "jobId": j.get("jobId", ""), "kind": "bg",
+                "title": j.get("title", ""), "detail": j.get("detail", ""),
+                "status": st, "result": j.get("result", ""),
+                "createdAt": j.get("createdAt", now),
+                "updatedAt": j.get("updatedAt", now),
+            })
+    items.sort(key=lambda x: x.get("updatedAt", 0), reverse=True)
+    return {"ok": True, "tasks": items[:limit],
+            "total": len(items)}
 
 def _task_plan(st):
     """v4.0.37：任务中心的**结构化步骤数组**（OpenMuse 借鉴⑧，真缺口：进度只有一行拼出来的字符串）。
@@ -893,6 +937,33 @@ def _night_job_titles():
     return out
 
 
+def _night_reason(path):
+    """失败留档 → 一行原因（P3-15）。取 `## Error` 段最后一条非空行（= 真异常句），
+    没有该段就退回全文第一条含 error/failed/失败 的行；取不到 → None（App 那行不显示）。"""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read(20000)
+    except Exception:
+        return None
+    m = re.search(r"(?ms)^##[ \t]*Error[ \t]*$(.*?)(?=^##[ \t]|\Z)", text)
+    if m:
+        seg = m.group(1)
+    else:
+        m2 = re.search(r"(?mi)^.*(?:error|failed|失败|异常).*$", text)
+        seg = m2.group(0) if m2 else ""
+    lines = [ln.strip().strip("`").strip() for ln in seg.splitlines()]
+    lines = [ln for ln in lines if ln]
+    if not lines:
+        return None
+    pick = lines[-1]
+    m3 = re.match(r"^[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception)?:\s*(.+)$", pick)
+    if m3 and len(m3.group(1).strip()) >= 4:
+        pick = m3.group(1).strip()          # 剥掉 "RuntimeError:" 类名，只留人话
+    if len(pick) > 160:
+        pick = pick[:160] + "…"
+    return pick or None
+
+
 def _night_runs_scan(start, end):
     """扫 cron/output/<job_id>/*.md，mtime 落在窗口内的运行留档 → [{id,title,status,at}]（新到旧）。"""
     runs = []
@@ -939,7 +1010,9 @@ def _night_runs_scan(start, end):
                 except ValueError:
                     pass
             runs.append({"id": "%s-%s" % (jid, fn[:-3]), "title": title[:80],
-                         "status": "error" if failed else "done", "at": int(at)})
+                         "status": "error" if failed else "done", "at": int(at),
+                         # P3-15：失败原因下钻（只给失败的读留档，成功的读它纯属浪费 IO）
+                         "reason": _night_reason(p) if failed else None})
     runs.sort(key=lambda r: r["at"], reverse=True)
     return runs
 
@@ -963,6 +1036,7 @@ def _collect_active_tasks():
     _bgjobs_load()      # v4.0.40（#2）：首次调用时把落盘作业回填进内存
     now = time.time()
     tasks = []
+    _lease_dead = []   # v4.0.86：本轮租约判死的 jobId（锁外统一落盘）
     with _tasks_lock:
         for tid, t in _tasks.items():
             st = t["state"]
@@ -991,7 +1065,16 @@ def _collect_active_tasks():
                 })
     with _background_jobs_lock:
         for j in _background_jobs.values():
-            # 防呆: running 作业超过 TTL(2h) 视为收尾上报丢失(挂死), 任务中心不再显示
+            # v4.0.86（任务中心④）：租约过期 = 收尾上报丢失（挂死）→ 就地标 error 收进历史，
+            # 不再以 running 下发（原 TTL 2h 才消失，App 会「永远在跑」）。30min 无推进即判。
+            if j.get("status") == "running" and now > float(j.get("leaseUntil") or 0):
+                j["status"] = "error"
+                j["updatedAt"] = now
+                j["result"] = str(j.get("result") or "作业超时未收尾（租约过期）")[:2000]
+                j.pop("leaseUntil", None)
+                _lease_dead.append(j.get("jobId", ""))
+                continue
+            # 防呆: running 作业超过 TTL(2h) 视为收尾上报丢失(挂死), 任务中心不再显示（老兜底，租约缺失时用）
             if j.get("status") == "running" and now - j.get("createdAt", now) > _BGJOB_TTL:
                 continue
             if j.get("status") == "running" or now - j.get("updatedAt", 0) < _BGJOB_TTL:
@@ -1003,6 +1086,16 @@ def _collect_active_tasks():
                     "createdAt": j.get("createdAt", now),
                     "updatedAt": j.get("updatedAt", now),
                 })
+    if _lease_dead:
+        _bgjobs_flush()   # v4.0.86：锁外落盘（_bgjobs_flush 要拿同一把锁，锁内调=死锁）
+        print("[bgjobs] 租约过期判死 %d 条: %s" % (len(_lease_dead), ",".join(_lease_dead[:5])), flush=True)
+    # v4.0.45（要求③）：长期目标推进 → 「进行中」常显当前是第几步。
+    # 真作业（胶囊那条）已在上面登记；这里只补 cron 侧跑在别的进程、任务中心看不到的情况。
+    try:
+        import goal_module as _gm2
+        tasks.extend(_gm2.active_goal_rows(existing_ids={t.get("jobId") for t in tasks}))
+    except Exception as _e:
+        print("[tasks] 目标行合成失败:", str(_e)[:120], flush=True)
     tasks.sort(key=lambda x: x.get("createdAt", 0), reverse=True)
     return {"ok": True, "tasks": tasks,
             "running": sum(1 for t in tasks if t.get("status") == "running")}
@@ -1034,6 +1127,8 @@ def _persist_state(task_id, st):
     v4.0.37：心跳与"已发布"标记共用。为什么不复用 _write_state：那个函数会把
     updatedAt 刷成"现在"，而 updatedAt 是"内容静默时长"的真值（进度卡片
     _stream_progress_detail 与推送闸门都读它）——心跳一旦借它，静默判定全废。
+    v4.0.38（待做池⑥ 稳妥档）：工具步事件（added/done）也改走这里落盘，
+    让 toolSpans/toolSeq 在重启对账时仍然可读（已完成步不重跑的依据）。
     """
     if not task_id:
         return
@@ -1750,6 +1845,7 @@ QCARD_PROMPT = (
     "（title=步骤名，status/tone=完成/ok、进行中/warn、跳过/信息），title 下可带 subtitle=该步结果一句话。"
     "围栏独占一行、必须闭合；围栏外文字照常写。纪律：闲聊/解释/短回复一律不要用卡片；"
     "【闭合纪律】收尾的三反引号必须另起一行、独占一行（前面不许粘 JSON 的结尾花括号或任何字符），否则客户端认不出闭合，整张卡片会被当代码块原样显示。JSON 与闭合围栏之间不要留空行。"
+    "【围栏格式铁律】ql-card 围栏一律用【三个】反引号，开头行就是 ```ql-card、后面绝对不许再嵌套任何代码块（严禁写四个反引号、严禁在 ql-card 内部再写 ```json 之类——JSON 直接裸写在围栏内）。整条回复里只有开头和结尾两行含反引号。"
     "一张卡片讲完当前这轮结果，不要多卡堆叠；JSON 必须合法（客户端解析失败会原样显示文本，不会报错）。"
 )
 
@@ -1776,13 +1872,24 @@ _GOAL_ACTION_DOC = (
     "goal.create（title 必填【目标标题】、steps 必填【拆出的步骤，JSON 数组字符串，例 \"[\\\"定产品线\\\",\\\"备货5000\\\"]\"】、"
     "morningHour 可选【每天几点推进，默认 9】）—— "
     "判定用户说的是**长期目标**（要花几天到几周、需要分多步推进的事）时用它："
-    "App 会弹一张建目标卡，用户点确认后才真建，并自动把步骤灌进待办清单、每天早上自动推进一小步并汇报。"
-    "【判定要克制，别误伤普通闲聊】只在满足下面**全部**条件时才发这个动作："
-    "①用户话里明确出现目标/筹备类表达（筹备、准备、计划做、要办、打算开展、推进……这类**长期**意味，"
-    "不是「帮我查下」「今天中午吃什么」这种一次性事）；②这件事明显要分多步、跨天；"
-    "③用户是在陈述一件要持续做的事，而不是在问问题、不是在让你做一次性操作。"
-    "任何一条不满足就**不要**发这个动作，正常聊天即可。"
-    "闲聊、问天气、问代码、问「现在几点」、抱怨吐槽、已经完成的事，都绝对不要发。"
+    "App 会弹一张建目标卡，**用户点确认后才真建**：确认后我会在后台每天早上和晚上各推进一次"
+    "（默认早 9:09 推进、晚 21:21 复盘），**推进结果直接推到你微信**，并把步骤灌进待办清单。"
+    "**goal.create 的 summary 必须把这个后果写清楚**（例：「确认后我每天在后台推进，早/晚推你微信」）"
+    "——别让用户点了之后才知道会收到微信推送。"
+    "【判定边界·只认用户本人的诉求】长期目标只看**用户自己说的**想做什么；"
+    "用户让你写的文案/推广语/汇报/代码/示例，以及你自己产出的这类内容里出现的「长期做某事」句式，"
+    "一律**不建卡、也不必问**（典型误抓：给用户写种草文时，把文案句「开启 X 时…做到 Y」当成了他的目标）。"
+    "【两段式判定（v4.0.25）】先看持续性信号，再看是否要分步推进 —— "
+    "①**持续性信号**（出现任一即算）：每天/每周/每月/长期/一直/坚持/养成/打卡；"
+    "今年/这个月/这个季度 + 要做的事；想学/想练/想考/想减/想攒/想读/想写 + 具体对象；"
+    "筹备/准备/打算/计划做/要办/推进/启动 + 一件不当天完的事；帮我盯着/督着我 + 长期事。"
+    "②**要分步推进**：明显跨天、要多步才能做完（不是今天一次就完的事）。"
+    "【怎么落】两条都成立 → 发 goal.create；"
+    "**只成立一条、或你拿不准用户是不是想长期做 → 不要发动作**，改用一句文字问："
+    "「这看着像要长期推进的事，要不要我建个长期目标、每天推你一步？」"
+    "（用户说要，下一轮再发动作；说不用就别再问。）"
+    "【绝不误伤】闲聊、问天气/时间、问代码、一次性帮忙（帮我查下/今天中午吃什么）、抱怨吐槽、"
+    "已经完成的事 —— 一律不发动作、也不必问。"
     "步骤要拆得具体可执行（每步都是今天/明天就能动手的一件事），3-6 步为宜，不要写「完成XX」这种空话。"
     "goal.step_done（goalId 必填、stepId 必填、done 必填 true/false）—— "
     "用户说某一步做完了 / 搞定了时勾掉那一步；用户改口说还没做完时 done=false 恢复。"
@@ -2576,6 +2683,9 @@ def _hermes_responses_worker(task_id, task, req_body, headers, last_write):
                             del _hist[:-20]
                     except Exception:
                         pass
+                    # v4.0.38（待做池⑥ 稳妥档）：工具步新增即落盘（走 _persist_state，不碰 updatedAt），
+                    # 确保进程被重启切断时 toolSeq/toolSpans 仍在盘上 → 启动对账后「已完成步」可读、不重跑。
+                    _persist_state(task_id, st)
             elif jtype == "response.output_item.done":
                 # v3.9.58 工具耗时收口：done 事件按 call_id 配对 added 的开始时刻，
                 # 算出该步耗时（秒）追加进 toolSpans（与 toolHistory 同序、同长度上限）。
@@ -2598,6 +2708,9 @@ def _hermes_responses_worker(task_id, task, req_body, headers, last_write):
                             del _hist[:-20]
                     except Exception:
                         pass
+                    # v4.0.38（待做池⑥ 稳妥档）：工具步收口（含耗时）即落盘 —— 重启对账后
+                    # 「已完成步 + 耗时」仍在，作为「已完成步不重跑」的持久依据。
+                    _persist_state(task_id, st)
             elif jtype == "response.output_text.done":
                 # 兜底：本轮流里没出现过 delta 时，用 done 事件的整段文本补上
                 text = j.get("text") or ""
@@ -3035,6 +3148,14 @@ class StreamHandler(BaseHTTPRequestHandler):
             return self._send(200, _collect_night_tasks())
         if self.path.startswith("/api/tasks/active") or self.path.startswith("/api/agent/tasks/active"):
             return self._send(200, _collect_active_tasks())
+        # v4.0.86（任务中心③）：历史任务列表（done/error 的 bg 作业，bgjobs.json 真源）
+        if self.path.split("?", 1)[0] in ("/api/tasks/history", "/api/agent/tasks/history"):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            try:
+                _lim = int(q.get("limit", ["100"])[0])
+            except Exception:
+                _lim = 100
+            return self._send(200, _collect_task_history(_lim))
         # V1.7.3：返回全部 provider 及可选模型聚合（app 通用渲染 + 新 provider 免改版）
         # v3.0.60：并发拉取各 provider 模型（串行7个provider×10s超时=70s挂起根因）
         if self.path.startswith("/api/stream/model-providers"):
@@ -3224,6 +3345,12 @@ class StreamHandler(BaseHTTPRequestHandler):
                             "isWorking": False,
                             "error": _bst.get("error", "") or "任务中断（服务重启或异常），已保留已生成内容",
                             "agent": _bst.get("agent", False),
+                            # v4.0.38（待做池⑥ 稳妥档）：把中断任务的断点信息带出——
+                            # outcome_unknown + 已完成步 plan/toolSeq，供任务中心/对话展示
+                            # 「已完成第 k 步 · 结果未知 · 未自动重放」。纯增量键，老 App 忽略。
+                            "outcome": _bst.get("outcome", ""),
+                            "plan": _task_plan(_bst),
+                            "planSeq": int(_bst.get("toolSeq") or 0),
                             "fromDisk": True
                         })
             except Exception:
@@ -3562,12 +3689,12 @@ def cleanup_old_tasks():
 
 
 def reconcile_streams_on_startup():
-    """v4.0.37（借鉴⑤）：启动对账。
+    """v4.0.37（借鉴⑤）/ v4.0.38（待做池⑥ 稳妥档）：启动对账。
 
     内存侧 _tasks 是空的（进程刚起），磁盘上仍标 streaming 的任务 = 被重启/异常切断的
     孤儿。这里主动落地判死（status=error + 保留已生成内容 + 标 outcome_unknown），
-    **绝不自动重放**——重放会重复干活、重复推送。v3.9.80 只在 App 调 recover 时兜底，
-    本函数把它提前到启动时：App 一进来就是终态，不会再对着幽灵任务转圈。
+    **绝不自动重放**——重放会重复干活、重复推送。已收口的工具步（toolSpans/toolSeq）
+    原样保留在文件里，作为「已完成步不重跑」的持久依据。
     """
     n = 0
     try:
