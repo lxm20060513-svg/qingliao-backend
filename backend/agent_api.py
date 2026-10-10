@@ -151,6 +151,21 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"ok": ok, "message": msg, "rules": agent_rules.list_rules()})
             except Exception as e:
                 self._send(400, {"ok": False, "error": str(e)[:200]})
+        elif self.path.startswith("/api/agent/suggest_questions"):
+            # v4.0.42 待做池 ①：提问推荐「猜你想问」
+            # 借 /api/agent 前缀 → nginx 三份 conf / lucky 白名单 / ALLOWED_RELAY 零改动。
+            # 失败与「没有好候选」一律 200 + ok:false/空数组，App 侧静默不渲染该区。
+            import suggest_api
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                d = json.loads(self.rfile.read(n) or b"{}")
+                qs = suggest_api.build_questions(
+                    d.get("lastUser", ""), d.get("lastAssistant", ""),
+                    d.get("exclude") or [], d.get("batch") or 0)
+                self._send(200, {"ok": True, "questions": qs})
+            except Exception as e:
+                self._send(200, {"ok": False, "questions": [],
+                                 "error": str(e)[:150]})
         elif self.path.startswith("/api/agent/suggest"):
             # v2.0.116：看板智能建议（基于天气/NAS/设备状态生成简短建议）
             import stream_api

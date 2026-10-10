@@ -26,7 +26,7 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 HERMES_API = "http://127.0.0.1:9123"
 HERMES_KEY = os.environ.get("STREAM_HERMES_KEY") or os.environ.get("QL_AGENT_KEY") or ""
@@ -59,6 +59,18 @@ _ANSWER_DONE = set()             # 已处理过答案的 question id（幂等，
 _WATCHERS = set()                # v4.0.44 审查修复：正在等答案的 question id（并发上限用）
 _WATCH_MAX = 8                   # 等答案线程上限（每张卡一个 daemon，最多空转 QUESTION_TIMEOUT）
 DEFAULT_ASK_OPTIONS = ["继续推进（现在就推进一次）", "我知道了，按计划来"]
+
+
+def _iso_now():
+    """SyncedStore 文件（goals.json / todos.json）专用时间戳：UTC + 'Z' + 无小数秒。
+
+    为什么不能再用 datetime.now().isoformat()：这两个文件 iOS 端走 SyncedStore，
+    用 JSONDecoder .iso8601 解码 —— 只认「带时区、无小数秒」（App 自己写的
+    '2026-10-04T03:14:51Z'）。naive + 微秒（容器 TZ=UTC，如 '2026-10-04T09:59:58.666916'）
+    会让 App **整个文件解码失败**，而 decode 里是 try? → 错误被吞 → loadFromServer 静默
+    return → 界面永远停在本地旧快照（待办不自动划、目标步骤与任务中心不对应、看不到报告）。
+    容器 TZ 是 UTC，所以这里直接用 UTC，与历史 naive 值的语义一致（不+8h）。"""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _goals_read():
@@ -220,7 +232,7 @@ def goals_create(payload):
         raw_steps = [{"id": uuid.uuid4().hex, "title": t} for t in _auto_split(title)]
 
     steps = []
-    now = datetime.now().isoformat()
+    now = _iso_now()
     for s in raw_steps[:MAX_STEPS]:
         st = (s.get("title", "") if isinstance(s, dict) else str(s)).strip()
         if not st:
@@ -304,7 +316,7 @@ def goals_report(payload):
         g = goals.get(gid)
         if not g:
             return 404, {"ok": False, "error": "目标不存在"}
-        now = datetime.now().isoformat()
+        now = _iso_now()
         # v4.0.37（OpenMuse 借鉴②）：同一份汇报正文重复回写不再往时间线塞重复条目
         # （cron 重试、早晚两段跑出同样内容都会走到这里），但"上次汇报时间"照常刷新。
         # 用整串 md5 比对：lastReport 截断到 2000 字，直接比正文对长汇报会漏判。
@@ -358,6 +370,7 @@ def goals_report(payload):
         for _idx, _title in newly:
             if not _notify_step_done(gid, _idx, _title, total=len(steps_l)):
                 warn.append("第%d步完成通知没发出" % _idx)
+        _sync_todos_backfill(gid)   # v4.0.45：全量对账，补上早先漏联动的步骤
     if finished:
         _sync_todos_finish(gid)
     if warn:
@@ -386,7 +399,7 @@ def goals_update(payload):
     gid = str(payload.get("id") or "")
     if not gid:
         return 400, {"ok": False, "error": "缺少 id"}
-    now = datetime.now().isoformat()
+    now = _iso_now()
     with _goals_lock:
         goals = _goals_read()
         g = goals.get(gid)
@@ -421,6 +434,8 @@ def goals_update(payload):
         _goals_write(goals)
     if finished:
         _sync_todos_finish(gid)
+    # v4.0.45：App 端勾选/取消勾选步骤也要对账进待办（原先这条路径没挂钩 → 待办永远不划）
+    _sync_todos_backfill(gid)
     return 200, {"ok": True, "goal": g, "finished": bool(finished)}
 
 
@@ -595,7 +610,7 @@ def _run_push_now(gid):
     # v4.0.44：把「完成步骤」一并回传 → 卡片勾选 + 单步待办联动 + 每步完成通知都在函数里闭环。
     goals_report({"goalId": gid, "report": report or body[:2000],
                   "doneSteps": _parse_done_steps(report), "source": "push_now"})
-    now = datetime.now().isoformat()
+    now = _iso_now()
     m = _PROGRESS_RE.search(text or "")
     with _goals_lock:
         goals = _goals_read()
@@ -684,7 +699,7 @@ def _sync_todos_finish(gid):
         if not g:
             return 0
         marker = "［目标·%s］" % g.get("title", "")
-        now = datetime.now().isoformat()
+        now = _iso_now()
         n = 0
         with _todos_lock:
             items = _todos_read()
@@ -764,6 +779,23 @@ def _current_step_text(goal):
     return "第 %d/%d 步：%s" % (done_n + 1, len(steps), str(nxt.get("title") or "")[:30])
 
 
+def _next_goal_run_hint(g):
+    """给合成行补一句「下次什么时候自动推进」——复用目标的早晚时段配置，零新采集。"""
+    try:
+        slots = []
+        if g.get("morningEnabled", True):
+            slots.append(int(g.get("morningHour", 9)))
+        if g.get("eveningEnabled", True):
+            slots.append(int(g.get("eveningHour", 21)))
+        if not slots:
+            return ""
+        now_h = datetime.now().hour
+        nxt = next((h for h in sorted(slots) if h > now_h), sorted(slots)[0])
+        return "｜ 下次 %d:00 自动推进" % nxt
+    except Exception:
+        return ""
+
+
 def _notify_step_done(gid, idx, title, total=0):
     """v4.0.44（用户第②条）：每步完成推一条 system 进固定会话「轻聊投递」+ App 通知。
 
@@ -799,7 +831,7 @@ def _sync_todos_steps(gid, titles):
         if not g:
             return 0
         marker = "［目标·%s］" % g.get("title", "")
-        now = datetime.now().isoformat()
+        now = _iso_now()
         n = 0
         with _todos_lock:
             items = _todos_read()
@@ -824,6 +856,105 @@ def _sync_todos_steps(gid, titles):
     except Exception as e:
         print("[goals] 单步待办联动失败 goal=%s: %s" % (gid[:8], e), flush=True)
         return 0
+
+
+def _step_key(title):
+    """步骤匹配键：优先用序号饰符（①..⑫）。
+
+    🚨 待办 content 是**按长度截断**过的（52~59 字），用「全文包含步骤标题」匹配会漏，
+    但只要开头那个序号饰符还在，用它当键就稳。
+    """
+    t = str(title or "").strip()
+    for ch in t:
+        if ch in "①②③④⑤⑥⑦⑧⑨⑩⑪⑫":
+            return ch
+    return t[:8]
+
+
+def _sync_todos_backfill(gid):
+    """把目标**所有**已完成步骤对账进待办清单（幂等、双向）。
+
+    🚨 为什么必须全量对账：勾/取消勾步骤有三条写入口 ——
+      ① cron 汇报回写（v4.0.44 挂了单步联动）
+      ② goals_update.doneStepIds（App 端手动勾）← **原先没挂钩，待办永远不划**
+      ③ App 端 GoalTodoBridge（本地匹配，内容截断时会漏）
+    任一入口造成的漂移都在这里自愈：以 goals.json 为准，双向同步 done。
+    """
+    try:
+        with _goals_lock:
+            g = _goals_read().get(gid)
+        if not g:
+            return 0
+        marker = "［目标·%s］" % g.get("title", "")
+        keys = {}
+        for s in (g.get("steps") or []):
+            k = _step_key(s.get("title"))
+            if k:
+                keys[k] = bool(s.get("done"))
+        if not keys:
+            return 0
+        now = _iso_now()
+        n = 0
+        with _todos_lock:
+            items = _todos_read()
+            changed = False
+            for t in items:
+                if not isinstance(t, dict):
+                    continue
+                c = str(t.get("content") or "")
+                if not c.startswith(marker):
+                    continue
+                k = _step_key(c[len(marker):].strip())
+                if k not in keys:
+                    continue
+                want = keys[k]
+                if bool(t.get("done")) != want:
+                    t["done"] = want
+                    t["doneAt"] = now if want else None
+                    t["updatedAt"] = now
+                    n += 1
+                    changed = True
+            if changed:
+                _todos_write(items)
+        if n:
+            print("[goals] 待办对账 goal=%s 改动 %d 条" % (gid[:8], n), flush=True)
+        return n
+    except Exception as e:
+        print("[goals] 待办对账失败 goal=%s: %s" % (gid[:8], e), flush=True)
+        return 0
+
+
+def active_goal_rows(existing_ids=None):
+    """任务中心「进行中」的**合成行**：每个未完成且未暂停的目标一行，标题带当前步。
+
+    🚨 为什么：cron 侧的推进跑在 Hermes 计划任务里（另一个进程），不会在后台登记作业，
+    于是「进行中」整段时间是空的 —— 用户看不到「当前在推进哪一步」（要求③）。
+    这里按 goals.json 合成一行，App 用现有 ActiveTaskRow 直接渲染，零 App 改动。
+    """
+    rows = []
+    try:
+        existing = set(existing_ids or ())
+        for gid, g in (_goals_read() or {}).items():
+            if not isinstance(g, dict):
+                continue
+            steps = g.get("steps") or []
+            if not steps or g.get("paused"):
+                continue
+            if all(s.get("done") for s in steps):
+                continue
+            jid = "goal-%s" % gid[:16]
+            if jid in existing:
+                continue          # 胶囊那条真作业在跑，别重复一行
+            rows.append({
+                "jobId": jid, "kind": "bg",
+                "title": "目标推进 · %s" % str(g.get("title") or "")[:36],
+                "detail": "正在推进 %s%s" % (_current_step_text(g), _next_goal_run_hint(g)),
+                "status": "running", "result": "",
+                "createdAt": time.time(), "updatedAt": time.time(),
+            })
+    except Exception:
+        return []
+    return rows
 
 
 def _inject_to_session(sid, text):
@@ -941,7 +1072,7 @@ def _apply_answer(gid, sid, ans):
     ans = str(ans or "").strip()[:400]
     if not ans:
         return
-    now = datetime.now().isoformat()
+    now = _iso_now()
     title = ""
     try:
         with _goals_lock:
@@ -1002,6 +1133,7 @@ def goals_report_from_cron(job_id, report, done_steps=None):
         print("[goals] cron 回写：job=%s 命中 %d 个目标，已全部回写" % (job_id, len(hits)), flush=True)
         body["updated"] = len(hits)
     return code, body
+
 
 
 

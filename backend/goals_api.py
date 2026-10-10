@@ -16,16 +16,24 @@
 
 import json, os, time, threading, urllib.request, urllib.error
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime
+from datetime import datetime, timezone
 
 HERMES_API = 'http://127.0.0.1:9123'
 HERMES_KEY = os.environ.get("STREAM_HERMES_KEY") or os.environ.get("QL_AGENT_KEY") or ""
 CRON_PASSWORD = os.environ.get("QL_PASSWORD", "")
-DATA_DIR = os.environ.get("QL_LIFE_DIR", "/volume1/docker/hermes/微信文件/轻聊web/data")
+DATA_DIR = os.environ.get("QL_LIFE_DIR", os.environ.get("QL_DATA_DIR", "/data"))
 GOALS_FILE = os.path.join(DATA_DIR, "goals.json")
 
 # 写锁：iOS 端也是 FIFO 串行写，服务端同样不能并发覆盖
 _write_lock = threading.Lock()
+
+
+def _iso_now():
+    """goals.json 专用时间戳：UTC + 'Z' + 无小数秒 —— 与 goal_module._iso_now 同口径。
+
+    iOS 端 SyncedStore 用 JSONDecoder .iso8601 解码，naive/带微秒的串会让**整个文件**
+    解码失败并被 try? 吞掉 → 界面停在本地旧快照。详见 goal_module._iso_now 注释。"""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -212,7 +220,7 @@ class Handler(BaseHTTPRequestHandler):
         mh = int(data.get('morningHour', 9))
         eh = int(data.get('eveningHour', 21))
         gid = data.get('id') or str(uuid_hex())
-        now_iso = datetime.now().isoformat()
+        now_iso = _iso_now()
 
         job_ids = []
         try:
@@ -259,7 +267,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({'error': 'goal not found'}, 404)
                 return
             g['lastReport'] = report[:2000]
-            g['lastPushedAt'] = datetime.now().isoformat()
+            g['lastPushedAt'] = _iso_now()
             g['updatedAt'] = g['lastPushedAt']
             # cron 报「今天推进了 X」→ 把那一步勾上（不猜：只认后端明确传来的 doneStepIds）
             for sid in (data.get('doneStepIds') or [])[:12]:

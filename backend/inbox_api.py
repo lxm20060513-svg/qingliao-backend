@@ -51,6 +51,12 @@ QUEUE_LIMIT = 100
 SENDING_TIMEOUT = 60
 # 滞留 TTL（秒）：pending/sending 超过此时长仍未 done → 直接舍弃（清理僵尸）
 STALE_TTL = 24 * 3600
+# v4.0.7x 问题卡自动退场：发卡进程（ask_user.py）提前退出时永远没人调 done，
+# 卡会 sending→pending 每 60s 重投一次 → 用户实报「确认卡一直弹、选了也还是弹」。
+# ① 已作答但 AI 侧在 ANSWERED_GRACE 内仍未取走 → 视为发卡进程已死，归档退场
+# ② 任何 question 卡挂满 QUESTION_TTL 未收尾 → 归档退场
+QUESTION_TTL = 2 * 3600
+ANSWERED_GRACE = 30 * 60
 
 _lock = threading.RLock()
 
@@ -145,7 +151,13 @@ def push(text, task_id=None, task_type="reply", want_id=False, session_id=None, 
         _reused = False
         if task_id and task_type == "question":
             for it in items:
-                if it.get("source_task_id") == task_id and it.get("status") in ("pending", "sending"):
+                # v4.0.57 修复：复用必须同时限定「同为 question 且仍在挂」。
+                # 只按 source_task_id 匹配，会把同 id 的 reply/agent 条目（例如同一任务的截图消息）
+                # 误判成「卡还挂着」→ 卡根本不入队，而 AI 侧拿到那条 reply 的 id 去轮询答案
+                # → 用户看不到卡、即使作答也永远送不回（实测：reply + question 同 task_id 必现）。
+                if (it.get("source_task_id") == task_id
+                        and it.get("status") in ("pending", "sending")
+                        and it.get("task_type") == "question"):
                     mid = it.get("id") or mid
                     it["ts"] = time.time()      # 刷新滞留计时（用户还没答，别被 STALE_TTL 清掉）
                     _save(items)
@@ -224,6 +236,20 @@ def pop_pending():
     for it in items:
         st = it.get("status")
         ts = it.get("ts") or 0
+        # v4.0.7x：问题卡（question）专用退场规则（见顶部常量注释）。
+        # 关键：**已作答的卡一律不再投给 App** —— 答案已在队列里等 AI 取走，
+        # 重投只会让用户「选了还弹」（AI 侧 GET /api/inbox/answer 直接读队列，不依赖本函数投递）。
+        if it.get("task_type") == "question":
+            ans_ts = it.get("answered_ts") or 0
+            if ans_ts:
+                if now - ans_ts > ANSWERED_GRACE:
+                    dropped.append((it, "question_answered_untaken_%dm" % (ANSWERED_GRACE // 60)))
+                    continue
+                rest.append(it)
+                continue
+            if now - ts > QUESTION_TTL:
+                dropped.append((it, "question_stale_%dh" % (QUESTION_TTL // 3600)))
+                continue
         if st == "pending":
             if now - ts > STALE_TTL:
                 dropped.append((it, "pending_stale_%dh" % (STALE_TTL // 3600)))
@@ -256,6 +282,34 @@ def pop_pending():
             print("[inbox] 消息离开队列 id=%s task=%s 原因=%s 字数=%d（已归档）" % (
                 d.get("id"), d.get("source_task_id"), reason, len(d.get("text") or "")), flush=True)
     return picked
+
+
+def _gone_reason(mid):
+    """v4.0.46：条目已不在队列时，回查归档拿「为什么消失」，供 App 侧回执说实话。
+      - "mark_done"          → AI 侧拿到答案并收尾了（= 答案确实送到了）
+      - "pending_stale_24h" / "sending_stale_24h" → 24h 没人确认被清理（AI 很可能早超时了）
+      - "unknown"            → 归档里也没有（队列被手工改过、跨天归档等）
+    只扫最近两个归档文件（今天的 + 前一天的），够用且不翻整库。"""
+    try:
+        import glob as _glob
+        files = sorted(_glob.glob(os.path.join(ARCHIVE_DIR, "inbox_*.jsonl")), reverse=True)[:2]
+        for fn in files:
+            hits = []
+            with open(fn, encoding="utf-8") as f:
+                for line in f:
+                    if mid not in line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    if rec.get("id") == mid:
+                        hits.append(rec)
+            if hits:
+                return hits[-1].get("reason") or "unknown"   # 同 id 多条归档取最后一次
+    except Exception as e:
+        print("[inbox] 回查归档失败 id=%s: %s" % (mid, e), flush=True)
+    return "unknown"
 
 
 def mark_done(mid):
@@ -393,8 +447,13 @@ class Handler(BaseHTTPRequestHandler):
         """GET /api/inbox/answer?id=..&wait=N —— 长轮询等答案（给 AI 侧脚本，省得它每秒疯狂打接口）。
 
         语义：
-          - 有答案 → 立刻 {"ok":true,"answered":true,"id":..,"text":..}
-          - 没答案 → 最多轮询 wait 秒（上限 30s、1 秒一跳）→ {"ok":true,"answered":false,"id":..}
+          - 有答案 → 立刻 {"ok":true,"answered":true,"id":..,"text":..,"taken":false}
+          - 没答案（问题还在） → 最多轮询 wait 秒（上限 30s、1 秒一跳）→ {"ok":true,"answered":false,"id":..,"taken":false}
+          - 条目已不在队列（AI 侧 done 取走 / STALE_TTL 清理）→ {"ok":true,"answered":false,"id":..,"taken":true,"gone_reason":"mark_done"}
+            ⚠️ v4.0.46：`taken`/`gone_reason` 是给 **App 侧回执**用的（用户报「选完卡不确定 AI 收没收到」）：
+            App 已提交答案的前提下，条目消失 = AI 侧把答案取走了 → 卡片从「已提交」升级成「✅ AI 已收到」；
+            `gone_reason != "mark_done"`（如 *_stale_24h）说明不是被 AI 取走而是过期清理 → 卡上要照实说，别报假回执。
+            老调用方（ask_user.py 长轮询）不看这两个字段，行为零变化。
           - wait 缺省 0（只查一次就返回）；缺 id → {"ok":false,"error":"缺少 id"}
         阻塞说明：本服务是 ThreadingHTTPServer（unified_router.run_server），
         一个请求阻塞的是它自己的线程，不会卡住其它请求。
@@ -417,11 +476,14 @@ class Handler(BaseHTTPRequestHandler):
             found, ans = read_answer(mid)
             if ans:
                 print("[inbox] GET answer 命中 id=%s 字数=%d" % (mid, len(ans)), flush=True)
-                self._send(200, {"ok": True, "answered": True, "id": mid, "text": ans})
+                self._send(200, {"ok": True, "answered": True, "id": mid, "text": ans, "taken": False})
                 return
             if time.time() >= deadline:
                 print("[inbox] GET answer 未答 id=%s found=%s wait=%ds" % (mid, found, wait), flush=True)
-                self._send(200, {"ok": True, "answered": False, "id": mid})
+                # v4.0.46：条目不存在（found=False）= 已出队 → 回查归档说清「为什么消失」（App 回执用）
+                self._send(200, {"ok": True, "answered": False, "id": mid,
+                                 "taken": (not found),
+                                 "gone_reason": (_gone_reason(mid) if not found else "")})
                 return
             time.sleep(1)
 
@@ -522,4 +584,5 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *a):
         pass
+
 
