@@ -254,7 +254,7 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "description": "搜索关键词（文件名或内容）"},
-                    "path": {"type": "string", "description": "搜索目录（默认 /volume1）"},
+                    "path": {"type": "string", "description": "搜索目录（默认 /data）"},
                 },
                 "required": ["pattern"],
             },
@@ -458,11 +458,11 @@ def _fmt_kb(kb):
 
 
 def _disk_usage():
-    """宿主存储卷磁盘状态：/volume1/2/3 容量/已用/可用/使用率 + 各卷顶层主要占用。
+    """宿主存储卷磁盘状态：/data/2/3 容量/已用/可用/使用率 + 各卷顶层主要占用。
     qingliao 跑在宿主 systemd，df/du 天然是宿主视角（区别于容器内 df 只见自身挂载）。
     注意：勿用 df -hT | head -8——系统分区会占满前 8 行，/volume3 被截断（历史 bug）。"""
     out = []
-    df = _sh("df -h /volume1 /volume2 /volume3", timeout=20)
+    df = _sh("df -h /data /volume2 /volume3", timeout=20)
     for row in df.splitlines()[1:]:
         p = row.split()
         if len(p) < 6:
@@ -581,7 +581,7 @@ def execute(name, args, agent_model=None, agent_provider=None):
         if name == "list_files":
             return _list_files(args.get("path", "."))
         if name == "search_files":
-            return _search_files(args.get("pattern", ""), args.get("path", "/volume1"))
+            return _search_files(args.get("pattern", ""), args.get("path", "/data"))
         if name == "execute_code":
             return _execute_code(args.get("code", ""), args.get("language", "python"))
         if name == "delegate_task":
@@ -742,7 +742,7 @@ def _list_files(path='.'):
         return f"列目录失败：{str(e)[:150]}"
 
 
-def _search_files(pattern, path='/volume1'):
+def _search_files(pattern, path="/data"):
     """按文件名搜索"""
     if not pattern:
         return "搜索词为空"

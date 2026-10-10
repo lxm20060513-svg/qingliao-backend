@@ -25,8 +25,8 @@ except ImportError:
 # 2026-09-09：wechat-profile 已删除，微信通道由 default profile（主 config.yaml）服务。
 # 模型写入主 config.yaml 的 model 段，重启 default gateway 生效。
 # v3.0.83：QL_WECHAT_PROFILE_CFG env 已在 compose 中改指主 config.yaml（旧值指向已删 profile 会 500）。
-_DEFAULT_CFG = os.environ.get("QL_HERMES_CONFIG","/volume1/docker/hermes/hermes-data/config.yaml")
-_FALLBACK_CFG = "/volume1/docker/hermes/hermes-data/hermes_config.yaml"
+_DEFAULT_CFG = os.environ.get("QL_HERMES_DATA", "/data/hermes") + "/config.yaml"
+_FALLBACK_CFG = "/data/hermes_config.yaml"
 PROFILE_CFG = os.environ.get("QL_WECHAT_PROFILE_CFG") or (
     _DEFAULT_CFG if os.path.exists(_DEFAULT_CFG) else _FALLBACK_CFG
 )
@@ -184,7 +184,7 @@ def _restart_gateway():
     """重启 Hermes gateway 使新模型生效（docker exec 容器内，异步不阻塞）"""
     try:
         subprocess.Popen(
-            ["docker", "exec", "hermes-hermes-1", "hermes", "gateway", "restart"],
+            ["docker", "exec", os.environ.get("QL_HERMES_CONTAINER", "hermes-container"), "hermes", "gateway", "restart"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )

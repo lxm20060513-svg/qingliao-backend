@@ -248,7 +248,6 @@ SYNC_ENDPOINTS = {
     "opencode": ("https://opencode.ai/zen/go/v1/models", ["providers", "opencode", "api_key"]),
     "opencode-apple": ("https://opencode.ai/zen/go/v1/models", ["providers", "opencode-apple", "api_key"]),
     "stepfun": ("https://api.stepfun.com/step_plan/v1/models", ["providers", "stepfun", "api_key"]),
-    "deepseek": ("https://api.deepseek.com/v1/models", ["providers", "deepseek", "api_key"]),
     "xiaomi": ("https://token-plan-cn.xiaomimimo.com/v1/models", ["providers", "xiaomi", "api_key"]),
     "sensenova": ("https://token.sensenova.cn/v1/models", ["providers", "sensenova", "api_key"]),
     "zai-coding": ("https://api.z.ai/api/coding/paas/v4/models", ["providers", "zai-coding", "api_key"]),
@@ -888,7 +887,7 @@ NIGHT_START_HOUR, NIGHT_END_HOUR = 20, 9                    # 昨夜 20:00 → �
 NIGHT_ITEMS_MAX = 50
 CRON_DIR = os.environ.get("QL_HERMES_CRON_DIR") or os.path.join(
     os.environ.get("QL_HERMES_DATA_DIR")
-    or os.path.join(os.environ.get("QL_HERMES_ROOT_DIR", "/volume1/docker/hermes"), "hermes-data"),
+    or os.path.join(os.environ.get("QL_HERMES_ROOT_DIR", os.environ.get("QL_DOCKER_ROOT", "/data/docker")), "hermes-data"),
     "cron")
 
 
@@ -3830,6 +3829,8 @@ if __name__ == "__main__":
     srv = ThreadingHTTPServer(("0.0.0.0", 9132), StreamHandler)
     print("[stream] listening on 9132, dir:", STREAM_DIR, flush=True)
     srv.serve_forever()
+
+
 
 
 

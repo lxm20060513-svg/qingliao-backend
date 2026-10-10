@@ -14,7 +14,7 @@ import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler
 
-DATA_DIR = os.environ.get("QL_DATA_DIR", "/volume1/docker/hermes/微信文件/轻聊web/data")
+DATA_DIR = os.environ.get("QL_DATA_DIR", "/data")
 DEFAULT_FILE = os.path.join(DATA_DIR, "notes.json")
 _lock = threading.Lock()
 

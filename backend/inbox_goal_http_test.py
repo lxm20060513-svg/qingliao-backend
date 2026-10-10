@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # 跑法（容器内，数据重定向 /tmp，不碰生产）：
-#   python3 /opt/data/scripts/ql.py nas put <本文件> 微信文件/轻聊web/backend
-#   python3 /opt/data/scripts/ql.py nas exec "docker exec -w '/volume1/docker/hermes/微信文件/轻聊web/backend' -e QL_DATA_DIR=/tmp -e PYTHONPATH='/volume1/docker/hermes/微信文件/轻聊web/backend' qingliao python3 <文件名>"
+#   python3 /data/hermes/scripts/ql.py nas put <本文件> 微信文件/轻聊web/backend
+#   python3 /data/hermes/scripts/ql.py nas exec "docker exec -w os.environ.get("QL_WEB_ROOT", "/data") + "/backend" -e QL_DATA_DIR=/tmp -e PYTHONPATH=os.environ.get("QL_WEB_ROOT", "/data") + "/backend" qingliao python3 <文件名>"
 """HTTP 端到端自测：POST /api/inbox/push 带 goal_report（真路由，token 走环境变量，不落盘）
 
 目的：证明运行中的容器里「桥 → inbox 路由 → goal_module 回写」这条线是通的，

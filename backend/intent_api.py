@@ -33,6 +33,7 @@ KINDS = ("express", "address", "contact", "link", "text", "amount", "datetime")
 
 EXTRACT_PATHS = ("/api/intent/extract", "/api/agent/intent/extract")
 HEALTH_PATHS = ("/api/intent/health", "/api/agent/intent/health")
+BILL_PATHS = ("/api/intent/bill", "/api/agent/intent/bill")
 
 MAX_TEXT = 2000          # 输入上限（Clippings 级别的短内容；超长的截断后判定）
 MAX_IMG_B64 = 6_000_000  # ≈4.5MB 原图；App 侧已压到 1600px/JPEG0.7（通常 150~400KB）
@@ -283,6 +284,149 @@ def extract(body):
     return {"ok": True, "source": "cloud-vision", **norm}
 
 
+# ───────────────── v4.0.20（#⑪）账单截图识别入账 ─────────────────
+# 定位：App「拍照/相册选图 → 后端识别 → 返回结构化账单 → 用户确认后入账」。
+# 后端只做「图 → 结构化字段」，**不写账本**（写入仍由 App 走 records 同步链路，
+# 人工确认这一环留在 App，避免把识别错的金额自动记进账本）。
+# 复用 intent 的视觉端点解析（_aux_vision_endpoint）与 _post_json，零新配置项；
+# 路由借已注册的 /api/intent 前缀（ROUTE_TABLE 最长前缀命中）→
+# nginx 三份 conf / lucky 白名单 / relay ALLOWED_RELAY 全部零改动。
+BILL_CATEGORIES = ("餐饮", "购物", "交通", "医疗", "娱乐", "居住", "通讯", "其他")
+
+BILL_SYSTEM_PROMPT = """你是账单/小票识别器。读用户给的账单截图或账单文字，抽取**一笔支出**的结构化字段。
+只输出 JSON，不要解释、不要思考过程、不要多余文字。JSON 结构：
+{"amount": 合计/实付金额（数字，单位元；认不出填 null）, "date": "消费日期 YYYY-MM-DD（认不出填空串）", "category": "只能是 餐饮/购物/交通/医疗/娱乐/居住/通讯/其他 之一", "item": "一句话摘要（≤20字，如「便利店购物」）", "confidence": 0.0~1.0}
+要点：只认**最终合计/实付金额**，不要把小计、优惠前金额或单件单价当合计；认不出金额就把 amount 填 null。"""
+
+
+def _img_mime(b64):
+    """按 base64 魔数判图片类型（App 压缩后多为 JPEG，也可能直接给 PNG）。"""
+    return "image/png" if str(b64 or "").startswith("iVBORw0KGgo") else "image/jpeg"
+
+
+def _norm_bill(obj):
+    """把模型输出收敛成对 App 的契约。返回 None 表示「没认出可用字段」→ 调用方回 ok:false。"""
+    if not isinstance(obj, dict):
+        return None
+    amt = obj.get("amount")
+    try:
+        s = str(amt).replace(",", "").replace("¥", "").replace("￥", "").replace("元", "").strip()
+        amt = float(s)
+        if amt != amt or amt <= 0 or amt > 100000000:
+            amt = None
+    except Exception:
+        amt = None
+    date = str(obj.get("date") or "").strip()
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
+        date = ""
+    cat = str(obj.get("category") or "").strip()
+    if cat not in BILL_CATEGORIES:
+        cat = "其他"
+    item = str(obj.get("item") or "").strip()[:20]
+    if amt is None and not date and not item:
+        return None
+    return {"amount": amt, "date": date, "category": cat, "item": item,
+            "confidence": _clamp_conf(obj.get("confidence"))}
+
+
+def _ask_bill_image(image_b64):
+    """账单看图：需要视觉端点。未配置 → ('no_vision', None)；解析失败 → ('parse_fail', None)。"""
+    global RAW_LAST
+    ep = _aux_vision_endpoint()
+    if not ep:
+        return "no_vision", None
+    url, key, model = ep
+    body = {
+        "model": model,
+        "messages": [{"role": "system", "content": BILL_SYSTEM_PROMPT},
+                     {"role": "user", "content": [
+                         {"type": "text", "text": "识别这张账单，提取金额/日期/分类，只输出 JSON。"},
+                         {"type": "image_url",
+                          "image_url": {"url": "data:" + _img_mime(image_b64) + ";base64," + image_b64}}]}],
+        "temperature": 0,
+        # 4096：step-3.7-flash 思考关不掉（实测），预算给少会随机撞 finish_reason=length 返空 content
+        "max_tokens": 4096,
+    }
+    resp = _post_json(url, key, body)
+    ch = ((resp or {}).get("choices") or [{}])[0]
+    msg = (ch.get("message") or {})
+    content = msg.get("content") or ""
+    if not content:
+        RAW_LAST = "content 为空（finish_reason=%s，reasoning=%s 字）" % (
+            ch.get("finish_reason"), len(str(msg.get("reasoning_content") or "")))
+        return "parse_fail", None
+    RAW_LAST = content[:300]
+    try:
+        return "ok", json.loads(_strip_code_fence(content))
+    except Exception:
+        return "parse_fail", None
+
+
+def _ask_bill_text(text):
+    """账单纯文本（App 端 OCR 出来的字）：一次上游调用要 JSON。"""
+    body = {"messages": [{"role": "system", "content": BILL_SYSTEM_PROMPT},
+                         {"role": "user", "content": "账单文字：\n" + text[:MAX_TEXT]}],
+            "temperature": 0, "max_tokens": 800,
+            "response_format": {"type": "json_object"}}
+    # 文本支路优先复用「账单看图」那个端点（实测 step-3.7-flash 支持纯文本、key 可用）；
+    # 主 Agent 模型的 key 可能没余额（实测 402 Insufficient Balance）→ 不能只走 _upstream。
+    resp = None
+    ep = _aux_vision_endpoint()
+    if ep:
+        try:
+            resp = _post_json(ep[0], ep[1], dict(body, model=ep[2]))
+        except Exception:
+            resp = None
+    if not resp:
+        try:
+            import stream_api
+            body["model"] = getattr(stream_api, "AGENT_MODEL", None) or "deepseek-chat"
+        except Exception:
+            body["model"] = "deepseek-chat"
+        resp = _upstream(body)
+    content = (((resp or {}).get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    for cand in (_strip_code_fence(content), content):
+        try:
+            return json.loads(cand)
+        except Exception:
+            continue
+    return None
+
+
+def extract_bill(body):
+    """账单识别对外契约（入 dict → 出 dict）。请求体问题抛 ValueError。
+
+    出：{"ok": true, "amount": 数字|null, "date": "YYYY-MM-DD"|"", "category": "餐饮…",
+         "item": "摘要", "confidence": 0-1, "source": "cloud-vision"|"cloud-ocr"|"cloud"}
+    失败：{"ok": false, "error": "..."}，**HTTP 一律 200**（与 intent/extract 同口径）。
+    """
+    if not isinstance(body, dict):
+        raise ValueError("请求体必须是对象")
+    image_b64 = str(body.get("image_b64") or "").strip()
+    text = str(body.get("text") or "").strip()
+    if not image_b64 and not text:
+        raise ValueError("image_b64 与 text 至少要给一个")
+    if len(image_b64) > MAX_IMG_B64:
+        return {"ok": False, "error": "图片过大"}
+    if image_b64:
+        status, obj = _ask_bill_image(image_b64)
+        if status == "no_vision":
+            # 没配视觉模型时退回文本（App 传来的 text 往往是它 OCR 出来的字，聊胜于无）
+            if text:
+                norm = _norm_bill(_ask_bill_text(text))
+                if norm:
+                    return {"ok": True, "source": "cloud-ocr", **norm}
+            return {"ok": False, "error": "云端视觉不可用：" + VISION_REASON}
+        norm = _norm_bill(obj)
+        if not norm:
+            return {"ok": False, "error": "未识别出账单字段", "raw": RAW_LAST}
+        return {"ok": True, "source": "cloud-vision", **norm}
+    norm = _norm_bill(_ask_bill_text(text))
+    if not norm:
+        return {"ok": False, "error": "未识别出账单字段"}
+    return {"ok": True, "source": "cloud", **norm}
+
+
 class Handler(BaseHTTPRequestHandler):
     def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -318,13 +462,39 @@ class Handler(BaseHTTPRequestHandler):
         if self._path() in HEALTH_PATHS:
             ok_vision = bool(_aux_vision_endpoint())
             self._send(200, {"ok": True, "kinds": list(KINDS),
-                             "vision": ok_vision, "vision_reason": VISION_REASON})
+                             "bill": True, "vision": ok_vision,
+                             "vision_reason": VISION_REASON})
             return
         self._send(404, {"error": "Not Found"})
 
     def do_POST(self):
         if not self._check_auth():
             self._send(401, {"error": "未授权"})
+            return
+        if self._path() in BILL_PATHS:
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                n = 0
+            raw = self.rfile.read(n) if n > 0 else b""
+            try:
+                body = json.loads(raw.decode("utf-8", "replace") or "{}")
+            except Exception as e:
+                self._send(200, {"ok": False, "error": "请求体不是合法 JSON：%s" % str(e)[:120]})
+                return
+            try:
+                self._send(200, extract_bill(body))
+            except ValueError as e:
+                self._send(200, {"ok": False, "error": str(e)[:200]})
+            except urllib.error.HTTPError as e:
+                detail = ""
+                try:
+                    detail = e.read().decode("utf-8", "replace")[:200]
+                except Exception:
+                    pass
+                self._send(200, {"ok": False, "error": "上游 HTTP %s" % e.code, "upstream": detail})
+            except Exception as e:
+                self._send(200, {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:200])})
             return
         if self._path() not in EXTRACT_PATHS:
             self._send(404, {"error": "Not Found"})

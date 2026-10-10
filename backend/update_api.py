@@ -64,11 +64,11 @@ STATE_DIR = os.environ.get(
     os.path.join(os.environ.get("QL_DATA_DIR", "/data"), "update_state"))
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-# 生产：/volume1/docker/hermes/微信文件/轻聊web/backend；源码直跑：本文件同级
+# 生产：/data/backend；源码直跑：本文件同级
 BACKEND_DIR = os.environ.get(
     "QL_BACKEND_DIR",
-    "/volume1/docker/hermes/微信文件/轻聊web/backend"
-    if os.path.isdir("/volume1/docker/hermes/微信文件/轻聊web/backend")
+    os.environ.get("QL_WEB_ROOT", "/data") + "/backend"
+    if os.path.isdir(os.environ.get("QL_WEB_ROOT", "/data") + "/backend")
     else _HERE)
 ROOT_DIR = os.environ.get("QL_UPDATE_ROOT", os.path.dirname(BACKEND_DIR.rstrip("/")))
 COMPOSE_FILE = os.environ.get(

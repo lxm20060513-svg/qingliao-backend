@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 
-DATA_DIR = os.environ.get("QL_DATA_DIR", "/volume1/docker/hermes/微信文件/轻聊web/data")
+DATA_DIR = os.environ.get("QL_DATA_DIR", os.environ.get("QL_DATA_DIR", "/data"))
 RULES_PATH = os.path.join(DATA_DIR, "agent_rules.json")
 MAX_RULES = 20
 # BE12：读-改-写并发（对话里 stream_api 自动加规则 vs 设置页 agent_api 增删改）会互相覆盖丢条目

@@ -9,7 +9,7 @@ import http.server
 import json
 import os
 import threading
-DATA_DIR = os.environ.get("QL_DATA_DIR", "/volume1/docker/hermes/微信文件/轻聊web/data")
+DATA_DIR = os.environ.get("QL_DATA_DIR", os.environ.get("QL_DATA_DIR", "/data"))
 import time
 import hmac
 import media_convert  # v2.0.130: 历史消息 MEDIA:路径→data URL 图片
@@ -61,7 +61,7 @@ def _data_dir():
             if _dir_writable(p):
                 return p
             # 位置覆盖指向不可写目录时不能硬用：否则每次 merge/save 都 500（客户端表现为
-            # 「删除失败 服务器错误(500)」）。典型成因：容器把 /volume1 以 :ro 挂入，而覆盖
+            # 「删除失败 服务器错误(500)」）。典型成因：容器把 /data 以 :ro 挂入，而覆盖
             # 指向该卷下的历史目录（如 微信文件/轻聊app/sessions）。
             print('[sessions] 位置覆盖不可写，回退默认目录: %s -> %s' % (p, fallback), flush=True)
     except Exception:
@@ -125,7 +125,11 @@ def append_fixed_message(sid, title, text, task_type="cron"):
             ts_ms = int(time.time() * 1000)
             sess.setdefault("messages", []).append({
                 "role": "assistant", "content": text,
-                "timestamp": ts_ms, "isPush": True})
+                "timestamp": ts_ms, "isPush": True,
+                # v4.0.20（#3）：来源一起落库 —— App 气泡角标要按来源三色区分。
+                # 原先后端只在投递队列里带 task_type，写进固定会话时丢掉了，
+                # 于是「轻聊投递」里的定时推进和系统通知长得一模一样。
+                "task_type": task_type})
             sess["updatedAt"] = ts_ms
             save_sessions(sessions)
         return True
@@ -142,10 +146,122 @@ def append_proactive_message(text, task_type="agent"):
     return append_fixed_message(PROACTIVE_SESSION_ID, PROACTIVE_SESSION_TITLE, text, task_type)
 
 
+# 🚨 落库丢内容根治：普通会话「消息级合并」
+# 起因（用户实报「会话落库后重来老是丢内容」）：merge 对同 id 会话原先是**整会话覆盖**，
+# 而唯一的仲裁键 updatedAt 形同虚设 —— App 写入 payload 只有 {id,title,messages}（不带
+# updatedAt，恒 0），NAS 侧普通会话也没有该字段，于是 `0 >= 0` 恒真 ⇒ **任何一份「发起时
+# 快照」都会无条件覆盖服务端**，期间别的写者（后台流式落地 / 推送注入 / 另一台设备）写进去的
+# 消息被整份抹掉（实测 19 个会话里 17 个 updatedAt 为空、仲裁从未生效）。
+# 修法：普通会话按消息**并集**合并 —— 服务端已有的消息一条不丢（旧快照抹不掉新消息），
+# 同 uid 的消息以 incoming 版本为准（撤回/折叠这类「消息状态」由客户端持有最新值）。
+# 显式意图不变：空数组 = 清空本会话、deleted = 删会话、固定会话（投递/主动）各走原有特判。
+def _msg_key(m):
+    """消息稳定标识：优先 uid（App v3.4.x 起落库持久化 uid）；无 uid 回落 (role, timestamp)。"""
+    if not isinstance(m, dict):
+        return None
+    u = m.get("uid")
+    if isinstance(u, str) and u.strip():
+        return ("uid", u)
+    return ("rt", m.get("role"), m.get("timestamp"))
+
+
+def _merge_messages(cur_msgs, inc_msgs):
+    """消息级合并，返回 (merged, kept, replaced)。
+
+    - 以 incoming 为**顺序骨架**（客户端持有用户看到的完整顺序）
+    - 同键消息用 incoming 版本（撤回/折叠等状态由客户端持有最新值）
+    - 服务端独有、且 timestamp **比客户端最新一条还新** → 保留（这是防丢内容的核心：
+      后台流式落地/推送注入/缓存截断写回 都属于这一类，旧快照抹不掉它们）
+    - 其余服务端独有 → 视为客户端**主动删除**（中间缺一条），丢弃（尊重删除语义）
+    已知边界：删除**最后一条**与「落后一条的旧快照」在数据上不可区分，一律按防丢优先（撤回不受影响）。
+    """
+    inc_keys = set()
+    inc_max = None
+    for m in inc_msgs:
+        k = _msg_key(m)
+        if k is not None:
+            inc_keys.add(k)
+        t = m.get("timestamp") if isinstance(m, dict) else None
+        if isinstance(t, (int, float)) and (inc_max is None or t > inc_max):
+            inc_max = t
+    cur_only = []
+    cur_by_key = {}
+    for m in cur_msgs:
+        k = _msg_key(m)
+        if k is not None and k in inc_keys:
+            if k not in cur_by_key:
+                cur_by_key[k] = m
+            continue                        # 同键：交给 incoming 版本
+        if not isinstance(m, dict):
+            cur_only.append(m)              # 脏元素：保留
+            continue
+        t = m.get("timestamp")
+        if inc_max is None or not isinstance(t, (int, float)) or t > inc_max:
+            cur_only.append(m)              # 比客户端更新（或无法比较）→ 防丢优先
+    replaced = 0
+    for m in inc_msgs:
+        old = cur_by_key.get(_msg_key(m))
+        if old is not None and old != m:
+            replaced += 1
+    merged = list(inc_msgs)
+    if cur_only:
+        if all(isinstance(m, dict) and isinstance(m.get("timestamp"), (int, float)) for m in cur_only):
+            cur_only.sort(key=lambda m: m.get("timestamp") or 0)
+            out = []
+            j = 0
+            for m in merged:
+                t = m.get("timestamp") if isinstance(m, dict) else None
+                if isinstance(t, (int, float)):
+                    while j < len(cur_only) and (cur_only[j].get("timestamp") or 0) <= t:
+                        out.append(cur_only[j])
+                        j += 1
+                out.append(m)
+            out.extend(cur_only[j:])
+            merged = out
+        else:
+            merged = list(cur_only) + merged
+    return merged, len(cur_only), replaced
+
+
+def _merge_plain_session(cur, inc):
+    """普通会话（非固定会话）写入：消息并集合并 + 元数据以 incoming 为准。
+
+    显式意图保留：`messages` 为空数组 = 清空本会话（App `writeSessionSnapshot` 的
+    `allowEmpty` 护栏保证只有清空路径会发空数组）；不带 `messages` 键 = 纯改名，消息一条不动。
+    """
+    cur_msgs = cur.get("messages") if isinstance(cur.get("messages"), list) else []
+    inc_has = isinstance(inc.get("messages"), list)
+    inc_msgs = inc.get("messages") if inc_has else []
+    out = dict(cur)
+    for k, v in inc.items():
+        if k not in ("messages", "createdAt", "updatedAt"):
+            out[k] = v
+    if cur.get("createdAt"):
+        out["createdAt"] = cur["createdAt"]
+    if not inc_has:
+        out["messages"] = list(cur_msgs)
+        return out
+    if not inc_msgs:
+        if cur_msgs:
+            print('[sessions] 普通会话显式清空: %s（清掉 %d 条）' % (cur.get('id'), len(cur_msgs)), flush=True)
+        out["messages"] = []
+        out["updatedAt"] = int(time.time() * 1000)
+        return out
+    merged, kept, replaced = _merge_messages(cur_msgs, inc_msgs)
+    out["messages"] = merged
+    if kept or replaced:
+        out["updatedAt"] = int(time.time() * 1000)
+    if kept:
+        print('[sessions] 会话合并: %s 客户端 %d 条 + 服务端独有 %d 条 = %d 条'
+              % (cur.get('id'), len(inc_msgs), kept, len(merged)), flush=True)
+    return out
+
+
 def merge_sessions(local, incoming, deleted):
     """合并策略：
     - incoming 中 NAS 没有的 -> 新增
-    - 同 id 的 -> 取 updatedAt 较新的（incoming 较新则覆盖）
+    - 同 id 的普通会话 -> **消息级并集合并**（见 _merge_plain_session，防旧快照抹掉服务端消息）；
+      固定会话（投递壳/主动会话）仍按 updatedAt 较新者为准 + 各自特判
     - deleted 中的 id -> 删除
     例外（固定投递会话 qingliao_delivery）：不可删 + 标题锁定，但**消息内容以客户端为准**
     （客户端能删单条/清空，否则投递详情越积越多）——详见下方 v3.9.72 注释。
@@ -172,9 +288,14 @@ def merge_sessions(local, incoming, deleted):
             _DELIVERY_INCOMING[sid] = s
         if sid in by_id:
             cur = by_id[sid]
-            # 以 updatedAt 较新者为准
-            if (s.get('updatedAt') or 0) >= (cur.get('updatedAt') or 0):
-                by_id[sid] = s
+            if sid in _PROTECTED_IDS:
+                # 固定会话：保持原语义（投递壳内容以客户端为准 → 下方特判；主动会话以 NAS 为准）
+                if (s.get('updatedAt') or 0) >= (cur.get('updatedAt') or 0):
+                    by_id[sid] = s
+            else:
+                # 🚨 普通会话：消息级并集合并 —— 旧快照**不许**整份覆盖（否则抹掉期间落进去的消息，
+                # 这正是「重来老是丢内容」的根因）。updatedAt 恒 0 的仲裁在这里不再参与判定。
+                by_id[sid] = _merge_plain_session(cur, s)
         else:
             by_id[sid] = s
     for sid in (deleted or []):
@@ -205,6 +326,22 @@ def merge_sessions(local, incoming, deleted):
             _new["createdAt"] = _cur["createdAt"]
         by_id[_sid] = _new
         print('[sessions] 固定会话内容以客户端为准: %s msgs=%d' % (_sid, len(_new["messages"])), flush=True)
+    # v4.0.18: 主动会话「显式清空」特判 —— 客户端发来的该会话 messages 为空数组时采纳
+    # （清空是唯一显式意图，空数组不可能来自旧快照竞态）；非空快照仍走上面 updatedAt 判定
+    # （内容以 NAS 为准，防旧快照盖掉新回复）。采纳后 updatedAt 抬到当前时间，
+    # 天然挡掉清空瞬间仍在途的旧快照写（0 >= 非零 不成立）。
+    _pro_inc = _DELIVERY_INCOMING.get(PROACTIVE_SESSION_ID)
+    if _pro_inc is not None and isinstance(_pro_inc.get("messages"), list) \
+            and len(_pro_inc["messages"]) == 0:
+        _cur = by_id.get(PROACTIVE_SESSION_ID) or {}
+        _new = dict(_cur)
+        _new["messages"] = []
+        _new["title"] = PROACTIVE_SESSION_TITLE
+        _new["updatedAt"] = int(time.time() * 1000)
+        if _cur.get("createdAt"):
+            _new["createdAt"] = _cur["createdAt"]
+        by_id[PROACTIVE_SESSION_ID] = _new
+        print('[sessions] 主动会话显式清空采纳（空数组）', flush=True)
     # v3.9.71: 固定会话标题锁定（改名也被还原）
     for _sid, _t in ((DELIVERY_SESSION_ID, DELIVERY_SESSION_TITLE),
                       (PROACTIVE_SESSION_ID, PROACTIVE_SESSION_TITLE)):

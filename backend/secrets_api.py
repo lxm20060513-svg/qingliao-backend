@@ -3,9 +3,8 @@ from cryptography.fernet import Fernet
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # 凭据安全存储：Fernet 对称加密文件（密钥 600 权限，防 NAS 本地文件泄露）
-_D = os.environ.get("QL_DATA_DIR", "/volume1/docker/hermes/微信文件/轻聊web/data")
-STORE = os.path.join(_D, "secrets_store.json.enc")
-KEY_FILE = os.path.join(_D, ".secrets_key")
+STORE = os.environ.get("QL_DATA_DIR", "/data") + "/secrets_store.json.enc"
+KEY_FILE = os.environ.get("QL_DATA_DIR", "/data") + "/.secrets_key"
 ALLOWED_TYPES = ('nas', 'router', 'other')
 
 _lock = threading.Lock()

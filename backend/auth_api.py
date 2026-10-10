@@ -15,7 +15,7 @@ import hashlib
 import hmac
 import json
 import os
-DATA_DIR = os.environ.get("QL_DATA_DIR", "/volume1/docker/hermes/微信文件/轻聊web/data")
+DATA_DIR = os.environ.get("QL_DATA_DIR", os.environ.get("QL_DATA_DIR", "/data"))
 import secrets
 import threading
 import time
