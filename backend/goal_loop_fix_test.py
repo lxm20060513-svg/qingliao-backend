@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # 跑法（容器内，数据重定向 /tmp，不碰生产）：
-#   python3 /opt/data/scripts/ql.py nas put <本文件> 微信文件/轻聊web/backend
-#   python3 /opt/data/scripts/ql.py nas exec "docker exec -w '/volume1/docker/hermes/微信文件/轻聊web/backend' -e QL_DATA_DIR=/tmp -e PYTHONPATH='/volume1/docker/hermes/微信文件/轻聊web/backend' qingliao python3 <文件名>"
+#   python3 /data/hermes/scripts/ql.py nas put <本文件> 微信文件/轻聊web/backend
+#   python3 /data/hermes/scripts/ql.py nas exec "docker exec -w os.environ.get("QL_WEB_ROOT", "/data") + "/backend" -e QL_DATA_DIR=/tmp -e PYTHONPATH=os.environ.get("QL_WEB_ROOT", "/data") + "/backend" qingliao python3 <文件名>"
 """v4.0.44 审查修复自测（容器内跑，数据全走 /tmp，不碰生产）。
 
 覆盖审查抓到的 5 条：
