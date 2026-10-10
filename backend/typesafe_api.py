@@ -13,8 +13,11 @@ TypeSafe 把「自然语言 → 带类型的判断 + 概率」做成可编程原
   GET  /api/typesafe/health        配置状态（不回显 key；含 routing + breaker）
   GET  /api/(agent/)typesafe/routing   读路由开关与熔断状态
   POST /api/(agent/)typesafe/routing   写路由开关：{"enabled":false} / {"mode":"smart"} /
-                                       {"threshold":0.7} / {"reset_breaker":true}
+                                       {"threshold":0.7} / {"reset_breaker":true} / {"backend":"custom"}
                                        （改配置免重启，App 设置里的开关走这个接口）
+  GET  /api/(agent/)typesafe/model     读判定模型配置（自定义模型；api_key 只回掩码，永不回明文）
+  POST /api/(agent/)typesafe/model     写判定模型：{"base_url":..,"model":..,"api_key":..}
+                                       （api_key 省略=不改、传空串=清空）/ {"test":true} 真调用两条样例
 
 请求体
   {"state": <string|object|array>,  必填：要判定的内容（用户原话/会话片段/任意状态）
@@ -26,17 +29,24 @@ TypeSafe 把「自然语言 → 带类型的判断 + 概率」做成可编程原
   {"ok":true,"model":"jev-1.13.0","answers":{...},"usage":{...},"ms":420,"preset":"chat_router"}
   上游失败：HTTP 502 + {"ok":false,"error":...,"upstream_status":N}——失败不降级成假判断。
 
-配置：<data>/typesafe_config.json = {"api_key","base_url","model","routing":{...}}（600 权限）
+配置：<data>/typesafe_config.json = {"api_key","base_url","model","routing":{...},"custom":{...}}（600 权限）
+判定后端（routing.backend，v4.0.87）：
+  typesafe = 云端 Jev（默认）；custom = 用户自带 key 的 OpenAI 兼容模型（智谱/OpenRouter/硅基流动…，
+  接口地址 + 模型名 + API Key 在 App「设置 → 智能路由 → 判定模型」里填，key 存后端、接口只回掩码）；
+  local = 本机 ollama 小模型（CLI 可设，App 不暴露：0.6B 实测判不准）。
+  三者同契约：判 needs_action 二分类 → 异常/超时一律 fail-open 回退现状；换后端只改配置、免重启。
 会话路由（v3.9.55）：stream_api 在「关键词规则未命中」时调 route()，判定 needs_action
   → False=纯聊天契约 / True=Agent 工具契约；判定失败/超时一律回退现状（fail-open）。
   熔断（v3.9.56）：连续 breaker_fails（默认 3）次失败/超时 → 停判定 breaker_cooldown_s
   （默认 300s），期间 route() 立即返回 ok=False 不碰上游；到点自动半开重试。
 维护：python3 typesafe_api.py show | keyfile <json路径> | judge <preset> "<文本>" | route "<文本>"
-      | routing [enabled=true|false mode=smart threshold=0.7 reset_breaker=true ...]
+      | routing [enabled=true|false mode=smart threshold=0.7 reset_breaker=true backend=custom ...]
+      | model [base_url=https://…/v1 model=xxx api_key=xxx test=true]
 """
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -51,10 +61,14 @@ MAX_QUESTIONS = 20
 VALID_TYPES = ("noul", "choice", "score")
 CONFIG_NAME = "typesafe_config.json"
 
+# 配置读改写串行锁（可重入）：服务跑在 ThreadingHTTPServer 上，App 可能并发写 /routing 与 /model。
+# 无锁会丢更新，并让两个线程共用同一 tmp 名互相 replace 失败（HTTP 500）。
+_CFG_LOCK = threading.RLock()
+
 # 轻聊惯例：QL_DATA_DIR 为空时落 轻聊web/data（容器内 root 可写，持久化）
 _CANDIDATE_DIRS = [
     os.environ.get("QL_DATA_DIR") or "",
-    "/volume1/docker/hermes/微信文件/轻聊web/data",
+    os.environ.get("QL_DATA_DIR", "/data"),
     os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "data"),
 ]
 
@@ -115,21 +129,17 @@ def load_config():
 
 
 def save_config(api_key, base_url=None, model=None):
-    cfg = load_config()
-    cfg["api_key"] = (api_key or "").strip()
-    if base_url:
-        cfg["base_url"] = base_url.strip()
-    if model:
-        cfg["model"] = model.strip()
-    cfg.setdefault("base_url", BASE_URL_DEFAULT)
-    cfg.setdefault("model", MODEL_DEFAULT)
-    p = config_path()
-    tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=1)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, p)
-    return cfg
+    with _CFG_LOCK:                     # 读改写整体串行：并发写 routing/custom 不互相覆盖
+        cfg = load_config()
+        cfg["api_key"] = (api_key or "").strip()
+        if base_url:
+            cfg["base_url"] = base_url.strip()
+        if model:
+            cfg["model"] = model.strip()
+        cfg.setdefault("base_url", BASE_URL_DEFAULT)
+        cfg.setdefault("model", MODEL_DEFAULT)
+        _atomic_write_json(config_path(), cfg)
+        return cfg
 
 
 def _mask(key):
@@ -148,6 +158,7 @@ def config_status():
         "config_path": config_path(),
         "presets": sorted(PRESETS),
         "routing": routing_cfg(),
+        "custom": custom_cfg(),
         "breaker": breaker_status(),
     }
 
@@ -163,7 +174,110 @@ ROUTING_DEFAULT = {
     "threshold": 0.6,         # needs_action 概率 ≥ 阈值 → 判「要干活」
     "breaker_fails": 3,       # 连续失败 N 次 → 熔断（0 = 关掉熔断）
     "breaker_cooldown_s": 300,  # 熔断持续秒数，到点自动半开重试（失败则再次熔断）
+    "backend": "typesafe",    # 判定后端：typesafe=云端 Jev / custom=自填 OpenAI 兼容模型 / local=本机 ollama
 }
+
+# ─── 本地判定后端（routing.backend = "local"）───
+# 用途：上游 TypeSafe 被地区封锁（451 not available in your region）时的替代。
+# 语义与云端 chat_router 对齐，但只判 needs_action 一件事 —— 小模型只够做二分类，
+# 不产出校准概率，故 prob 恒为 1.0/0.0，threshold 实际不起区分作用。
+# NAS 实测（Celeron N5105，N=10 条固定样例，见下方对照）——**默认用 1.7B**：
+#   模型/提示词/num_predict      得分    单次耗时（常驻后）
+#   Qwen3-0.6B + 现有提示词      4/10    1.9s   ← 判不准（倾向全判「纯聊天」，真任务会被丢掉）
+#   Qwen3-0.6B + few-shot        6/10    2.6s
+#   Qwen3-1.7B + 现有提示词       10/10   7.7s
+#   Qwen3-1.7B + 现有提示词 + np=1 10/10  4.1s   ← 取这档（准 + 快）
+#   Qwen3-1.7B + 精简提示词       7/10    4.8s   ← 提示词里的类别枚举不能省
+LOCAL_URL_DEFAULT = "http://192.168.1.10:11434"   # 容器→宿主必须用 LAN IP（无 host.docker.internal）
+LOCAL_MODEL_DEFAULT = "qwen3:1.7b"
+LOCAL_KEEP_ALIVE = "60m"        # 常驻内存，避免每条消息都撞冷加载（冷启 ~5s）
+LOCAL_TIMEOUT_MS = 15000        # 本地比云端慢得多，单独给足超时（云端仍走 routing.timeout_ms）
+LOCAL_PROMPT = (
+    "你是轻聊的会话路由器。判断用户这条消息是「要助手实际做事」还是「纯聊天」。\n"
+    "要做事：查数据、看/写文件、控制设备、发邮件、建提醒、生成文件、取外部信息。\n"
+    "纯聊天：打招呼、寒暄、闲聊、感慨、问常识、对上一轮做简短回应。\n"
+    "只输出 1（要做事）或 0（纯聊天），不要输出任何解释或其他文字。\n"
+    "用户消息：{msg}\n/no_think"
+)
+
+
+def local_cfg():
+    """本地判定配置（typesafe_config.json 顶层 "local" 段，缺省用 LOCAL_* 常量）。"""
+    raw = load_config().get("local")
+    out = {"url": LOCAL_URL_DEFAULT, "model": LOCAL_MODEL_DEFAULT,
+           "timeout_ms": LOCAL_TIMEOUT_MS, "keep_alive": LOCAL_KEEP_ALIVE}
+    if isinstance(raw, dict):
+        for k in out:
+            if raw.get(k):
+                out[k] = raw[k]
+    return out
+
+
+# ─── 自定义判定后端（routing.backend = "custom"）───
+# 给「用户自带 key 的 OpenAI 兼容模型」用（智谱 GLM-4.7-Flash / OpenRouter / 硅基流动 …），
+# 与 TypeSafe 只差协议：走标准 POST {base_url}/chat/completions + Authorization: Bearer。
+# key 存在后端配置文件（600 权限、接口只回掩码），App 设置页只做「读写 + 回显掩码」。
+# 默认留空：用户 2026-10-10 拍板「不预填厂商，自己填地址/模型/key」
+CUSTOM_BASE_URL_DEFAULT = ""
+CUSTOM_MODEL_DEFAULT = ""
+CUSTOM_TIMEOUT_MS = 4000
+CUSTOM_PROMPT = (
+    "你是会话路由器，只输出 JSON，不要任何解释。\n"
+    "判断用户这条消息是否需要助手实际执行操作：\n"
+    "查数据 / 读写文件 / 控制设备 / 发邮件 / 建提醒 / 生成文件 / 取外部信息 / 翻译润色 → true；\n"
+    "打招呼 / 寒暄 / 闲聊 / 感慨 / 问常识 / 对上一轮做简短回应 → false。\n"
+    '格式：{"needs_action": true 或 false}\n'
+    "用户消息：{msg}"
+)
+
+
+def custom_cfg(with_key=False):
+    """自定义判定模型配置（typesafe_config.json 顶层 "custom" 段）。默认不回显明文 key。"""
+    raw = load_config().get("custom")
+    out = {"base_url": CUSTOM_BASE_URL_DEFAULT, "model": CUSTOM_MODEL_DEFAULT,
+           "timeout_ms": CUSTOM_TIMEOUT_MS, "api_key": ""}
+    if isinstance(raw, dict):
+        for k in out:
+            if raw.get(k):
+                out[k] = raw[k]
+    out["configured"] = bool(out.get("api_key"))
+    if not with_key:
+        out["api_key"] = _mask(out.get("api_key"))
+    return out
+
+
+def save_custom(base_url=None, model=None, api_key=None):
+    """写自定义判定模型配置（保留其它字段）。api_key 省略/传掩码 = 不改，传空串 = 清空。"""
+    with _CFG_LOCK:                     # 读改写整体串行（同上）
+        return _save_custom_locked(base_url, model, api_key)
+
+
+def _save_custom_locked(base_url=None, model=None, api_key=None):
+    cfg = load_config()
+    cur = cfg.get("custom") if isinstance(cfg.get("custom"), dict) else {}
+    nxt = dict(cur)                     # 保留 timeout_ms 等自定义键（旧写法只列三键会悄悄丢掉它们）
+    nxt["base_url"] = nxt.get("base_url") or CUSTOM_BASE_URL_DEFAULT
+    nxt["model"] = nxt.get("model") or CUSTOM_MODEL_DEFAULT
+    nxt["api_key"] = nxt.get("api_key") or ""
+    if base_url is not None:
+        b = str(base_url).strip()
+        if b and not (b.startswith("http://") or b.startswith("https://")):
+            raise ValueError("接口地址需以 http:// 或 https:// 开头")
+        nxt["base_url"] = b.rstrip("/") or CUSTOM_BASE_URL_DEFAULT
+    if model is not None:
+        nxt["model"] = str(model).strip() or CUSTOM_MODEL_DEFAULT
+    if api_key is not None:
+        k = str(api_key).strip()
+        if "…" in k or k in ("未配置", "已配置", "已设置") or (k and set(k) <= set("*•.")):
+            pass                                   # 回传的是掩码 → 视为未改动
+        elif k and len(k) < 8:
+            raise ValueError("API Key 太短（至少 8 位）")
+        else:
+            nxt["api_key"] = k                     # 空串 = 清空
+    cfg["custom"] = nxt
+    _atomic_write_json(config_path(), cfg)
+    return custom_cfg()
+
 
 # ─── 熔断状态（进程内，key 失效/上游挂掉时不再每条消息白等一次判定）───
 _BREAKER = {"fails": 0, "openedAt": 0.0, "until": 0.0, "lastError": "", "trips": 0}
@@ -276,6 +390,11 @@ def _coerce_routing(name, v):
         if m not in ("smart", "off", "force_agent"):
             raise ValueError("mode 只能是 smart / off / force_agent")
         return m
+    if name == "backend":
+        b = str(v or "").strip().lower()
+        if b not in ("typesafe", "custom", "local"):
+            raise ValueError("backend 只能是 typesafe / custom / local")
+        return b
     if name in ROUTING_HINTS:
         try:
             n = int(v)
@@ -297,24 +416,41 @@ def _coerce_routing(name, v):
 
 
 def _atomic_write_json(path, obj, mode=0o600):
-    """原子写 JSON，保留原文件属主与权限（mkstemp/replace 不可只沿 mode）。"""
+    """原子写 JSON，保留原文件属主与权限。
+
+    ⚠️ 旧写法踩过两个真坑（2026-10-10 审查）：
+      ① 固定 tmp 名 + 「先 open 后 chmod」：并发的两个写请求会互相 replace 走 tmp（后者抛
+         FileNotFoundError → HTTP 500），且 open 按 umask(022) 建出 0644 —— 明文 api_key
+         有短暂可读窗口 → 改 mkstemp（天生 0600）+ 全程持 _CFG_LOCK。
+      ② 读改写不串行会丢另一段修改 → 所有写入口统一走本函数（锁在内部；调用方已持锁也
+         不会死锁，_CFG_LOCK 是 RLock）。
+    """
     st = None
     try:
         st = os.stat(path)
     except OSError:
         pass
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=1)
-        f.flush()
-        os.fsync(f.fileno())
-    os.chmod(tmp, (st.st_mode & 0o777) if st else mode)
-    os.replace(tmp, path)
-    if st:
+    with _CFG_LOCK:
+        fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp",
+                                   dir=os.path.dirname(path) or ".")
         try:
-            os.chown(path, st.st_uid, st.st_gid)
-        except OSError:
-            pass
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(obj, f, ensure_ascii=False, indent=1)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, (st.st_mode & 0o777) if st else mode)
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        if st:
+            try:
+                os.chown(path, st.st_uid, st.st_gid)
+            except OSError:
+                pass
 
 
 def save_routing(patch):
@@ -335,6 +471,128 @@ def save_routing(patch):
     return cur
 
 
+def _parse_yesno(text):
+    """把本地小模型的极短输出解析成 True/False；判断不了返回 None（调用方据此回退 Agent）。"""
+    s = (text or "").strip()
+    if not s:
+        return None
+    low = s.lower().replace('"', "")
+    i = low.find("needs_action")
+    if i >= 0:                      # 优先认 JSON 形态 {"needs_action": true}
+        seg = low[i:i + 24]
+        if "true" in seg:
+            return True
+        if "false" in seg:
+            return False
+    if "true" in low:
+        return True
+    if "false" in low:
+        return False
+    for ch in s:
+        if ch in ("1", "是", "有", "y", "对"):
+            return True
+        if ch in ("0", "否", "无", "n", "不"):
+            return False
+        if ch in " \t\r\n\"'`。，,.：:;-—…":
+            continue
+        break
+    return None
+
+
+def _call_local(state, timeout, meta=None):
+    """本地 ollama 判定（routing.backend=local）：返回 (prob, model)，prob ∈ {1.0, 0.0}。
+
+    任何异常 / 输出无法解析 → 抛异常，由 route() 的熔断与 fail-open 兜底（回退走 Agent）。
+    故意不返回 None 概率：None 会被上层当成「纯聊天」，把真任务判掉才是危险方向。
+    """
+    lc = meta or local_cfg()
+    base = {
+        "model": lc.get("model") or LOCAL_MODEL_DEFAULT,
+        # 必须显式关思考：Qwen3 默认先出思考段，num_predict 小时 content 会是空串、
+        # done_reason=length（实测踩过 → 判定直接失败）。think=False 后 2 个 token 就出结果。
+        "think": False,
+        "messages": [{"role": "user", "content": LOCAL_PROMPT.replace("{msg}", state)}],
+        "stream": False,
+        "keep_alive": lc.get("keep_alive") or LOCAL_KEEP_ALIVE,
+        # num_predict=1：只要那一个数字。实测 8 → 1 把 1.7B 的单次判定从 7.7s 压到 4.1s
+        # （准确率不变，仍是 10/10），判定在用户每条消息的关键路径上，这里省下的都是体感。
+        "options": {"temperature": 0, "num_predict": 1},
+    }
+    url = (lc.get("url") or LOCAL_URL_DEFAULT).rstrip("/") + "/api/chat"
+    data = None
+    for payload in (base, {k: v for k, v in base.items() if k != "think"}):
+        req = urllib.request.Request(
+            url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), method="POST")
+        req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 400 and "think" in payload:   # 老版 ollama 不认 think 字段
+                continue
+            raise
+    if data is None:
+        raise RuntimeError("本地判定请求失败")
+    txt = ((data.get("message") or {}).get("content") or "").strip()
+    yes = _parse_yesno(txt)
+    if yes is None:
+        raise RuntimeError("本地判定输出无法解析：%r" % txt[:60])
+    return (1.0 if yes else 0.0), (data.get("model") or lc.get("model"))
+
+
+def _call_custom(state, timeout, meta=None):
+    """自定义 OpenAI 兼容判定（routing.backend=custom）：返回 (prob, model)，prob ∈ {1.0, 0.0}。
+
+    与 _call_local 同契约：任何异常/解析不出 → 抛异常，由 route() 熔断 + fail-open 兜底。
+    """
+    cc = meta or custom_cfg(with_key=True)
+    key = (cc.get("api_key") or "").strip()
+    if not key:
+        raise RuntimeError("自定义判定模型未配置 API Key")
+    base = (cc.get("base_url") or CUSTOM_BASE_URL_DEFAULT).strip()
+    if not base:
+        raise RuntimeError("自定义判定模型未配置接口地址")
+    if not (cc.get("model") or CUSTOM_MODEL_DEFAULT).strip():
+        raise RuntimeError("自定义判定模型未配置模型名")
+    url = base.rstrip("/") + "/chat/completions"
+    # 2026-10-10：思考型模型（GLM-4.5+/GLM-5.x 等）会把 max_tokens=16 全花在 reasoning_content 上，
+    # content 恒为空 → 判定永远解析失败（实测 glm-4.5-air/4.6/4.7-flash/5.x 全部如此）。
+    # 带上「关思考」参数；上游不认识该参数时（400/422）自动退回不含它的原始形态，保证第三方
+    # OpenAI 兼容服务（OpenRouter / 硅基流动…）仍然可用。
+    body = {
+        "model": cc.get("model") or CUSTOM_MODEL_DEFAULT,
+        "messages": [{"role": "user", "content": CUSTOM_PROMPT.replace("{msg}", state)}],
+        "temperature": 0,
+        "max_tokens": 16,
+        "stream": False,
+    }
+    data = None
+    for _extra in ({"thinking": {"type": "disabled"}}, None):
+        payload = dict(body)
+        if _extra:
+            payload.update(_extra)
+        req = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Authorization", "Bearer " + key)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+            break
+        except urllib.error.HTTPError as e:
+            if _extra is None or e.code not in (400, 422):
+                raise
+    try:
+        txt = data["choices"][0]["message"]["content"]
+    except Exception:
+        raise RuntimeError("自定义判定响应结构异常：%s"
+                           % json.dumps(data, ensure_ascii=False)[:120])
+    yes = _parse_yesno(txt)
+    if yes is None:
+        raise RuntimeError("自定义判定输出无法解析：%r" % (txt or "")[:60])
+    return (1.0 if yes else 0.0), (data.get("model") or cc.get("model"))
+
+
 def route(text, timeout_ms=None, cfg=None):
     """会话路由判定：{"ok", "needs_action", "needs_action_prob", "urgency_prob",
     "reply_mode", "model", "ms"}。任何异常/超时 → ok=False，调用方按现状处理（fail-open）。
@@ -348,11 +606,39 @@ def route(text, timeout_ms=None, cfg=None):
         b = breaker_status()
         return {"ok": False, "breaker": True, "remain_s": b["remain_s"],
                 "error": "判定熔断中（连续 %d 次失败，%ds 后自动恢复）" % (fails_limit, b["remain_s"])}
-    timeout = float(timeout_ms or c.get("timeout_ms") or ROUTING_DEFAULT["timeout_ms"]) / 1000.0
+    backend = str(c.get("backend") or ROUTING_DEFAULT["backend"]).strip().lower()
+    urgency = reply_mode = reply_mode_prob = None
     try:
+        # 超时换算也放进 try：配置被手改成非数值时同样走 fail-open，而不是抛穿 route()
+        if backend == "local":
+            timeout = float(local_cfg().get("timeout_ms") or LOCAL_TIMEOUT_MS) / 1000.0
+        elif backend == "custom":
+            timeout = float(custom_cfg().get("timeout_ms") or CUSTOM_TIMEOUT_MS) / 1000.0
+        else:
+            timeout = float(timeout_ms or c.get("timeout_ms") or ROUTING_DEFAULT["timeout_ms"]) / 1000.0
         t0 = time.time()
-        data = _call(t[:MAX_STATE_CHARS], PRESETS["chat_router"]["questions"], timeout=timeout)
+        if backend == "custom":
+            prob, model = _call_custom(t[:MAX_STATE_CHARS], timeout)
+        elif backend == "local":
+            prob, model = _call_local(t[:MAX_STATE_CHARS], timeout)
+        else:
+            data = _call(t[:MAX_STATE_CHARS], PRESETS["chat_router"]["questions"], timeout=timeout)
+            ans = data.get("answers") or {}
+            prob = (ans.get("needs_action") or {}).get("noul")
+            if prob is None:
+                # 上游没给 needs_action 时**绝不能静默判成纯聊天** —— 真任务会被当闲聊丢掉。
+                # 抛错走 fail-open + 熔断计数（与 _call_local 的注释同一口径）。
+                raise RuntimeError("上游未返回 needs_action")
+            urgency = (ans.get("urgency") or {}).get("noul")
+            reply_mode = (ans.get("reply_mode") or {}).get("choice")
+            reply_mode_prob = (ans.get("reply_mode") or {}).get("confidence")
+            model = data.get("model")
         ms = int((time.time() - t0) * 1000)
+        try:
+            threshold = float(c.get("threshold") or ROUTING_DEFAULT["threshold"])
+        except Exception:
+            threshold = ROUTING_DEFAULT["threshold"]
+        needs = float(prob) >= threshold      # prob 非数值 → 抛错走 fail-open，不静默判闲聊
     except Exception as e:
         err = "%s: %s" % (type(e).__name__, str(e)[:160])
         tripped, fails_now = _breaker_record(False, err, fails_limit, cooldown_s)
@@ -361,28 +647,21 @@ def route(text, timeout_ms=None, cfg=None):
                   % (fails_limit, int(cooldown_s), err), flush=True)
         return {"ok": False, "error": err, "breaker": bool(tripped or _breaker_open()),
                 "fails": fails_now}
-    ans = data.get("answers") or {}
-    na = ans.get("needs_action") or {}
-    prob = na.get("noul")
-    try:
-        threshold = float(c.get("threshold") or ROUTING_DEFAULT["threshold"])
-    except Exception:
-        threshold = ROUTING_DEFAULT["threshold"]
-    needs = None if prob is None else (float(prob) >= threshold)
     out = {
         "ok": True,
+        "backend": backend,
         "needs_action": bool(needs),
         "needs_action_prob": prob,
         "threshold": threshold,
-        "urgency_prob": (ans.get("urgency") or {}).get("noul"),
-        "reply_mode": (ans.get("reply_mode") or {}).get("choice"),
-        "reply_mode_prob": (ans.get("reply_mode") or {}).get("confidence"),
-        "model": data.get("model"),
+        "urgency_prob": urgency,
+        "reply_mode": reply_mode,
+        "reply_mode_prob": reply_mode_prob,
+        "model": model,
         "ms": ms,
     }
     _breaker_record(True, "", fails_limit, cooldown_s)
-    print("[typesafe-route] needs_action=%s p=%s mode=%s ms=%d" %
-          (out["needs_action"], prob, out["reply_mode"], ms), flush=True)
+    print("[typesafe-route] backend=%s needs_action=%s p=%s mode=%s ms=%d" %
+          (backend, out["needs_action"], prob, reply_mode, ms), flush=True)
     return out
 
 
@@ -478,6 +757,7 @@ def judge(body, preset_override=None):
 JUDGE_PATHS = ("/api/typesafe/judge", "/api/agent/typesafe/judge")
 HEALTH_PATHS = ("/api/typesafe/health", "/api/agent/typesafe/health")
 ROUTING_PATHS = ("/api/typesafe/routing", "/api/agent/typesafe/routing")
+MODEL_PATHS = ("/api/typesafe/model", "/api/agent/typesafe/model")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -520,6 +800,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "routing": routing_cfg(), "breaker": breaker_status(),
                              "restart_needed": False})
             return
+        if p in MODEL_PATHS:
+            # custom = 用户自带 key 的模型；local = 本机模型（设置页第三档只读展示）
+            self._send(200, {"ok": True, "custom": custom_cfg(), "local": local_cfg()})
+            return
         self._send(404, {"error": "Not Found"})
 
     def do_POST(self):
@@ -527,7 +811,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(401, {"error": "未授权"})
             return
         p = self._path()
-        if p not in JUDGE_PATHS and p not in ROUTING_PATHS:
+        if p not in JUDGE_PATHS and p not in ROUTING_PATHS and p not in MODEL_PATHS:
             self._send(404, {"error": "Not Found"})
             return
         try:
@@ -547,7 +831,8 @@ class Handler(BaseHTTPRequestHandler):
             # 写开关/改配置：{"enabled":false} / {"mode":"smart"} / {"reset_breaker":true}
             try:
                 patch = dict(body)
-                reset = bool(patch.pop("reset_breaker", False))
+                # 与 CLI 同口径解析：字符串 "false" 不能被 bool() 当成 True（会误复位熔断）
+                reset = str(patch.pop("reset_breaker", "")).lower() in ("1", "true", "yes", "on")
                 if reset:
                     reset_breaker()
                 if not patch and not reset:
@@ -561,6 +846,41 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:200])})
                 return
             self._send(200, {"ok": True, "routing": cfg, "breaker": breaker_status(),
+                             "restart_needed": False})
+            return
+        if p in MODEL_PATHS:
+            # 写「自定义判定模型」：{"base_url":..,"model":..,"api_key":..}
+            # api_key 省略 = 不改；传空串 = 清空（UI 回显的是掩码，没动过就别传）
+            try:
+                if any(k in body for k in ("base_url", "model", "api_key")):
+                    save_custom(base_url=body.get("base_url") if "base_url" in body else None,
+                                model=body.get("model") if "model" in body else None,
+                                api_key=body.get("api_key") if "api_key" in body else None)
+            except ValueError as e:
+                self._send(400, {"ok": False, "error": str(e)})
+                return
+            except Exception as e:
+                self._send(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:200])})
+                return
+            if body.get("test"):
+                # 测「当前判定后端」（云端 / 自定义 / 本机三档都覆盖）：直接走 route()，
+                # 与生产同一份链路，看到的就是真实判定结果与耗时。
+                # 先复位熔断：用户显式点的测试，不该被历史熔断状态挡成「熔断中」。
+                reset_breaker()
+                rc = routing_cfg()
+                be = str(rc.get("backend") or ROUTING_DEFAULT["backend"]).lower()
+                out = []
+                for sample in ("帮我把这个文件转成 PDF", "你好呀"):
+                    t0 = time.time()
+                    r = route(sample, cfg=rc)
+                    out.append({"text": sample, "ok": bool(r.get("ok")),
+                                "needs_action": bool(r.get("needs_action")),
+                                "ms": r.get("ms") or int((time.time() - t0) * 1000),
+                                "error": r.get("error") or ""})
+                self._send(200, {"ok": all(x.get("ok") for x in out), "backend": be,
+                                 "test": out, "custom": custom_cfg(), "local": local_cfg()})
+                return
+            self._send(200, {"ok": True, "custom": custom_cfg(), "local": local_cfg(),
                              "restart_needed": False})
             return
         try:
@@ -629,6 +949,42 @@ def _main(argv):
         print(json.dumps({"ok": True, "routing": routing_cfg(), "breaker": breaker_status()},
                          ensure_ascii=False, indent=2))
         return 0
+    if argv[0] == "model":
+        # 读/写自定义判定模型（v4.0.87）：model [base_url=.. model=.. api_key=.. test=true]
+        if len(argv) == 1:
+            print(json.dumps({"custom": custom_cfg()}, ensure_ascii=False, indent=2))
+            return 0
+        patch = {}
+        do_test = False
+        for a in argv[1:]:
+            if "=" not in a:
+                print("用法：model [base_url=.. model=.. api_key=.. test=true]")
+                return 2
+            k, v = a.split("=", 1)
+            k = k.strip()
+            if k == "test":
+                do_test = v.strip().lower() in ("1", "true", "yes", "on")
+                continue
+            patch[k] = v.strip()
+        try:
+            if patch:
+                save_custom(base_url=patch.get("base_url"), model=patch.get("model"),
+                            api_key=patch.get("api_key"))
+        except ValueError as e:
+            print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+            return 1
+        print(json.dumps({"ok": True, "custom": custom_cfg()}, ensure_ascii=False, indent=2))
+        if do_test:
+            tmo = float(custom_cfg().get("timeout_ms") or CUSTOM_TIMEOUT_MS) / 1000.0
+            for sample in ("帮我把这个文件转成 PDF", "你好呀"):
+                t0 = time.time()
+                try:
+                    prob, _m = _call_custom(sample, tmo)
+                    print("  %s → %s · %dms" % (sample, "要干活" if prob >= 0.5 else "纯聊天",
+                                                int((time.time() - t0) * 1000)))
+                except Exception as e:
+                    print("  %s → 失败：%s: %s" % (sample, type(e).__name__, str(e)[:120]))
+        return 0
     if argv[0] == "judge" and len(argv) >= 3:
         body = {"preset": argv[1], "state": argv[2]}
         try:
@@ -647,3 +1003,4 @@ def _main(argv):
 
 if __name__ == "__main__":
     sys.exit(_main(sys.argv[1:]))
+
