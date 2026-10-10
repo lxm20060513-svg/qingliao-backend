@@ -15,8 +15,7 @@ GET /api/version → {"ok": true, "version": "4.0.13", "commit": "bfe45a0",
    文件优先是给 bind mount / 手动部署用的：部署脚本写一次 backend/QL_VERSION 即生效
    （读盘带 60 秒缓存），**不必 `docker compose up -d` 重建容器去刷 env**；
    镜像部署（Dockerfile 注入 env、盘上无该文件）时自动回落到环境变量。
-   - backend/QL_VERSION：update.sh（git 装法）会写；手动/bind mount 部署自行写一份即可
-     （第一行版本号，可选第二行 commit、第三行日期）
+   - backend/QL_VERSION：手动/bind mount 部署由 `ql backend stamp` 写（版本/源码指纹/日期）
    - QL_BACKEND_COMMIT / QL_BACKEND_BUILT 同序遍历（各自缺失则单独回落）
    都没有则返回 version=""，App 侧显示"未知"而不是报错。
 3. 只加字段不改语义，与任何现有接口零耦合。
@@ -44,11 +43,7 @@ _CACHE_TTL = 60   # 60 秒：update.sh 更新后最多 1 分钟生效，避免�
 
 
 def _read_version_file():
-    """从 QL_VERSION 文件读版本（内容形如 `4.0.13` 或 `4.0.13\nbfe45a0\n2026-09-30`）
-
-    文件名带 QL_ 前缀是必须的：轻聊后端目录里本来就有个裸 `VERSION` 文件
-    （mail 模块的 IMAP 客户端标识，内容 "1.0.0"），读到它会把后端版本误报成 1.0.0。
-    """
+    """从 VERSION 文件读版本（内容形如 `4.0.13` 或 `4.0.13\nbfe45a0\n2026-09-30`）"""
     for path in _VERSION_FILES:
         try:
             with open(path, encoding="utf-8") as f:

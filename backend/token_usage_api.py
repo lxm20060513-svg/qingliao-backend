@@ -2,8 +2,8 @@
 """轻聊 · token 用量聚合（v3.9.82 · 看板「模型用量」栏第二块）
 
 数据源：Hermes 生产库 state.db 的 `sessions` 表（**只读**）。
-  容器内可见路径 <QL_HERMES_STATE_DB>
-  （= 宿主 `/opt/data/state.db` = NAS 挂载 `/opt/hermes_host/hermes-data/state.db`，同一 inode）。
+  容器内可见路径 `/data/hermes/state.db`
+  （= 宿主 `/data/hermes/state.db` = NAS 挂载 `/data/hermes/hermes-data/state.db`，同一 inode）。
 
 口径（与 App 卡片标签一致，均为**自然日/自然月**，非滚动 24 小时）：
   - 时间轴走 `started_at`（会话开始时刻），时区 CST(UTC+8) —— 宿主/容器可能是 UTC，
@@ -26,9 +26,9 @@ import time
 # 环境变量优先（便于换库/测试），否则按容器 → 宿主顺序探测
 DB_CANDIDATES = [
     os.environ.get("QL_STATE_DB") or "",
-    os.environ.get("QL_HERMES_STATE_DB","/data/hermes/state.db"),
-    "/opt/data/state.db",
-    "/opt/hermes_host/hermes-data/state.db",
+    os.environ.get("QL_HERMES_DATA", "/data/hermes") + "/state.db",
+    os.environ.get("QL_HERMES_DATA", "/data/hermes") + "/state.db",
+    "/data/hermes/hermes-data/state.db",
 ]
 # 用户所在时区（北京 +8）。宿主/容器是 UTC，故不跟随系统 localtime。
 TZ_OFFSET_HOURS = float(os.environ.get("QL_TZ_OFFSET") or 8)
@@ -72,6 +72,33 @@ def _agg(con, since):
     }
 
 
+TREND_DAYS = 7
+
+
+def _daily_series(con, tz, since_floor, days=TREND_DAYS):
+    """近 days 个自然日（含今天，升序）的每日 token 总量 → [{"key","total"}, …]，缺失日补 0。
+    口径与 today/month 一致（total = input+output+cache_read+cache_write，同一张 sessions 表），
+    并在 Python 侧按 +8 归日（不赌宿主 sqlite 的 date() 时区行为）。"""
+    now = datetime.datetime.now(tz)
+    first = datetime.datetime(now.year, now.month, now.day, tzinfo=tz) - datetime.timedelta(days=days - 1)
+    since = max(first.timestamp(), float(since_floor or 0))
+    rows = con.execute(
+        "SELECT started_at,"
+        " COALESCE(input_tokens,0)+COALESCE(output_tokens,0)"
+        "+COALESCE(cache_read_tokens,0)+COALESCE(cache_write_tokens,0)"
+        " FROM sessions WHERE started_at >= ?", (since,)).fetchall()
+    buckets = {}
+    for ts, tot in rows:
+        try:
+            key = datetime.datetime.fromtimestamp(float(ts), tz).strftime("%Y-%m-%d")
+        except (TypeError, ValueError, OSError):
+            continue
+        buckets[key] = buckets.get(key, 0) + int(tot or 0)
+    return [{"key": (first + datetime.timedelta(days=i)).strftime("%Y-%m-%d"),
+             "total": buckets.get((first + datetime.timedelta(days=i)).strftime("%Y-%m-%d"), 0)}
+            for i in range(days)]
+
+
 def collect_token_usage(now_ts=None):
     """返回给 `/api/nas/token-usage` 的 JSON（永不带异常，失败时 ok:false + error）。"""
     path = _db_path()
@@ -86,6 +113,8 @@ def collect_token_usage(now_ts=None):
         try:
             today = _agg(con, day0)
             month = _agg(con, mon0)
+            # P3-16：近 7 天趋势（同库同口径；起点同受重置起点约束）
+            daily = _daily_series(con, tz, _rp)
         finally:
             con.close()
     except Exception as e:                       # 库被占/表结构变化都不该让面板整块塌掉
@@ -98,6 +127,7 @@ def collect_token_usage(now_ts=None):
         "db": path,
         "today": today,
         "month": month,
+        "daily": daily,
     }
 
 

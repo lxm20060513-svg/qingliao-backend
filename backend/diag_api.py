@@ -8,7 +8,7 @@
   GET  /api/diag/ping     ← 连通性 + 延迟探针（诊断页「后端连通性」用，不落盘）
   GET  /api/diag/stats    ← 计数汇总（崩溃数/卡顿数/最近时间）
 
-落盘（QL_DIAG_DIR，默认 <QL_DATA_DIR>/diag，不可写则退到 /tmp/qingliao_diag）：
+落盘（QL_DIAG_DIR，默认 /data/diag，不可写则退到 /tmp/qingliao_diag）：
   <DIAG_DIR>/reports.jsonl   每行一条事件（JSONL 追加写，超过 ROTATE_LINES 行自动裁剪）
   <DIAG_DIR>/diag.log        人类可读摘要日志（时间/类型/摘要）
 
@@ -31,8 +31,7 @@ MAX_BODY_BYTES = 256 * 1024      # 单条上报上限 256KB（防大 body 打爆
 ROTATE_LINES = 2000              # jsonl 超过该行数则裁剪
 KEEP_LINES = 1000
 
-_DEFAULT_DIR = os.path.join(
-    os.environ.get("QL_DATA_DIR", "/volume1/docker/hermes/微信文件/轻聊web/data"), "diag")
+_DEFAULT_DIR = os.environ.get("QL_DATA_DIR", "/data") + "/diag"
 _FALLBACK_DIR = "/tmp/qingliao_diag"
 
 # 字段白名单（与 iOS 端 DiagnosticsPayload.allowedKeys 保持一致）

@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """MEDIA 协议 → data URL 图片转换（v2.0.130 + 2026-08-17）
 
-问题：Hermes Agent 回复图片时输出 MEDIA:/路径 协议（如 MEDIA:/opt/data/random_image.jpg），
+问题：Hermes Agent 回复图片时输出 MEDIA:/路径 协议（如 MEDIA:/data/hermes/random_image.jpg），
 App 端只认 markdown 图片语法 ![alt](url)，导致图片显示成一行路径文本（用户实测反馈）。
 
 方案：写入侧把 MEDIA: 路径转成 data:image base64 URL（App v2.0.128 已支持 data URL 本地解码），
 零 App 改动、免鉴权、蜂窝环境最稳。只在非流式写入/全量读取处转换（流式增量轮询按 offset
 推进，中途变长会错位——Agent 路径是一次性写入，安全）。
 
-路径映射：Hermes 容器 /opt/data = 宿主 <QL_HERMES_DATA_DIR>
+路径映射：Hermes 容器 /data/hermes = NAS 宿主 /data/hermes
 （qingliao 后端跑在宿主 systemd，读宿主路径）。
 """
 import base64
@@ -17,13 +17,13 @@ import re
 
 # 容器路径前缀 → 宿主真实路径（按 docker-compose 挂载）
 # 生产口径默认值（本部署 env 未设时兜底为宿主真实路径；env 已在 compose .env 显式注入）
-_HERMES_DATA = os.environ.get("QL_HERMES_DATA_DIR", "/data/hermes")
+_HERMES_DATA = os.environ.get("QL_HERMES_DATA_DIR", os.environ.get("QL_HERMES_DATA", "/data/hermes"))
 _HERMES_ROOT = (os.environ.get("QL_HERMES_ROOT_DIR")
-                or os.environ.get("QL_HERMES_ROOT") or "/data")
+                or os.environ.get("QL_HERMES_ROOT") or os.environ.get("QL_DOCKER_ROOT", "/data/docker"))
 
 _PREFIX_MAP = [
-    ("/opt/data", _HERMES_DATA),
-    ("/opt/hermes_host", _HERMES_ROOT),
+    (os.environ.get("QL_HERMES_DATA", "/data/hermes"), _HERMES_DATA),
+    (os.environ.get("QL_HERMES_ROOT", "/data/hermes"), _HERMES_ROOT),
 ]
 
 
@@ -41,13 +41,13 @@ def media_roots():
     roots = [host for _, host in _PREFIX_MAP]
     roots += [_HERMES_DATA, _HERMES_ROOT,
               os.environ.get("QL_HERMES_HOST_DIR", "/data/hermes_host"),
-              os.environ.get("QL_UPLOAD_DIR", "/data/uploads"),
-              os.path.join(os.environ.get("QL_DATA_DIR", "/volume1/docker/hermes/微信文件/轻聊web/data"), "files")]
+              os.environ.get("QL_UPLOAD_DIR", os.environ.get("QL_UPLOAD_DIR", "/data/uploads")),
+              os.path.join(os.environ.get("QL_DATA_DIR", os.environ.get("QL_DATA_DIR", "/data")), "files")]
     # 生产护栏：任何白名单根不得是 QL_DATA_DIR 的祖先（含相等）。本部署的映射表里
-    # /opt/hermes_host → <QL_HERMES_ROOT_DIR> 是**整个 docker 根**，而 DATA_DIR 就在它下面；
+    # /data/hermes → /data/docker 是**整个 docker 根**，而 DATA_DIR 就在它下面；
     # 照抄上游「白名单与映射表同源」会把 DATA_DIR 根部的 auth_tokens.json / sessions/ 重新
     # 暴露成免鉴权可读（实测 403→200）。这里自动剔除这类祖先根，映射保持可用、沙箱不放开。
-    _d = os.path.realpath(os.environ.get("QL_DATA_DIR", "/volume1/docker/hermes/微信文件/轻聊web/data"))
+    _d = os.path.realpath(os.environ.get("QL_DATA_DIR", os.environ.get("QL_DATA_DIR", "/data")))
     out, seen = [], set()
     for r in roots:
         if not r or r in seen:

@@ -16,8 +16,8 @@
 
 为什么 CLI 要 docker exec：官方 skill 的 CLI 是 node 程序，而 node 只装在 hermes 容器里
 （qingliao 容器只有 python3）。skills 目录是同一宿主目录
-（宿主 <QL_HOST_SKILLS_DIR> → hermes 容器内 /opt/data/skills），
-所以这里统一「qingliao 容器内 docker exec hermes-hermes-1 node ...」。
+（/data/hermes/skills → hermes 容器内 /data/hermes/skills），
+所以这里统一「qingliao 容器内 docker exec hermes-container node ...」。
 探活顺序固定：install.sh → login --token → get-user-info → 一个最轻的读操作（browse 根目录），
 三段都拿到 code:0 才算接入成功（只到 install.sh 不算数）。
 """
@@ -35,10 +35,10 @@ import zipfile
 from http.server import BaseHTTPRequestHandler
 
 # ── 环境 ──
-HERMES_CONTAINER = os.environ.get("QL_HERMES_CONTAINER", "hermes-hermes-1")
-# 宿主 skills 目录（qingliao 容器挂载 /volume1；hermes 容器内对应 /opt/data/skills）
-HOST_SKILLS_DIR = os.environ.get("QL_HOST_SKILLS_DIR", "/data/hermes/skills")
-HERMES_SKILLS_DIR = "/opt/data/skills"
+HERMES_CONTAINER = os.environ.get("QL_HERMES_CONTAINER", os.environ.get("QL_HERMES_CONTAINER", "hermes-container"))
+# 宿主 skills 目录（qingliao 容器挂载 /data；hermes 容器内对应 /data/hermes/skills）
+HOST_SKILLS_DIR = os.environ.get("QL_HOST_SKILLS_DIR", os.environ.get("QL_HERMES_DATA", "/data/hermes") + "/skills")
+HERMES_SKILLS_DIR = os.environ.get("QL_HERMES_DATA", "/data/hermes") + "/skills"
 DRIVE_REGISTRY = os.environ.get("QL_DRIVE_REGISTRY", "/data/cloud_drives.json")
 DL_DIR = os.environ.get("QL_CLOUDDRIVE_DL", "/data/clouddrive_dl")
 
@@ -94,7 +94,7 @@ def _skill_path(host_dir, skill_id):
 
 def run_cli(skill_id, args, timeout=CLI_TIMEOUT):
     """在 hermes 容器内跑官方 CLI；返回 (code, stdout_text)。"""
-    entry = "/opt/data/skills/%s/scripts/quark-drive.cjs" % skill_id
+    entry = os.environ.get("QL_HERMES_DATA", "/data/hermes") + "/skills/%s/scripts/quark-drive.cjs" % skill_id
     cmd = ["docker", "exec"]
     for k, v in AGENT_ENV.items():
         cmd += ["-e", "%s=%s" % (k, v)]
@@ -212,8 +212,8 @@ def install_skill(skill_url):
         if not os.path.isfile(installer):  # 平铺包:install.sh 在根级(官方 1.0.20+)
             installer = os.path.join(dest, "install.sh")
         if os.path.isfile(installer):
-            # install.sh 需要 node,只在 hermes 容器里有;dest 已挂载为她的 /opt/data/skills/<id>
-            hermes_dest = os.path.join("/opt/data/skills", skill_id)
+            # install.sh 需要 node,只在 hermes 容器里有;dest 已挂载为她的 /data/hermes/skills/<id>
+            hermes_dest = os.path.join(os.environ.get("QL_HERMES_DATA", "/data/hermes") + "/skills", skill_id)
             r = subprocess.run(["docker", "exec", HERMES_CONTAINER, "bash", hermes_dest + installer[len(dest):]],
                                capture_output=True, text=True,
                                timeout=INSTALL_TIMEOUT, cwd=dest)

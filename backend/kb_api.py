@@ -27,7 +27,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler
 
 KB_DIR = os.environ.get("QL_KB_DIR",
-                        "/volume1/docker/hermes/微信文件/轻聊web/data/kb")
+                        os.environ.get("QL_DATA_DIR", "/data") + "/kb")
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
 MAX_DOC = 50

@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ROUTER_DEFAULT = {'host': os.environ.get("QL_ROUTER_HOST", ""), 'port': 22, 'username': os.environ.get("QL_ROUTER_USER", "root"), 'password': os.environ.get("QL_ROUTER_PASS", "")}
 CONTAINER = os.environ.get('QL_HERMES_CONTAINER', 'hermes-container')
-PY = "/opt/hermes/.venv/bin/python3"  # v-fix: hermes 容器内解释器（qingliao 的 sys.executable 在目标容器不存在）
+PY = os.environ.get("QL_HERMES_PYTHON", sys.executable)  # v-fix: hermes 容器内解释器（qingliao 的 sys.executable 在目标容器不存在）
 
 def _router_cred():
     try:
@@ -55,7 +55,7 @@ def _router_exec(cmds, pty=False, timeout=45):
                                  user=cred['username'], pw=cred['password'])
     payload = base64.b64encode(json.dumps(cmds).encode()).decode()
     r = subprocess.run(
-        ['docker', 'exec', CONTAINER, 'env', 'PYTHONPATH=/opt/data/paramiko_old/lib/python3.13/site-packages', PY, '-c', script, payload, '1' if pty else '0'],
+        ['docker', 'exec', CONTAINER, 'env', 'PYTHONPATH=/data/paramiko/site-packages', PY, '-c', script, payload, '1' if pty else '0'],
         capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
         # v2.0.93f：PTY 下 recv_exit_status 遇命令退出码非 0 时 paramiko 可能抛异常，
