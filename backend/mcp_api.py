@@ -24,12 +24,14 @@ import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler
 
-# Hermes config.yaml 路径（qingliao 容器已挂载 /volume1，hermes-data 同一宿主目录）
+import yaml
+
+# Hermes config.yaml 路径（qingliao 容器已挂载 /data，hermes-data 同一宿主目录）
 # ⚠️ 生产口径：本值是 Hermes 网关真正读取的 config.yaml（mcp_servers 写在这里），
 # 不能改成 QL_HERMES_CONFIG（那是轻聊侧 provider key 台账，Hermes 不读）——否则
 # App「MCP 工具服务」的保存会写进没人读的文件而静默失效。
-HERMES_CONFIG_PATH = os.environ.get("QL_HERMES_CONFIG","/volume1/docker/hermes/hermes-data/config.yaml")
-HERMES_CONTAINER = "hermes-hermes-1"
+HERMES_CONFIG_PATH = os.environ.get("QL_HERMES_DATA", "/data/hermes") + "/config.yaml"
+HERMES_CONTAINER = os.environ.get("QL_HERMES_CONTAINER", "hermes-container")
 RESTART_STATUS_FILE = "/data/streams_data/mcp_restart_status.json"
 
 # 预置 MCP 模板（App 端展示用；key 由用户填入 URL 的 {key} 占位）
@@ -46,11 +48,13 @@ MCP_TEMPLATES = [
 _LOCK = threading.Lock()
 _RESTARTING = False
 
-_MARK_BEGIN = "# == qingliao-mcp-begin =="
-_MARK_END = "# == qingliao-mcp-end =="
+# v4.0.58：改为直接读写 config.yaml **顶层 mcp_servers 段**（不再用 # == qingliao-mcp-*
+# == 标记块）。旧的标记块实现只认自己写的那一段 → 手工注册进 mcp_servers 的 office /
+# browser-agent / wenyan 在 App「MCP 工具服务」页完全不显示；且保存时会另追加一个重复的
+# `mcp_servers:` 顶层键（原段一条不动）。现在：读 = 解析整段；写 = 只重建这一段，段内每个
+# 条目的其它字段（headers / tools / command / args / env / timeout …）原样保留。
+_SECTION_KEY = "mcp_servers"
 
-
-# ── YAML mcp_servers 标记块读写（文本级，不动 config 其他内容）──
 
 def _read_config_text():
     with open(HERMES_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -85,52 +89,59 @@ def _write_config_text(text):
             pass
 
 
-def _render_servers_yaml(servers):
-    lines = [_MARK_BEGIN, "mcp_servers:"]
-    for name, entry in servers.items():
-        lines.append("  %s:" % name)
-        lines.append("    url: %s" % entry["url"])
-        lines.append("    enabled: %s" % ("true" if entry.get("enabled", True) else "false"))
-    lines.append(_MARK_END)
-    return "\n".join(lines)
+def _section_span(text):
+    """定位顶层 mcp_servers 段：返回 (start, end) 字符区间；无该段返回 None。
+
+    段 = 从顶层 `mcp_servers:` 行开始，到下一个「顶格非注释行」（下一个顶层 key）之前。
+    """
+    m = re.search(r"(?m)^%s:[ \t]*(?:#.*)?$" % re.escape(_SECTION_KEY), text)
+    if not m:
+        return None
+    end = len(text)
+    for lm in re.finditer(r"(?m)^(\S.*)$", text[m.end():]):
+        end = m.end() + lm.start()
+        break
+    return m.start(), end
 
 
 def _load_servers():
-    """从标记块解析 servers dict；无块返回 {}"""
+    """解析顶层 mcp_servers 段 → dict（保留全部字段）；无段/解析失败返回 {}"""
     try:
         text = _read_config_text()
     except Exception:  # noqa: BLE001
         return {}
-    m = re.search(re.escape(_MARK_BEGIN) + r"\n(.*?)" + re.escape(_MARK_END), text, re.S)
-    if not m:
+    span = _section_span(text)
+    if not span:
         return {}
-    servers = {}
-    cur = None
-    for line in m.group(1).splitlines():
-        top = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
-        if top:
-            cur = top.group(1)
-            servers[cur] = {}
-            continue
-        url = re.match(r"^\s+url:\s*(\S+)", line)
-        en = re.match(r"^\s+enabled:\s*(\S+)", line)
-        if cur and url:
-            servers[cur]["url"] = url.group(1)
-        elif cur and en:
-            servers[cur]["enabled"] = en.group(1).lower() in ("true", "yes", "1")
-    return servers
+    try:
+        data = yaml.safe_load(text[span[0]:span[1]]) or {}
+    except Exception:  # noqa: BLE001
+        return {}
+    servers = data.get(_SECTION_KEY) if isinstance(data, dict) else None
+    return servers if isinstance(servers, dict) else {}
+
+
+def _render_section(servers):
+    """把 servers dict 渲染成顶层 mcp_servers 段文本（条目顺序按 dict 插入序）"""
+    if not servers:
+        return "%s: {}\n" % _SECTION_KEY
+    body = yaml.safe_dump(servers, allow_unicode=True, default_flow_style=False,
+                          sort_keys=False, width=10 ** 6)
+    indented = "".join(("  " + ln if ln.strip() else ln) for ln in body.splitlines(True))
+    return "%s:\n%s" % (_SECTION_KEY, indented)
 
 
 def _save_servers(servers):
+    """只替换 config.yaml 顶层的 mcp_servers 段，其余内容逐字节不动"""
     text = _read_config_text()
-    block = _render_servers_yaml(servers) if servers else ""
-    pat = re.compile(re.escape(_MARK_BEGIN) + r"\n.*?" + re.escape(_MARK_END) + "\n?", re.S)
-    if pat.search(text):
-        text = pat.sub(block + ("\n" if block else ""), text)
-    elif block:
+    block = _render_section(servers)
+    span = _section_span(text)
+    if span:
+        text = text[:span[0]] + block + text[span[1]:]
+    else:
         if not text.endswith("\n"):
             text += "\n"
-        text += "\n" + block + "\n"
+        text += "\n" + block
     _write_config_text(text)
 
 
@@ -210,11 +221,25 @@ class Handler(BaseHTTPRequestHandler):
             servers = _load_servers()
             safe = {}
             for name, e in servers.items():
-                url = e.get("url", "")
+                e = e if isinstance(e, dict) else {}
+                url = str(e.get("url") or "")
+                cmd = str(e.get("command") or "")
+                if cmd:
+                    kind = "command"
+                    summary = "本地命令 · %s" % os.path.basename(cmd)
+                else:
+                    kind = "url"
+                    summary = _mask_key(url) or "（无 url）"
+                include = (e.get("tools") or {}).get("include") or []
                 safe[name] = {
                     "url": _mask_key(url),
                     "has_key": "key=" in url,
-                    "enabled": e.get("enabled", True),
+                    "enabled": bool(e.get("enabled", True)),
+                    # v4.0.58：新增字段（旧 App 忽略即可）——command 型服务没有 url，
+                    # 光靠 url 字段 App 会以为是空条目，故补 type/summary 供展示。
+                    "type": kind,
+                    "summary": summary,
+                    "tools_count": len(include) if isinstance(include, list) else 0,
                 }
             self._send(200, {"ok": True, "servers": safe, "templates": MCP_TEMPLATES})
             return
@@ -253,11 +278,16 @@ class Handler(BaseHTTPRequestHandler):
         key = str(body.get("key", "")).strip()
         template = str(body.get("template", "")).strip()
         url_in = str(body.get("url", "")).strip()
+        has_enabled = "enabled" in body
         enabled = bool(body.get("enabled", True))
 
         if not name:
             self._send(400, {"ok": False, "error": "name 必填"})
             return
+
+        # v4.0.58：url 只在本请求确实给了 template/key 或 url 时才动；只带 name(+enabled)
+        # 的请求 = 开关已有条目，不得覆盖它原有的字段
+        url = None
         if template:
             tpl = next((t for t in MCP_TEMPLATES if t["id"] == template), None)
             if not tpl:
@@ -272,13 +302,27 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, {"ok": False, "error": "url 须以 http(s):// 开头"})
                 return
             url = url_in
-        else:
-            self._send(400, {"ok": False, "error": "template+key 或 url 必填一个"})
-            return
 
         try:
             servers = _load_servers()
-            servers[name] = {"url": url, "enabled": enabled}
+            cur = servers.get(name)
+            cur = dict(cur) if isinstance(cur, dict) else None
+            if cur is not None and cur.get("command") and url:
+                self._send(400, {"ok": False,
+                                 "error": "该服务是本地命令型（command），不能改写成 URL"})
+                return
+            if cur is None:
+                if not url:
+                    self._send(400, {"ok": False, "error": "template+key 或 url 必填一个"})
+                    return
+                cur = {"url": url}
+                servers[name] = cur
+            elif url:
+                cur["url"] = url
+            if has_enabled:
+                cur["enabled"] = enabled
+            elif "enabled" not in cur:
+                cur["enabled"] = True
             _save_servers(servers)
         except Exception as exc:  # noqa: BLE001
             self._send(500, {"ok": False, "error": "写配置失败: %s" % exc})
