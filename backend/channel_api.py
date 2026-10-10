@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""微信通道模型设置 API（v3.0.19 方案B + v3.0.22 视觉模型）：
-- GET  /api/channel/model          读 wechat-profile 当前 model/provider
-- POST /api/channel/model          写 wechat-profile 的 model/provider（改 config.yaml + 重启 gateway）
-- GET  /api/channel/vision-model   读 wechat-profile 的 auxiliary.vision（视觉模型 provider/model/base_url）
-- POST /api/channel/vision-model   写 wechat-profile 的 auxiliary.vision（provider/model，base_url/api_key 自动从 providers 段解析）
+"""通道模型设置 API（v3.0.19 方案B + v3.0.22 视觉模型；2026-10-10 语义更正）：
+- GET  /api/channel/model          读 Hermes 主模型（model 段）当前 model/provider
+- POST /api/channel/model          写 Hermes 主模型（改主 config.yaml + 重启 gateway）
+- GET  /api/channel/vision-model   读 auxiliary.vision（视觉模型 provider/model/base_url）
+- POST /api/channel/vision-model   写 auxiliary.vision（provider/model，base_url/api_key 自动从 providers 段解析）
 - DELETE /api/channel/vision-model 清除 auxiliary.vision（恢复跟随主模型原生视觉/默认兜底）
 - 端口 9152，需 X-Auth-Token（与其它服务一致）
-wechat-profile = Hermes 独立 profile，微信通道经 profile_routes 路由到它，
-改它的 config.yaml 即独立控制微信通道（不影响其它通道）。
+
+⚠️ 作用域 = 全局（不是「只影响微信通道」）：wechat-profile 已于 2026-09-09 删除，
+微信通道改由 default profile（主 config.yaml）服务，因此这里写的就是 Hermes 全局主模型 ——
+微信通道、定时任务、后台任务全部跟着变；轻聊 App 对话不受影响（它每轮自带 provider/model）。
 视觉模型逻辑（Hermes agent.image_input_mode: auto 原生支持）：
 主模型 supports_vision → 原生传图用主模型；主模型不支持 + auxiliary.vision 显式配置 → 用视觉模型兜底。
 """
@@ -75,7 +77,7 @@ VALID_PROVIDERS = {
 
 
 def _normalize_provider(provider):
-    """App 端 provider 名 → wechat-profile providers 段实际名（local → ollama）"""
+    """App 端 provider 名 → 主 config providers 段实际名（local → ollama）"""
     return "ollama" if provider == "local" else provider
 
 
@@ -109,7 +111,7 @@ def _is_model_header(ln):
 
 
 def _read_model():
-    """读 wechat-profile config.yaml 的 model 段（无文件/无 model 段 → None）"""
+    """读主 config.yaml 的 model 段（Hermes 全局主模型；无文件/无 model 段 → None）"""
     try:
         with open(PROFILE_CFG, encoding="utf-8") as f:
             raw = f.read()
@@ -146,7 +148,7 @@ def _read_model():
 
 
 def _write_model(model, provider):
-    """改 wechat-profile config.yaml 的 model.default / model.provider（行级替换，保留注释）"""
+    """改主 config.yaml 的 model.default / model.provider（= Hermes 全局主模型，行级替换，保留注释）"""
     with open(PROFILE_CFG, encoding="utf-8") as f:
         lines = f.read().splitlines()
     # 找 model: 段（只认顶层 model:，防误匹配 auxiliary 段）——先删掉旧 default/provider 行再统一插入
@@ -400,13 +402,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(401, {"error": "unauthorized"})
                 return
             info = _read_model()
-            self._send(200, {"ok": True, "channel": "wechat", "profile": "wechat-profile", **info})
+            self._send(200, {"ok": True, "scope": "global", "profile": "default", **info})
         elif self.path == "/api/channel/vision-model":
             if not self._auth():
                 self._send(401, {"error": "unauthorized"})
                 return
             info = _read_vision()
-            self._send(200, {"ok": True, "channel": "wechat", "profile": "wechat-profile", **info})
+            self._send(200, {"ok": True, "scope": "global", "profile": "default", **info})
         else:
             self._send(404, {"error": "not found"})
             return
@@ -426,9 +428,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(500, {"error": "clear failed: %s" % str(e)[:150]})
                 return
         restart_ok = _restart_gateway()
-        self._send(200, {"ok": True, "channel": "wechat", **info,
+        self._send(200, {"ok": True, "scope": "global", **info,
                          "restart": "triggered" if restart_ok else "failed",
-                         "note": "已清除微信通道视觉模型，gateway 重启后生效（约 10-30 秒）"})
+                         "note": "已清除视觉模型配置（恢复跟随主模型），gateway 重启后生效（约 10-30 秒）"})
 
     def do_POST(self):
         if self.path == "/api/channel/model":
@@ -468,11 +470,11 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(500, {"error": "write failed: %s" % str(e)[:150]})
                 return
-        # 异步重启 gateway（模型切换需要 gateway 重新加载 profile 配置）
+        # 异步重启 gateway（模型切换需要 gateway 重新加载主 config）
         restart_ok = _restart_gateway()
-        self._send(200, {"ok": True, "channel": "wechat", **info,
+        self._send(200, {"ok": True, "scope": "global", **info,
                          "restart": "triggered" if restart_ok else "failed",
-                         "note": "gateway 重启后生效（约 10-30 秒）"})
+                         "note": "已写入 Hermes 全局主模型（微信通道/定时任务/后台任务共用），gateway 重启后生效（约 10-30 秒）"})
 
     def _post_vision(self):
         if not self._auth():
@@ -498,6 +500,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(500, {"error": "write failed: %s" % str(e)[:150]})
                 return
         restart_ok = _restart_gateway()
-        self._send(200, {"ok": True, "channel": "wechat", **info,
+        self._send(200, {"ok": True, "scope": "global", **info,
                          "restart": "triggered" if restart_ok else "failed",
-                         "note": "微信通道视觉模型已设置，gateway 重启后生效（约 10-30 秒）"})
+                         "note": "视觉模型已写入 Hermes 全局配置，gateway 重启后生效（约 10-30 秒）"})
