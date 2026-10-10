@@ -13,25 +13,41 @@ import tempfile
 import threading
 import time
 
-MEMORY_PATH = os.path.join(os.environ.get("QL_DATA_DIR", "/volume1/docker/hermes/微信文件/轻聊web/data"),"memory.json")
+MEMORY_PATH = os.environ.get("QL_DATA_DIR", "/data") + "/memory.json"
 MAX_ENTRIES = 50
+
+# v4.0.x 第 4 项「记忆条目结构化」：状态 / 日期 / 来源会话。
+#
+# 🚨 为什么**旁挂 meta 表**而不是把 entries 从 [str] 换成 [dict]：
+#   entries 是全仓最热的共享结构 —— App 三处（MemoryView / SettingsCore 计数 / HomeCards 提示卡）、
+#   memory_api 三处响应、prompt_block() 注入、proactive_agent._memory_block() 全都按字符串读它。
+#   一旦换结构，这些地方**全部静默变成空**（`as? [String]` 拿不到 → 记忆看起来"丢了"）。
+#   而 proactive_agent.py:394 早就写着 `r.get("text","")` 在等 dict 形态 —— 说明这条路
+#   曾经被规划过但没做完（一直返回空串，那一整块用户偏好对 proactive 一直是空的）。
+#   旁挂 meta = 旧读者零感知（零回归），新字段按 text 查。
+META_KEY = "meta"
+# 状态取值（App 侧三选一）。默认 active = 生效中，会注入 prompt。
+STATUS_ACTIVE = "active"      # 生效中
+STATUS_PENDING = "pending"    # 待确认（仍注入，只是提醒用户复核）
+STATUS_STALE = "stale"        # 已过时（仍注入，但 App 标灰、明确表示可能不再准确）
+STATUSES = (STATUS_ACTIVE, STATUS_PENDING, STATUS_STALE)
 
 # v3.0.6 review fix：记忆 JSON 高并发读写（每条流式消息 inject→add_entry），
 # 加全局锁 + 原子写（tmp+os.replace+fsync），防丢条目/写一半损坏
 _lock = threading.Lock()
 
 
-def _load():
-    """读记忆条目。v3.9.14：解析失败不再静默返回空——先把损坏文件改名留档。
+def _read_doc():
+    """读整个记忆文档 {"entries": [...], "meta": {...}}。
 
-    原来 `except Exception: return []` 会把「文件损坏」表现成「用户没有记忆」，而调用方
-    紧接着 `_save()` 就用这个空列表覆盖真文件 → 记忆永久丢失、日志里也查不到任何线索。
+    v3.9.14：解析失败不再静默返回空——先把损坏文件改名留档。返回 (entries, meta, ok)。
+    ok=False 表示「读到了但坏了」（已留档），调用方**不要**拿这个空列表去 _save 覆盖真文件。
     """
     try:
         with open(MEMORY_PATH, encoding="utf-8") as f:
-            return json.load(f).get("entries", [])
+            doc = json.load(f)
     except FileNotFoundError:
-        return []
+        return [], {}, True
     except Exception as e:
         try:
             bad = MEMORY_PATH + ".corrupt-" + time.strftime("%Y%m%d%H%M%S")
@@ -39,18 +55,129 @@ def _load():
             print("[memory] 记忆文件解析失败，已留档为 %s：%s" % (bad, e), flush=True)
         except Exception:
             pass
-        return []
+        return [], {}, False
+    if not isinstance(doc, dict):
+        return [], {}, False
+    entries = doc.get("entries", [])
+    if not isinstance(entries, list):
+        entries = []
+    # meta 必须是 dict[str, dict]；任何别的形态（被手改坏 / 老版本遗留）一律当空，
+    # 绝不因为 meta 读不出来就把 entries 也丢掉 —— 那才是真事故。
+    meta = doc.get(META_KEY, {})
+    if not isinstance(meta, dict):
+        meta = {}
+    clean = {}
+    for k, v in meta.items():
+        if isinstance(k, str) and isinstance(v, dict):
+            clean[k] = v
+    return [str(e) for e in entries], clean, True
 
 
-def _save(entries):
-    """原子写记忆文件（v3.0.6 起就是 mkstemp+fsync+replace；v3.9.14 让失败可见）。"""
+def _load():
+    """读记忆条目（只取正文，兼容全部旧调用方）。"""
+    return _read_doc()[0]
+
+
+def _default_meta(text, source="", session_id=""):
+    return {
+        "status": STATUS_ACTIVE,
+        "created": int(time.time()),
+        "updated": int(time.time()),
+        "source": source,
+        "sessionId": session_id,
+    }
+
+
+def _normalize_meta(m, text):
+    """把一条 meta 补齐成完整形态（缺字段给默认值，非法状态归 active）。
+
+    为什么要 normalize 而不是直接信任文件：这份 JSON 用户能编辑、也能被老版本写坏。
+    App 侧拿到 status 去查表，值不在表里就会显示成一个空白胶囊（用户看着像 bug）。
+    """
+    out = _default_meta(text)
+    if not isinstance(m, dict):
+        return out
+    st = m.get("status")
+    if st in STATUSES:
+        out["status"] = st
+    for k in ("created", "updated"):
+        v = m.get(k)
+        if isinstance(v, (int, float)) and v > 0:
+            out[k] = int(v)
+    for k in ("source", "sessionId"):
+        v = m.get(k)
+        if isinstance(v, str):
+            out[k] = v[:200]
+    return out
+
+
+def list_meta():
+    """返回 [{text, status, created, updated, source, sessionId}, ...]（与 entries 同序）。
+
+    旧文件里的条目**也**在这里出现，status 缺省 active —— 所以 App 一次都不用改
+    就能显示全部条目，而不是只显示「改过的那几条」。
+    """
+    with _lock:
+        entries, meta, _ = _read_doc()
+        out = []
+        for t in entries:
+            m = _normalize_meta(meta.get(t), t)
+            row = {"text": t}
+            row.update(m)
+            out.append(row)
+        return out
+
+
+def set_meta(text, status=None, source=None, session_id=None):
+    """改一条记忆的状态 / 来源。text 不存在返回 False。
+
+    只改 meta，**绝不碰 entries 正文**（这条最容易写成顺手 append 一遍）。
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+    with _lock:
+        entries, meta, ok = _read_doc()
+        if not ok or t not in entries:
+            return False
+        m = _normalize_meta(meta.get(t), t)
+        if status is not None:
+            if status not in STATUSES:
+                return False
+            m["status"] = status
+        if source is not None and isinstance(source, str):
+            m["source"] = source[:200]
+        if session_id is not None and isinstance(session_id, str):
+            m["sessionId"] = session_id[:200]
+        m["updated"] = int(time.time())
+        meta[t] = m
+        return _save(entries, meta)
+
+
+def _save(entries, meta=None):
+    """原子写记忆文件（v3.0.6 起就是 mkstemp+fsync+replace；v3.9.14 让失败可见）。
+
+    meta 缺省时**沿用文件里现有的 meta**（重新读一次）—— 原来 add_entry/delete_entry
+    只传 entries，若这里默认清空 meta，用户点一次「删除」就会把旁边所有条目的
+    状态/来源/日期全抹掉。宁可多读一次文件（读在锁内、无并发风险），也不能静默丢数据。
+    """
     tmp = None
     try:
         os.makedirs(os.path.dirname(MEMORY_PATH), exist_ok=True)
+        if meta is None:
+            meta = _read_doc()[1]
+        keep = entries[-MAX_ENTRIES:]
+        # 正文被 MAX_ENTRIES 截掉的条目，它的 meta 是孤儿键 → 顺手剪掉，
+        # 否则 meta 表会单调增长（每次新增都留一条永远读不到的记录）。
+        live = set(keep)
+        meta = {k: v for k, v in meta.items() if k in live}
         # v3.0.6 review fix：tmp + write + flush + fsync + os.replace 原子落盘
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(MEMORY_PATH), suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump({"entries": entries[-MAX_ENTRIES:]}, f, ensure_ascii=False)
+            doc = {"entries": keep}
+            if meta:
+                doc[META_KEY] = meta
+            json.dump(doc, f, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, MEMORY_PATH)
@@ -71,17 +198,25 @@ def list_entries():
         return _load()
 
 
-def add_entry(text):
+def add_entry(text, source="", session_id=""):
+    """新增一条记忆。source/session_id 是第 4 项新加的来源标注（缺省不影响旧行为）。
+
+    ⚠️ 正文去重命中时**不覆盖来源**：用户手动加过的条目不该被一次聊天里的重复句
+    改写成「来自某会话」（那会把用户自己整理过的东西降级）。所以只在真正新增时写 meta。
+    """
     t = text.strip()
     if not t or len(t) < 2:
         return False
     # v3.0.6 review fix：读-改-写全在锁内，防并发丢条目
     with _lock:
-        entries = _load()
+        entries, meta, ok = _read_doc()
+        if not ok:
+            return False
         if t not in entries:
             entries.append(t)
+            meta[t] = _default_meta(t, source, session_id)
             # v3.9.14：如实返回落盘结果（原来无论 _save 成败都 return True）
-            return _save(entries)
+            return _save(entries, meta)
         return False
 
 
@@ -90,10 +225,16 @@ def delete_entry(text):
     # 语法合法所以没被发现）→ App 点「删除」永远返回 False、条目删不掉。
     # v3.0.6 review fix：读-改-写全在锁内
     with _lock:
-        entries = _load()
+        entries, meta, ok = _read_doc()
+        if not ok:
+            return False
         if text in entries:
             entries.remove(text)
-            _save(entries)
+            # 🚨 第 4 项：正文删了，meta 里的孤儿键**必须**一起删。
+            #   原来 _save 只按 entries 重建 JSON（当时也没有 meta），改成 dict 后
+            #   留着键会让「同名条目重新加进来」继承上一世的状态/来源 —— 极难察觉。
+            meta.pop(text, None)
+            _save(entries, meta)
             return True
         return False
 
@@ -109,17 +250,23 @@ def update_entry(old, new):
     if not n or len(n) < 2:
         return False
     with _lock:
-        entries = _load()
-        if o not in entries:
+        entries, meta, ok = _read_doc()
+        if not ok or o not in entries:
             return False
         i = entries.index(o)
         if n == o:
             return True
         if n in entries:
             entries.pop(i)
-            return _save(entries)
+            meta.pop(o, None)
+            return _save(entries, meta)
         entries[i] = n
-        return _save(entries)
+        # 🚨 第 4 项：正文改了就**改名 meta 的键**并把 updated 推到现在。
+        #   忘了搬 meta → 这条记忆的状态/来源/日期静默归零（用户看着像"结构化没生效"）。
+        m = _normalize_meta(meta.pop(o, None), n)
+        m["updated"] = int(time.time())
+        meta[n] = m
+        return _save(entries, meta)
 
 
 # 记忆意图检测（记住/我是/我喜欢/别忘了…）
@@ -137,14 +284,18 @@ def _last_user(messages):
     return ""
 
 
-def check_and_save(user_text):
-    """检测用户消息的记忆意图 → 提取句子存入；返回新存条目"""
+def check_and_save(user_text, session_id=""):
+    """检测用户消息的记忆意图 → 提取句子存入；返回新存条目。
+
+    v4.0.x 第 4 项：session_id 只用来给新条目**标注来源会话**（不传 = 不标注，
+    与旧调用完全等价）。source 固定 "chat" —— 「记住…」这句话本身就来自聊天。
+    """
     t = str(user_text)
     saved = []
     for m in _REMEMBER.finditer(t):
         phrase = m.group(1).strip()
         if phrase and len(phrase) >= 2 and not any(phrase.startswith(s) for s in _SKIP):
-            if add_entry(phrase):
+            if add_entry(phrase, source="chat", session_id=session_id):
                 saved.append(phrase)
     return saved
 
