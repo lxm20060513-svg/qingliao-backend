@@ -175,6 +175,7 @@ ROUTING_DEFAULT = {
     "breaker_fails": 3,       # 连续失败 N 次 → 熔断（0 = 关掉熔断）
     "breaker_cooldown_s": 300,  # 熔断持续秒数，到点自动半开重试（失败则再次熔断）
     "backend": "typesafe",    # 判定后端：typesafe=云端 Jev / custom=自填 OpenAI 兼容模型 / local=本机 ollama
+    "ambig_action": False,    # v4.x dejavu 式三候选打分（custom 后端专属）：True = action/chat/unsure 自报置信度归一，unsure 高 → 判「不确定」
 }
 
 # ─── 本地判定后端（routing.backend = "local"）───
@@ -227,6 +228,21 @@ CUSTOM_PROMPT = (
     "查数据 / 读写文件 / 控制设备 / 发邮件 / 建提醒 / 生成文件 / 取外部信息 / 翻译润色 → true；\n"
     "打招呼 / 寒暄 / 闲聊 / 感慨 / 问常识 / 对上一轮做简短回应 → false。\n"
     '格式：{"needs_action": true 或 false}\n'
+    "用户消息：{msg}"
+)
+
+
+# v4.x（dejavu 移植）：三候选打分提示词。与二元版互斥（routing.ambig_action 开关）——
+# 模型对 action/chat/unsure 各自报 0~1 置信度，服务端归一化后拿真概率分档：
+# 高 action → Agent；高 chat → 纯聊天；高 unsure → 中间态（调用方决定要不要先问一句）。
+CUSTOM_SCORED_PROMPT = (
+    "你是会话路由器，只输出 JSON，不要任何解释。\n"
+    "先在心里快速想一下这条消息最可能是什么，再给下面三个选项各打一个 0~1 的置信度：\n"
+    "action=要助手实际做事（查数据/读写文件/控制设备/发邮件/建提醒/生成文件/取外部信息/翻译润色）；\n"
+    "chat=纯聊天（打招呼/寒暄/感慨/问常识/对上一轮做简短回应）；\n"
+    "unsure=介于两者之间，仅凭这一句拿不准用户想干嘛（指代不明/既可闲聊也可执行）。\n"
+    "三个数先在心里归一化（合计为 1）再输出，保留两位小数。\n"
+    '格式：{"action": 0.xx, "chat": 0.xx, "unsure": 0.xx}\n'
     "用户消息：{msg}"
 )
 
@@ -385,6 +401,15 @@ def _coerce_routing(name, v):
         if s in ("false", "0", "off", "no"):
             return False
         raise ValueError("enabled 只能是 true / false")
+    if name == "ambig_action":
+        if isinstance(v, bool):
+            return v
+        s = str(v).strip().lower()
+        if s in ("true", "1", "on", "yes"):
+            return True
+        if s in ("false", "0", "off", "no"):
+            return False
+        raise ValueError("ambig_action 只能是 true / false")
     if name == "mode":
         m = str(v or "").strip().lower()
         if m not in ("smart", "off", "force_agent"):
@@ -499,6 +524,33 @@ def _parse_yesno(text):
     return None
 
 
+def _parse_scored(txt):
+    """dejavu 式打分输出解析：{"action":.7,"chat":.2,"unsure":.1} → 归一化 dict。
+
+    缺键按 0 补；全非数值/全 0，或概率质量合计偏离 1 超过 ±0.1（覆盖不足）→ 返回 None，
+    调用方按判定失败走 fail-open + 熔断（与 _parse_yesno 的 None 同口径：
+    绝不静默判成纯聊天——真任务被丢掉才是危险方向）。
+    """
+    try:
+        j = json.loads((txt or "").strip())
+    except Exception:
+        return None
+    if not isinstance(j, dict):
+        return None
+    out = {}
+    for k in ("action", "chat", "unsure"):
+        try:
+            out[k] = float(j.get(k) or 0.0)
+        except Exception:
+            out[k] = 0.0
+    total = out["action"] + out["chat"] + out["unsure"]
+    # 质量守恒校验（dejavu 的概率质量守恒思路）：只认三种约定刻度 —— 和≈1（小数）、
+    # ≈10（整数）、≈100（百分制）；其余（0.5/1.5/70+20+100=190 等覆盖不足/超量）直接拒绝。
+    if total <= 0 or not any(abs(total - t) <= 0.35 for t in (1.0, 10.0, 100.0)):
+        return None
+    return {k: v / total for k, v in out.items()}
+
+
 def _call_local(state, timeout, meta=None):
     """本地 ollama 判定（routing.backend=local）：返回 (prob, model)，prob ∈ {1.0, 0.0}。
 
@@ -541,7 +593,7 @@ def _call_local(state, timeout, meta=None):
     return (1.0 if yes else 0.0), (data.get("model") or lc.get("model"))
 
 
-def _call_custom(state, timeout, meta=None):
+def _call_custom(state, timeout, meta=None, scored=False):
     """自定义 OpenAI 兼容判定（routing.backend=custom）：返回 (prob, model)，prob ∈ {1.0, 0.0}。
 
     与 _call_local 同契约：任何异常/解析不出 → 抛异常，由 route() 熔断 + fail-open 兜底。
@@ -555,6 +607,12 @@ def _call_custom(state, timeout, meta=None):
         raise RuntimeError("自定义判定模型未配置接口地址")
     if not (cc.get("model") or CUSTOM_MODEL_DEFAULT).strip():
         raise RuntimeError("自定义判定模型未配置模型名")
+    if scored:
+        prompt = CUSTOM_SCORED_PROMPT.replace("{msg}", state)
+        max_tokens = 200      # 三个浮点数的 JSON，16 会截断
+    else:
+        prompt = CUSTOM_PROMPT.replace("{msg}", state)
+        max_tokens = 16
     url = base.rstrip("/") + "/chat/completions"
     # 2026-10-10：思考型模型（GLM-4.5+/GLM-5.x 等）会把 max_tokens=16 全花在 reasoning_content 上，
     # content 恒为空 → 判定永远解析失败（实测 glm-4.5-air/4.6/4.7-flash/5.x 全部如此）。
@@ -562,9 +620,9 @@ def _call_custom(state, timeout, meta=None):
     # OpenAI 兼容服务（OpenRouter / 硅基流动…）仍然可用。
     body = {
         "model": cc.get("model") or CUSTOM_MODEL_DEFAULT,
-        "messages": [{"role": "user", "content": CUSTOM_PROMPT.replace("{msg}", state)}],
+        "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
-        "max_tokens": 16,
+        "max_tokens": max_tokens,
         "stream": False,
     }
     data = None
@@ -587,10 +645,16 @@ def _call_custom(state, timeout, meta=None):
     except Exception:
         raise RuntimeError("自定义判定响应结构异常：%s"
                            % json.dumps(data, ensure_ascii=False)[:120])
+    model = data.get("model") or cc.get("model")
+    if scored:
+        scores = _parse_scored(txt)
+        if scores is None:
+            raise RuntimeError("打分输出无法解析：%r" % (txt or "")[:80])
+        return scores["action"], model, scores["unsure"]   # (prob, model, unsure)
     yes = _parse_yesno(txt)
     if yes is None:
         raise RuntimeError("自定义判定输出无法解析：%r" % (txt or "")[:60])
-    return (1.0 if yes else 0.0), (data.get("model") or cc.get("model"))
+    return (1.0 if yes else 0.0), model, None
 
 
 def route(text, timeout_ms=None, cfg=None):
@@ -607,7 +671,7 @@ def route(text, timeout_ms=None, cfg=None):
         return {"ok": False, "breaker": True, "remain_s": b["remain_s"],
                 "error": "判定熔断中（连续 %d 次失败，%ds 后自动恢复）" % (fails_limit, b["remain_s"])}
     backend = str(c.get("backend") or ROUTING_DEFAULT["backend"]).strip().lower()
-    urgency = reply_mode = reply_mode_prob = None
+    urgency = reply_mode = reply_mode_prob = unsure = None
     try:
         # 超时换算也放进 try：配置被手改成非数值时同样走 fail-open，而不是抛穿 route()
         if backend == "local":
@@ -618,7 +682,8 @@ def route(text, timeout_ms=None, cfg=None):
             timeout = float(timeout_ms or c.get("timeout_ms") or ROUTING_DEFAULT["timeout_ms"]) / 1000.0
         t0 = time.time()
         if backend == "custom":
-            prob, model = _call_custom(t[:MAX_STATE_CHARS], timeout)
+            scored = bool(c.get("ambig_action"))
+            prob, model, unsure = _call_custom(t[:MAX_STATE_CHARS], timeout, scored=scored)
         elif backend == "local":
             prob, model = _call_local(t[:MAX_STATE_CHARS], timeout)
         else:
@@ -639,6 +704,11 @@ def route(text, timeout_ms=None, cfg=None):
         except Exception:
             threshold = ROUTING_DEFAULT["threshold"]
         needs = float(prob) >= threshold      # prob 非数值 → 抛错走 fail-open，不静默判闲聊
+        if unsure is not None:
+            # v4.x dejavu 中间态：unsure 同时高于 action 与 chat 才算「不确定」；
+            # 此时按纯聊天放行（needs=False）+ ambiguity 标记，由调用方决定要不要先问一句。
+            if unsure > max(float(prob), 1.0 - float(prob) - float(unsure)):
+                needs = False
     except Exception as e:
         err = "%s: %s" % (type(e).__name__, str(e)[:160])
         tripped, fails_now = _breaker_record(False, err, fails_limit, cooldown_s)
@@ -652,6 +722,8 @@ def route(text, timeout_ms=None, cfg=None):
         "backend": backend,
         "needs_action": bool(needs),
         "needs_action_prob": prob,
+        "unsure": unsure,
+        "ambiguity": bool(unsure is not None and unsure > max(float(prob), 1.0 - float(prob) - float(unsure))),
         "threshold": threshold,
         "urgency_prob": urgency,
         "reply_mode": reply_mode,
@@ -660,8 +732,8 @@ def route(text, timeout_ms=None, cfg=None):
         "ms": ms,
     }
     _breaker_record(True, "", fails_limit, cooldown_s)
-    print("[typesafe-route] backend=%s needs_action=%s p=%s mode=%s ms=%d" %
-          (backend, out["needs_action"], prob, reply_mode, ms), flush=True)
+    print("[typesafe-route] backend=%s needs_action=%s p=%s uns=%s mode=%s ms=%d" %
+          (backend, out["needs_action"], prob, unsure, reply_mode, ms), flush=True)
     return out
 
 
@@ -979,7 +1051,7 @@ def _main(argv):
             for sample in ("帮我把这个文件转成 PDF", "你好呀"):
                 t0 = time.time()
                 try:
-                    prob, _m = _call_custom(sample, tmo)
+                    prob, _m, _u = _call_custom(sample, tmo, scored=True)
                     print("  %s → %s · %dms" % (sample, "要干活" if prob >= 0.5 else "纯聊天",
                                                 int((time.time() - t0) * 1000)))
                 except Exception as e:

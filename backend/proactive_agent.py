@@ -55,6 +55,8 @@ CLUSTER_FILE = os.path.join(DATA_DIR, "proactive_todo_cluster.json")
 # 真源 = <QueryDataDir>/records.json（App RecordStore 经 /api/files/pin_write 写入），
 # **不是** life_config.expense 段（App 从不写那个段 → 老周报的记账永远是 ¥0）。
 RECORDS_FILE = os.path.join(DATA_DIR, "records.json")
+# v4.0.22 股票异动事件源：状态留痕（每日方向冷却真源，内存态重启清零会重复打扰）。
+STOCK_FILE = os.path.join(DATA_DIR, "proactive_stock.json")
 
 LOOP_INTERVAL = 300          # 5 分钟一轮判定
 HA_POLL_INTERVAL = 60        # HA 差分轮询
@@ -86,6 +88,9 @@ DEFAULT_CFG = {
     # v4.0.x 第 6 项「反思日记」：到点主动问一句「今天有什么值得记下的」+ 每周一条回顾。
     "journalEnable": True,      # 关掉后每日一问与周回顾都不再产生
     "journalHour": 22,          # 每天几点开始问（本地钟 +08:00）；22 点 = 睡前
+    # v4.0.22 股票盘中异动：交易时段内轮询现价，日内涨跌幅首次破 ±阈值 产事件。
+    "stockWatch": ["601138"],   # 关注的 A 股代码（6 位数字，默认上证）；空列表 = 关
+    "stockPct": 3.0,            # 触发阈值（百分比，正数）
 }
 
 _lock = threading.RLock()
@@ -336,6 +341,90 @@ def weather_event():
         return 0, None
     except Exception:
         return 0, None
+
+
+# ───────────────────────── 股票盘中异动（v4.0.22） ─────────────────────────
+# 语义：交易时段内轻量查现价，日内涨跌幅首次突破 ±stockPct 时产一条事件
+#（走 add_event → judge → gate 同一条主链路，不单独推送）。
+# 防打扰口径：同股同方向每天最多 1 条（落盘留痕，重启不清零）；非交易时段零请求。
+# 数据源：腾讯 qt.gtimg.cn（容器内实测可达；东方财富 push2/push2delay 对本容器拒连）。
+# 返回 GBK 串：v_sh601138="1~名称~代码~现价~昨收~今开~..."，涨跌幅=(现价-昨收)/昨收。
+TX_URL = "https://qt.gtimg.cn/q=sh%s"
+
+
+def _trading_now(now=None):
+    n = now or _now()
+    if n.weekday() >= 5:
+        return False
+    hm = n.hour * 100 + n.minute
+    return 925 <= hm <= 1501  # 周一~五 9:25-15:01（节假日无妨：快照不变化不触发）
+
+
+def stock_event(dry_run=False):
+    """股票盘中异动事件源。返回 (产事件数, detail)。"""
+    cfg = get_config()
+    watch = cfg.get("stockWatch") or []
+    if not isinstance(watch, list) or not watch:
+        return 0, None
+    try:
+        pct = float(cfg.get("stockPct", 3.0))
+    except (TypeError, ValueError):
+        pct = 3.0
+    if pct <= 0:
+        pct = 3.0
+    now = _now()
+    if not _trading_now(now):
+        return 0, None
+    st = _load(STOCK_FILE, {})
+    day = _day()
+    produced = 0
+    detail = []
+    for code in watch:
+        s = str(code).strip()
+        if not (s.isdigit() and len(s) == 6):
+            continue
+        key = "%s:%s" % (day, s)
+        already = st.get(key) or {}
+        if already.get("up") and already.get("down"):
+            continue  # 两个方向都发过了，当天闭嘴
+        try:
+            req = urllib.request.Request(TX_URL % s, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                raw = r.read().decode("gbk", errors="replace")
+            body = raw.split('"', 1)[1]           # 取引号后的字段串
+            fields = body.split("~")              # 1~名称~代码~现价~昨收~今开~...
+            if len(fields) < 5:
+                continue
+            name = fields[1]
+            px = float(fields[3])
+            prev = float(fields[4])
+            chg = (px - prev) / prev * 100.0
+        except Exception:
+            continue  # 行情拉不到/解析失败跳过本轮，不留痕不报错
+        fired = None
+        if chg >= pct and not already.get("up"):
+            fired = ("up", "%s（%s）盘中涨幅达 %+.2f%%，现价 %.2f" % (name, s, chg, px))
+        elif chg <= -pct and not already.get("down"):
+            fired = ("down", "%s（%s）盘中跌幅达 %+.2f%%，现价 %.2f" % (name, s, chg, px))
+        if not fired:
+            continue
+        direction, text = fired
+        if add_event(text, kind="stock"):
+            produced += 1
+            detail.append({"kind": "stock", "text": text})
+            cur = st.get(key) or {}
+            cur[direction] = True
+            cur["ts"] = time.time()
+            st[key] = cur
+    if produced and not dry_run:
+        with _lock:
+            cur = _load(STOCK_FILE, {})
+            for k, v in st.items():
+                if v.get("ts") and (not cur.get(k) or (cur[k].get("ts") or 0) <= v["ts"]):
+                    cur[k] = v
+            cur = {k: v for k, v in cur.items() if k.split(":")[0] >= _day()}  # 只留今天起
+            _save(STOCK_FILE, cur)
+    return produced, detail
 
 
 # ───────────────────────── 目标追踪（设计稿 3） ─────────────────────────
@@ -1184,6 +1273,8 @@ def _loop():
             if cfg.get("haWatch"):
                 ha_diff_events()
             weather_event()
+            if cfg.get("stockWatch"):
+                stock_event()
             if cfg.get("goalNudge"):
                 ensure_goal_jobs()
                 goal_nudge_event()
@@ -1305,6 +1396,7 @@ class Handler(BaseHTTPRequestHandler):
         # v4.0.x 第 6 项：反思日记（预览默认 dry_run；答问才写盘）
         if tail == "/journal":
             dry = bool(body.get("dry_run", True))
+            n, detail = stock_event(dry_run=dry)
             n, detail = journal_event(dry_run=dry)
             return self._send({"ok": True, "dry_run": dry, "produced": n,
                                "detail": detail or [],

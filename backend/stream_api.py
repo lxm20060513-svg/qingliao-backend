@@ -47,6 +47,7 @@ from http.server import BaseHTTPRequestHandler
 # （原硬编码 "123" 弱口令，生产未注入——已核实）
 STREAM_PASS = os.environ.get("STREAM_PASS", "")
 MAX_CONTENT_LEN = 200_000   # v2.0.116 review：回复内容上限（防无限输出）
+REASONING_MAX_CHARS = 8000   # v4.0.91 思考流透传上限（字符），超出静默截断
 MAX_CONTEXT_MESSAGES = int(os.environ.get("STREAM_MAX_CONTEXT_MSGS", 40))  # 上下文消息上限，超出自动截断旧消息
 # BE1：/api/stream/media 免鉴权，单次响应大小上限（生成物图片/PDF 足够，日志类不再整本读进内存）
 MAX_MEDIA_BYTES = int(os.environ.get("QL_MAX_MEDIA_BYTES", 32 * 1024 * 1024))
@@ -245,7 +246,6 @@ _cleanup_started = False
 
 # V1.5.9：各 provider 的模型列表端点 + config key 路径
 SYNC_ENDPOINTS = {
-    "opencode": ("https://opencode.ai/zen/go/v1/models", ["providers", "opencode", "api_key"]),
     "opencode-apple": ("https://opencode.ai/zen/go/v1/models", ["providers", "opencode-apple", "api_key"]),
     "stepfun": ("https://api.stepfun.com/step_plan/v1/models", ["providers", "stepfun", "api_key"]),
     "xiaomi": ("https://token-plan-cn.xiaomimimo.com/v1/models", ["providers", "xiaomi", "api_key"]),
@@ -2179,11 +2179,17 @@ def _build_hermes_messages(st, last_user, is_agent):
                        "下面 messages 是会话历史（assistant 回复已压缩为占位符），仅作背景参考。"
                        "【关键】只回答最新一条 user 消息：先理解它问什么，再给有针对性的回答。"
                        "不要复述、续写或照抄历史里你已经回答过的内容。")
+    # 思考流中文（2026-10-11）：reasoning 摘要是模型自产的英文推理。实测同一请求
+    # 加此约束后中文占比 2.5% → 89%（DeepSeek 系按 system 切换思考语言）。App 0 行改动。
+    sys_content += "\n【思考语言】你的一切推理、思考过程（reasoning）必须使用中文书写，禁止使用英文。"
     sys_content += QCARD_PROMPT   # v3.9.31 ql-card 协议
     sys_content += QLACTION_PROMPT   # v3.9.95 ql-action 本地动作协议
     sys_content += TASK_PROMPT   # v3.9.72 P0.1 任务化回复
     sys_content += SOUL_PROMPT    # v3.9.73 soul：输出精炼
     sys_content += memory_store.prompt_block()   # v3.9.95 AI 记忆注入（哈希门控稳定前缀）
+    _ambig = str(st.pop("ambiguityHint", "") or "")   # v4.x dejavu 中间态（只对本轮生效）
+    if _ambig:
+        sys_content += _ambig
     if _ctx_text:
         # v3.9.80：早期对话摘要拼进**首条 system**（Responses 协议只认首条 system 平移到
         # instructions；在 messages 中间插 system 会被当历史消息发给模型，观感=莫名指令）。
@@ -2301,9 +2307,21 @@ def _worker(task_id, task):
             st["routeNeedsAction"] = _route_detail.get("needs_action")
         except Exception:
             pass
-        _ts_route_log("[%s] route=%s src=%s needs_action=%s p=%s ms=%s model=%s text=%s" % (
+        # v4.x dejavu 中间态：三候选打分判「不确定」时，本轮先让模型向用户确认。
+        # 提示拼进首条 system（st.pop 消费），不进历史、不留状态，下轮正常执行。
+        try:
+            if _route == "fast_chat" and _route_src == "typesafe" and _route_detail.get("ambiguity"):
+                st["ambiguityHint"] = (
+                    "\n\n【意图不明·先确认】路由判定对用户这条消息拿不准（介于闲聊和实际操作之间）。"
+                    "本轮不要执行任何操作、不要调用任何工具、不要输出卡片或动作围栏："
+                    "用一句简短自然的中文向用户确认他想做什么，给出最可能的两种理解让他选"
+                    "（例：「你是想让我帮你X，还是就是聊聊Y？」）。等他说清后下一轮再真正执行。")
+        except Exception:
+            pass
+        _ts_route_log("[%s] route=%s src=%s needs_action=%s p=%s uns=%s ms=%s model=%s text=%s" % (
             time.strftime("%m-%d %H:%M:%S"), _route, _route_src,
             _route_detail.get("needs_action"), _route_detail.get("needs_action_prob"),
+            _route_detail.get("unsure"),
             _route_detail.get("ms"), _route_detail.get("model"), str(last_user_text or "")[:50]))
         print("[route] %s/%s needs_action=%s ms=%s" % (
             _route, _route_src, _route_detail.get("needs_action"), _route_detail.get("ms")), flush=True)
@@ -2567,6 +2585,10 @@ def _hermes_responses_worker(task_id, task, req_body, headers, last_write):
     st = task["state"]
     err_text = ""
     tool_seq = 0          # v3.6.1 进度行序号（同名工具多次调用也要追加新行）
+    # v4.0.91 思考流透传：捕获上游 reasoning_summary 事件，App 可折叠展示「思考中」。
+    # 只存内存态（不落盘），上限 REASONING_MAX_CHARS 防长任务撑爆轮询响应。
+    st["reasoning"] = ""
+    rs_len = 0
 
     # v3.6.4 心跳 v3（只追加，禁止原位刷新）：App 轮询是 offset 增量协议（offset 只增不减、
     # content 只能追加不能修改/删除）——v3.6.3 的"删旧行+加新行"会位移字符导致 App 端
@@ -2636,6 +2658,15 @@ def _hermes_responses_worker(task_id, task, req_body, headers, last_write):
             if jtype == "response.created":
                 continue   # 事件壳，不算「真内容」
             _hb_collapse()   # 任何真实事件到达 → 折叠心跳行
+            if jtype == "response.reasoning_summary_text.delta":
+                # v4.0.91 思考流透传：模型思考摘要增量 → st["reasoning"]（纯内存，限长截断）
+                d = j.get("delta") or ""
+                if d and rs_len < REASONING_MAX_CHARS:
+                    # 硬截断：整块追加会超上限一拍（实测 8100），按剩余额度切片
+                    d = d[:REASONING_MAX_CHARS - rs_len]
+                    st["reasoning"] += d
+                    rs_len += len(d)
+                continue
             if jtype == "response.output_text.delta":
                 delta = j.get("delta") or ""
                 if not delta:
@@ -3413,6 +3444,7 @@ class StreamHandler(BaseHTTPRequestHandler):
                         "s": x.get("s")} for x in (st.get("toolSpans") or [])]
             return self._send(200, {
                 "content": new,
+                "reasoning": str(st.get("reasoning") or "")[-2000:],   # v4.0.91：思考流尾部（纯增量键，老 App 忽略）
                 "done": st["status"] != "streaming",
                 "status": st["status"],
                 "sessionId": st["sessionId"],
