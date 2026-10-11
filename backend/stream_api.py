@@ -2060,7 +2060,14 @@ def _build_hermes_agent_prompt(st, last_user):
                    "可以调用工具查询/控制 NAS、Docker、智能家居。"
                    "工具结果如实转达用户；失败要说明原因和建议。"
                    "回答简洁中文，用 emoji 点缀。"
-                   "每次回复只针对用户最新一条消息，不要重复历史中已回答过的内容。")
+                   "每次回复只针对用户最新一条消息，不要重复历史中已回答过的内容。"
+                   # v4.0.121（2026-10-11 提速两条纪律，实测依据见 references/latency-baseline）：
+                   # ① App 干活轮实测「一次模型往返只发 1 个工具调用」（某轮 37 往返/39 工具），
+                   #    而模型本身支持并行（探针同一 prompt 一次回 3 个 tool_calls），Hermes 端也会并发执行；
+                   # ② 网络类命令不带超时会硬等（git fetch 白等 180.06s，fetch_exit=124，GitHub 不通）。
+                   "互不依赖的读取、搜索、只读命令，尽量放在同一次回复里一起调用（可并行），不要一个命令一轮；"
+                   "网络/外部命令一律自带短超时（如 timeout 20），失败立刻换路"
+                   "（GitHub 连不上就直接走 API，不要反复 git fetch/push 硬等）。")
     # v3.9.31 ql-card 协议
     sys_content += QCARD_PROMPT
     sys_content += QLACTION_PROMPT   # v3.9.95 ql-action 本地动作协议
@@ -2261,6 +2268,41 @@ def _worker(task_id, task):
                 else:
                     last_user_text = str(last_user or "")
                 break
+        # v4.0.121（2026-10-11 诊断）：内部指令就地拦截——/new 是 App「新建会话」的静默指令
+        # （ChatView.silentGatewayReset / ChatStore.silentGatewayResetForNewSession 只投这一条）。
+        # 实测（agent.log 近两天 184 轮 api_server 会话）两个问题：
+        #   ① 静默 /new：每次都白付一次完整模型往返（in≈2.7 万 token、5~6s、0 工具）。而 Hermes 侧
+        #      早已不按 sessionId 复用上下文（见 _build_hermes_messages 注释：去掉了
+        #      X-Hermes-Session-Id，改发 App 全量净化历史）→「投 /new 触发 gateway 重置」的前提
+        #      已失效，这条指令现在不重置任何东西。
+        #   ② 手动发 /new（Hermes 捷径面板）：历史厚时弱模型把它当成「接着上一轮干活」，线上实测
+        #      跑了 71 步工具、23.5 分钟（会话 b481b163…，msg='/new' history=11）。
+        # 处置：命令不过网、不进模型，就地给固定应答（手动发送时 App 轮询即可见）；
+        # 不调 _maybe_push*：静默重置不该冒推送气泡（_maybe_push_app 内已有同口径跳过）。
+        _cmd_head = ((last_user_text or "").strip().split() or [""])[0]
+        _local_reply = {
+            "/new": "👋 新会话已开启，说吧。",
+            "/help": ("轻聊里真正生效的指令只有两条：\n"
+                      "• /new — 开一个新会话\n"
+                      "• /help — 看这条说明\n"
+                      "其它 Hermes 命令（/model、/skills、/cron、/memory…）在轻聊里不生效，"
+                      "功能都在 App 里：模型→设置·模型管理，记忆→设置·AI 记忆，技能→技能页，定时→任务中心。\n"
+                      "想让我直接动手做的事，用大白话说一句就行。"),
+        }.get(_cmd_head)
+        if _local_reply is None and _cmd_head in (
+                "/model", "/compress", "/memory", "/skills", "/skill", "/cron", "/voice", "/undo",
+                "/title", "/usage", "/status", "/personality", "/reasoning", "/background",
+                "/queue", "/fast", "/resume", "/sethome", "/update", "/tools", "/sessions",
+                "/reload", "/stop", "/clear"):
+            _local_reply = ("「%s」是 Hermes 命令行命令，轻聊里不生效（等价的界面入口：模型→设置·模型管理，"
+                            "记忆→设置·AI 记忆，技能→技能页，定时→任务中心）。想让我做的事直接用大白话说就行。" % _cmd_head)
+        if _local_reply:
+            st["agent"] = False
+            st["content"] = _local_reply
+            st["status"] = "done"
+            _write_state(task_id, task)
+            print("[cmd] %s 就地应答（不调用模型）：sid=%s" % (_cmd_head, str(st.get("sessionId"))[:14]), flush=True)
+            return
         new_rule = agent_rules.extract_from_text(last_user_text)
         if new_rule:
             agent_rules.add_rule(new_rule)
