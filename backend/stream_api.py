@@ -1140,6 +1140,81 @@ def _persist_state(task_id, st):
         pass
 
 
+def _build_resume_payload(parent_id):
+    """v4.0.96（第三档·从断点继续）：从磁盘上的中断任务重建续跑上下文。
+
+    ⚠️ 前提：工具执行在 Hermes 侧，轻聊手里只有 toolSpans/toolHistory（工具名+耗时，
+    **没有参数与结果**）→ 只能「带断点重开一轮」，不能真正从第 k 步接着执行，
+    也不承诺无重复（靠「已完成的不要重做」提示压制）。
+    返回 (ok, err, payload)；payload = {"messages": [...], "step": k, "taskId": id|None, "dedup": bool}
+    """
+    fp = os.path.join(STREAM_DIR, str(parent_id) + ".json")
+    if not os.path.isfile(fp):
+        return False, "父任务记录不存在", None
+    try:
+        with open(fp, "r", encoding="utf-8") as f:
+            pst = json.load(f)
+    except Exception:
+        return False, "父任务记录损坏", None
+    if str(pst.get("status") or "") != "error" or str(pst.get("outcome") or "") != "outcome_unknown":
+        return False, "该任务不是中断任务，不能续跑", None
+    if pst.get("resumedBy"):
+        # 审查 P2：dedup 也要带回当时的中断步数，否则 App 展示「已完成第 k 步」归零，
+        # 且与新建分支的返回体形状不一致。
+        return True, "", {"taskId": str(pst.get("resumedBy")), "dedup": True,
+                          "messages": [], "step": int(pst.get("toolSeq") or 0)}
+    msgs = pst.get("messages") if isinstance(pst.get("messages"), list) else []
+    if not msgs:
+        return False, "父任务没有可续跑的消息", None
+    steps = []
+    for x in (pst.get("toolSpans") or []):
+        if isinstance(x, dict) and x.get("n"):
+            steps.append(_TOOL_NAME_ZH.get(str(x["n"]), str(x["n"])))
+    if not steps:
+        steps = [_TOOL_NAME_ZH.get(str(x), str(x)) for x in (pst.get("toolHistory") or [])]
+    k = int(pst.get("toolSeq") or len(steps) or 0)
+    tail = str(pst.get("content") or "")[-1500:]
+    hint = ("【断点续跑】上一轮任务在服务端重启/异常时中断，已完成第 %d 步：%s。\n"
+            "已完成的部分不要重做。\n" % (k, "、".join(steps[:20]) or "（无）"))
+    if tail:
+        hint += "以下是中断前已生成的内容（可能不完整）：\n" + tail + "\n"
+    hint += "请接着把用户最初的要求做完，直接继续完成剩余部分。"
+    return True, "", {"messages": list(msgs) + [{"role": "system", "content": hint}],
+                      "step": k, "taskId": None, "dedup": False}
+
+
+def _mark_resumed(parent_id, child_id):
+    """v4.0.96：父子对账——父流记 resumedBy/resumeAt（原子写，保留属主与权限）。
+
+    ⚠️ 已知窄窗口（刻意不加固）：本函数与 `_build_resume_payload` 的「检查」之间不是同一临界区，
+    极端并发（同一父流两条续跑请求落在毫秒级间隔内）理论上能起两条续跑流。**不加占位锁**的理由：
+    既有 10s `[dedup-start]` 守卫（同 sessionId + 同末条 user 消息，续跑流的 messages 由服务端
+    从父流重建 → 键与父流一致）已覆盖秒级重复；而占位状态会引入「卡在 __resuming__ 后再也
+    不可续」的新故障面，代价大于收益。App 侧「继续完成」按钮点击即 isStreaming → 也不给双击留窗。
+    """
+    fp = os.path.join(STREAM_DIR, str(parent_id) + ".json")
+    with open(fp, "r", encoding="utf-8") as f:
+        pst = json.load(f)
+    pst["resumedBy"] = str(child_id)
+    pst["resumeAt"] = time.time()
+    uid = gid = mode = None
+    try:
+        _s = os.stat(fp)
+        uid, gid, mode = _s.st_uid, _s.st_gid, _s.st_mode & 0o7777
+    except Exception:
+        pass
+    tmp = fp + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(pst, f, ensure_ascii=False)
+    os.replace(tmp, fp)
+    if uid is not None:
+        try:
+            os.chown(fp, uid, gid)
+            os.chmod(fp, mode)
+        except Exception:
+            pass
+
+
 def _touch_state(task_id, task):
     """v4.0.37 心跳落盘：刷 st["heartbeatAt"] + 文件 mtime（防磁盘侧把"还在跑的长任务"
     当僵尸删掉），但**不动 updatedAt**（见 _persist_state 注释）。"""
@@ -3008,6 +3083,30 @@ class StreamHandler(BaseHTTPRequestHandler):
             # v3.6.5：App「模型思考胶囊」下发的思考档位（none/low/medium/high）——空则用服务端默认
             reasoning = str(data.get("reasoning", "") or "").strip().lower()
             # v3.2.7（方案C）：bot 模式已废除，不再读取 bot 字段（App 若仍传则被忽略，向后兼容）
+            # v4.0.96（第三档·从断点继续）：服务端重建断点上下文，App 只传 resumeFrom。
+            resume_from = str(data.get("resumeFrom") or "").strip()
+            # 🚨 审查 P1：resumeFrom 会直接拼进文件路径（读 + 写）→ 必须白名单化，否则
+            # `../../x` 可读 STREAM_DIR 外的 JSON 并把 resumedBy 回写进去（任意文件读/写原语）。
+            # 任务 id 形态 = uuid4().hex[:12]（小写十六进制）→ 白名单放宽到 [A-Za-z0-9_-]{4,64}。
+            if resume_from and not re.fullmatch(r"[A-Za-z0-9_-]{4,64}", resume_from):
+                return self._send(400, {"error": "bad resumeFrom"})
+            _rctx = None
+            if resume_from:
+                # 审查 P2：父流文件可被手改/损坏 → 必须包 try，别让 ValueError 冒到 do_POST
+                #（那样是「连接被重置」而不是 400，与同文件其它读盘点口径不一致）。
+                try:
+                    _rok, _rerr, _rctx = _build_resume_payload(resume_from)
+                except Exception as _be:
+                    print("[resume] 断点重建失败 %s: %s" % (resume_from, _be), flush=True)
+                    return self._send(400, {"error": "父任务记录损坏"})
+                if not _rok:
+                    return self._send(400, {"error": _rerr})
+                if _rctx.get("dedup"):
+                    return self._send(200, {"taskId": _rctx.get("taskId"),
+                                            "resumedFrom": resume_from,
+                                            "resumeStep": int(_rctx.get("step") or 0),
+                                            "deduplicated": True})
+                messages = _rctx["messages"]
             if not messages or not isinstance(messages, list):
                 return self._send(400, {"error": "messages required"})
             # v3.9.96 方案1：防重复发起（幂等守卫）。App 在 SSE 断开时会 autoRetryStream 重发同一
@@ -3046,13 +3145,30 @@ class StreamHandler(BaseHTTPRequestHandler):
                     "provider": provider,
                     "reasoning": reasoning,   # v3.6.5 思考档位（App 可调）
                     "createdAt": time.time(),
-                    "updatedAt": time.time()
+                    "updatedAt": time.time(),
+                    # v4.0.96（第三档·从断点继续）：本流由哪条父流续来 + 中断时步数
+                    "resumedFrom": resume_from or "",
+                    "resumeStep": int((_rctx or {}).get("step") or 0),
+                    "resumeAt": time.time() if _rctx else 0
                 }
             }
             with _tasks_lock:
                 _tasks[task_id] = task
+            if _rctx:
+                try:
+                    _mark_resumed(resume_from, task_id)
+                except Exception as _me:
+                    # 🚨 审查 P2：写失败不能当成功返回——父流没落 resumedBy，App 仍判「可续」，
+                    # 用户再点一次就起第二条续跑流（磁盘写失败是常态重复，不是已接受的毫秒级并发）。
+                    print("[resume] 父流对账失败 %s: %s" % (resume_from, _me), flush=True)
+                    try:
+                        _tasks.pop(task_id, None)     # 线程尚未 start，摘掉登记即可
+                    except Exception:
+                        pass
+                    return self._send(500, {"error": "父任务标记失败，请重试"})
             threading.Thread(target=_worker, args=(task_id, task), daemon=True).start()
-            return self._send(200, {"taskId": task_id})
+            return self._send(200, {"taskId": task_id, "resumedFrom": resume_from or "",
+                                    "resumeStep": int((_rctx or {}).get("step") or 0)})
 
         # stop
         if self.path.startswith("/api/stream/") and self.path.endswith("/stop"):
@@ -3423,6 +3539,9 @@ class StreamHandler(BaseHTTPRequestHandler):
                             "outcome": _bst.get("outcome", ""),
                             "plan": _task_plan(_bst),
                             "planSeq": int(_bst.get("toolSeq") or 0),
+                            # v4.0.96（第三档·从断点继续）：父流被续到哪条 + 中断步数
+                            "resumedBy": str(_bst.get("resumedBy") or ""),
+                            "resumeStep": int(_bst.get("resumeStep") or 0),
                             "fromDisk": True
                         })
             except Exception:
@@ -3501,7 +3620,8 @@ class StreamHandler(BaseHTTPRequestHandler):
                                               str(st.get("lastTool") or "")),
                 "toolNames": [_TOOL_NAME_ZH.get(x, x) for x in _th],
                 "toolSpans": _tspans,               # v3.9.58：已完成步骤的耗时（秒）
-                "lastToolAt": st.get("lastToolAt") or 0
+                "lastToolAt": st.get("lastToolAt") or 0,
+                "resumedFrom": str(st.get("resumedFrom") or "")   # v4.0.96：本流由哪条父流续来
             })
         return self._send(404, {"error": "not found"})
 
@@ -3691,6 +3811,10 @@ def cleanup_old_tasks():
     ZOMBIE_SILENT = 1800   # v4.0.37：降级为"旧口径兜底"（无 thread/heartbeat 证据时才用）
     # v3.9.56：已完成（非 streaming）任务文件的保留期，与 TASK_TTL 内存侧 2 小时口径区分开
     STREAM_FILE_TTL = 7200
+    # v4.0.96（第三档·从断点继续）：中断任务（outcome_unknown）是「继续完成」的唯一依据，
+    # 沿用 2 小时 TTL 会让「白天中断、晚上才点」的任务没有父流可续（实测样本就是这样被清掉的）。
+    # 未续过的中断流用更长的保留期；已续过（resumedBy 非空）就不必留。
+    STREAM_RESUME_TTL = int(os.environ.get("QL_STREAM_RESUME_TTL", 72 * 3600))
     # v4.0.37（借鉴①）：周期 300s → CLEANUP_INTERVAL(30s)。判死要"快"才有意义——真死的
     # 任务 30s 内回收，App 才不会对着幽灵任务一直转圈。磁盘扫描同步变 30s 一轮
     # （streams 目录文件数是个位数，读几个小 JSON 的开销可忽略）。
@@ -3752,8 +3876,14 @@ def cleanup_old_tasks():
                             if now - os.path.getmtime(fp) > ZOMBIE_SILENT:
                                 os.remove(fp)
                             continue
-                        # 已完成任务文件保留 STREAM_FILE_TTL（2 小时），沿用原设计
-                        if now - os.path.getmtime(fp) > STREAM_FILE_TTL:
+                        # 已完成任务文件保留 STREAM_FILE_TTL（2 小时），沿用原设计；
+                        # v4.0.96：未续过的中断任务改用 STREAM_RESUME_TTL（默认 72h）——
+                        # 否则「继续完成」的父流会被 2 小时清理掉，用户点按钮只剩 400。
+                        _ttl = STREAM_FILE_TTL
+                        if (isinstance(_st, dict) and _st.get("outcome") == "outcome_unknown"
+                                and not _st.get("resumedBy")):
+                            _ttl = STREAM_RESUME_TTL
+                        if now - os.path.getmtime(fp) > _ttl:
                             os.remove(fp)
                     except Exception:
                         pass
