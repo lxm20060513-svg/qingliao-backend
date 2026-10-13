@@ -62,7 +62,7 @@ def _data_dir():
                 return p
             # 位置覆盖指向不可写目录时不能硬用：否则每次 merge/save 都 500（客户端表现为
             # 「删除失败 服务器错误(500)」）。典型成因：容器把 /data 以 :ro 挂入，而覆盖
-            # 指向该卷下的历史目录（如 微信文件/轻聊app/sessions）。
+            # 指向该卷下的历史目录（如 <挂载点>/<历史数据目录>）。
             print('[sessions] 位置覆盖不可写，回退默认目录: %s -> %s' % (p, fallback), flush=True)
     except Exception:
         pass

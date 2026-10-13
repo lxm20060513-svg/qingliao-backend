@@ -46,7 +46,7 @@ def _save(path, notes):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
-    # 文件管理器可见（root 属主目录如微信文件）
+    # 文件管理器可见（root 属主目录需显式放开读权限）
     try:
         os.chmod(path, 0o644)
         os.chmod(d, 0o755)
