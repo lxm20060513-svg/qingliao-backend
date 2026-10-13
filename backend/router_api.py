@@ -1,4 +1,4 @@
-import json, base64, subprocess, os, sys
+import json, base64, subprocess, os, sys, threading, time, urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # 路由器面板后端：状态查询 + Clash 快捷启停
@@ -197,6 +197,32 @@ def _clash(action):
     return {'ok': True, 'clash_running': False, 'note': '已停止'}
 
 
+# v4.0.104：路由器状态 10s 缓存。
+# 这个口要经 hermes 容器 paramiko 连路由器（实测数秒），App 一屏并发拉多路 + 切页取消（499）
+# → 服务端反复白算；10s 内复用同一份，只影响"多快看到"。?fresh=1 绕过。
+ROUTER_STATUS_TTL = 10
+_ROUTER_STATUS_LOCK = threading.Lock()
+_ROUTER_STATUS_CACHE = {"ts": 0.0, "data": None}
+
+
+def _router_status_cached(fresh=False):
+    now = time.time()
+    with _ROUTER_STATUS_LOCK:
+        c = _ROUTER_STATUS_CACHE
+        if (not fresh) and c["data"] is not None and (now - c["ts"]) < ROUTER_STATUS_TTL:
+            d = dict(c["data"])
+            d["cached"] = True
+            d["cacheAge"] = round(now - c["ts"], 1)
+            return d
+        data = _router_status()
+        if data.get("ok"):        # 失败结果绝不写缓存（与天气接口同铁律）
+            c["ts"] = time.time()
+            c["data"] = data
+    d = dict(data)
+    d["cached"] = False
+    return d
+
+
 class Handler(BaseHTTPRequestHandler):
     def _cors(self):
         self.send_header('Access-Control-Allow-Origin', '*')
@@ -230,7 +256,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send({'ok': False, 'error': '未授权'}, 401)
             return
         if self.path == '/api/router/status' or self.path.startswith('/api/router/status?'):
-            self._send(_router_status())
+            # v4.0.104：10s 缓存，?fresh=1 强制重算
+            _q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            _fresh = (_q.get('fresh') or ['0'])[0].lower() in ('1', 'true', 'yes')
+            self._send(_router_status_cached(_fresh))
             return
         self._send({'ok': False, 'error': 'not found'}, 404)
 

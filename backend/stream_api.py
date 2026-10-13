@@ -296,6 +296,33 @@ def _provider_base_url(pid):
         pass
     return None
 
+# v4.0.104：NAS 面板结果 10s 内复用。
+# 缘由：看板一屏并发拉 9 路，而这个口每次都要 CPU 采样 0.4s + docker inspect/stats + df
+# （实测 p95 5.3s）→ App 切页/超时就取消（nginx 499），服务端白算一遍还刷 BrokenPipe 栈。
+# 缓存只影响"多快看到"，不影响数值口径；?fresh=1 绕过（与 life_api 的 fresh 惯例一致）。
+NAS_STATUS_TTL = 10
+_NAS_STATUS_LOCK = threading.Lock()
+_NAS_STATUS_CACHE = {"ts": 0.0, "data": None}
+
+
+def _nas_status_cached(fresh=False):
+    """带 10s 缓存的 _collect_nas_status()。锁覆盖计算期，避免并发重复采样。"""
+    now = time.time()
+    with _NAS_STATUS_LOCK:
+        c = _NAS_STATUS_CACHE
+        if (not fresh) and c["data"] is not None and (now - c["ts"]) < NAS_STATUS_TTL:
+            d = dict(c["data"])
+            d["cached"] = True
+            d["cacheAge"] = round(now - c["ts"], 1)
+            return d
+        data = _collect_nas_status()
+        c["ts"] = time.time()
+        c["data"] = data
+    d = dict(data)
+    d["cached"] = False
+    return d
+
+
 # V1.7.2：NAS 面板——收集宿主系统与服务状态
 def _collect_nas_status():
     def rd(p):
@@ -2926,15 +2953,21 @@ class StreamHandler(BaseHTTPRequestHandler):
 
     def _send(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers",
-                         "Content-Type, Authorization, X-Stream-Password, X-Auth-Token")
-        self.end_headers()
-        self.wfile.write(body)
+        # v4.0.104：客户端先断开（App 切页/超时取消 → nginx 499）时这里会抛
+        # BrokenPipeError/ConnectionResetError —— 不是服务端故障，静默即可，
+        # 否则每来一次就在日志里刷一段 Traceback（实测 20h 内 15 条栈全是它）。
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers",
+                             "Content-Type, Authorization, X-Stream-Password, X-Auth-Token")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -3396,7 +3429,10 @@ class StreamHandler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": False, "provider": provider, "error": str(e)[:150], "models": []})
         # V1.7.2：NAS 面板状态（宿主系统 + 服务健康）
         if self.path.startswith("/api/nas/status"):
-            return self._send(200, _collect_nas_status())
+            # v4.0.104：10s 缓存，?fresh=1 强制重算
+            _q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            _fresh = (_q.get("fresh") or ["0"])[0].lower() in ("1", "true", "yes")
+            return self._send(200, _nas_status_cached(_fresh))
         # v3.0.36：模型使用量聚合（deepseek/stepfun 官方余额；无接口 provider 标 unsupported）
         if self.path.startswith("/api/nas/providers-usage"):
             try:

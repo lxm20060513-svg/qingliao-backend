@@ -12,6 +12,7 @@ AI 答完一条后给 3 个追问候选，App 渲染成胶囊、点了直接接�
 """
 import json
 import re
+import time
 
 MAX_Q = 3
 MIN_Q = 2          # 去重后不足这个数就当「没有好候选」，返空数组
@@ -97,6 +98,46 @@ _PROMPT = (
 )
 
 
+# v4.0.104：进程内结果缓存。build_questions 每次都要真调一次 LLM（实测 p50 9.3s / p95 15.7s），
+# 而同一轮对话的 (用户问题 + AI 回答 + 已排除项) 是稳定的 —— App 重试/重发/切页回来会重复打。
+# 有候选：10 分钟；空结果：60s 短 TTL（一次上游抖动不能把整轮锁死 10 分钟）。
+_CACHE = {}
+_CACHE_MAX = 64
+CACHE_TTL_HIT = 600
+CACHE_TTL_MISS = 60
+
+
+def _cache_key(last_user, last_answer, exclude, n):
+    import hashlib
+    raw = "\x1f".join([
+        last_user or "", last_answer or "", str(n),
+        "\x1e".join(sorted(str(e or "") for e in (exclude or []))),
+    ])
+    return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()
+
+
+def _cache_get(k):
+    it = _CACHE.get(k)
+    if not it:
+        return None
+    if time.time() - it["ts"] > it["ttl"]:
+        _CACHE.pop(k, None)
+        return None
+    return it["qs"]
+
+
+def _cache_put(k, qs):
+    while len(_CACHE) >= _CACHE_MAX:
+        try:
+            oldest = min(_CACHE.items(), key=lambda kv: kv[1]["ts"])[0]
+            _CACHE.pop(oldest, None)
+        except Exception:
+            _CACHE.clear()
+            break
+    _CACHE[k] = {"ts": time.time(), "qs": list(qs),
+                 "ttl": CACHE_TTL_HIT if qs else CACHE_TTL_MISS}
+
+
 def build_questions(last_user, last_answer, exclude=None, n=MAX_Q):
     """生成 0~3 条追问候选。任何异常都吞成空数组（App 侧静默不渲染该区）。"""
     try:
@@ -106,6 +147,10 @@ def build_questions(last_user, last_answer, exclude=None, n=MAX_Q):
         ex = [str(e or "").strip() for e in (exclude or []) if str(e or "").strip()]
         if not last_user and not last_answer:
             return []
+        ck = _cache_key(last_user, last_answer, ex, n)
+        hit = _cache_get(ck)
+        if hit is not None:
+            return list(hit)
         prompt = _PROMPT.format(
             n=n, qlen=MAX_Q_LEN,
             ex=("（无）" if not ex else "；".join(e[:40] for e in ex[:8])),
@@ -127,8 +172,8 @@ def build_questions(last_user, last_answer, exclude=None, n=MAX_Q):
         if text.startswith("custom rejected"):   # 老网关形态：失败文本直接进 content
             return []
         qs = _normalize(_parse_questions(text), exclude)
-        if len(qs) < MIN_Q:
-            return []
-        return qs
+        out = qs if len(qs) >= MIN_Q else []
+        _cache_put(ck, out)
+        return out
     except Exception:
         return []
