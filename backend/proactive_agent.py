@@ -69,8 +69,10 @@ DEFAULT_CFG = {
     "quietStart": 23,         # 静默时段（23:00-07:00 不主动）
     "quietEnd": 7,
     "minScore": 0.55,         # LLM 置信度阈值，低于它不打扰
-    "judgeProvider": "",      # 空 = 按 JUDGE_FALLBACKS 依次试（默认 stepfun/step-3.7-flash）
-    "judgeModel": "",         # 同上；两个都空才回退全局 AGENT_*
+    "judgeProvider": "",      # 显式自配判定模型（两键都填才生效）；空 = 跟随主模型
+    "judgeModel": "",
+    "judgeFollowMain": True,  # 判定模型默认跟随主模型（Hermes 主 config.yaml 的 model 段）；
+                              # 关掉 → 回旧行为：JUDGE_FALLBACKS（stepfun/step-3.7-flash → 全局 AGENT_*）
     "goalNudge": True,        # 目标停滞 nudge
     # v4.0.20（#2）：长期目标自动判定 —— 关掉后 AI 不再收到 goal.create 说明，
     # 闲聊不会被误判成「长期目标」；**已存在的目标照常推进**（那是 cron 的事）。
@@ -660,6 +662,62 @@ def _memory_block():
         return "（暂无）"
 
 
+_MAIN_CFG_CANDIDATES = (
+    os.environ.get("QL_WECHAT_PROFILE_CFG") or "",
+    os.environ.get("QL_HERMES_DATA", "/data/hermes") + "/config.yaml",
+    "/data/hermes_config.yaml",
+)
+
+
+def _main_model():
+    """读 Hermes 主 config.yaml 的 model 段 → (provider, model)。
+
+    真值同 channel_api._read_model()（App「Hermes 主模型」设置写的就是这一段）。
+    语义：主动判定默认跟随主模型；主模型不可用时仍回退 JUDGE_FALLBACKS，
+    绝不因读不到主模型而让判定层失能。任何异常 → ("", "")。
+    """
+    try:
+        import yaml as _yaml
+    except Exception:
+        _yaml = None
+    for path in [p for p in _MAIN_CFG_CANDIDATES if p]:
+        try:
+            if not os.path.exists(path):
+                continue
+            with open(path, encoding="utf-8") as f:
+                raw = f.read()
+            if _yaml is not None:
+                cfg = _yaml.safe_load(raw) or {}
+                m = cfg.get("model") or {}
+                if isinstance(m, dict):
+                    mdl = str(m.get("default") or "").strip()
+                    prov = str(m.get("provider") or "").strip()
+                    if mdl:
+                        return (prov, mdl)
+                    continue
+            # 无 pyyaml 的行级兜底（只认顶层 model: 段）
+            mdl = prov = ""
+            in_model = False
+            for ln in raw.splitlines():
+                t = ln.strip()
+                if t == "model:" and not ln[:1] in (" ", "\t"):
+                    in_model = True
+                    continue
+                if in_model and t and not ln[:1] in (" ", "\t") and not t.startswith("#"):
+                    break
+                if in_model:
+                    if t.startswith("default:"):
+                        mdl = t.split(":", 1)[1].strip().strip("\"'")
+                    elif t.startswith("provider:"):
+                        prov = t.split(":", 1)[1].strip().strip("\"'")
+            if mdl:
+                return (prov, mdl)
+        except Exception as e:
+            print("[proactive] 读主模型 %s 失败: %s"
+                  % (os.path.basename(path), str(e)[:100]), flush=True)
+    return ("", "")
+
+
 JUDGE_FALLBACKS = [("stepfun", "step-3.7-flash"), ("", "")]   # (provider, model)
 
 
@@ -672,16 +730,31 @@ def _parse_judge(txt):
 
 
 def _judge_llm(signal):
-    """按 JUDGE_FALLBACKS 逐个端点试，第一个成功即用。
+    """按候选顺序逐个端点试，第一个成功即用（v4.0.x：默认跟随主模型）。
 
-    🚨 踩坑：`_agent_endpoint(None, None)` 回退全局 AGENT_*（本部署 = DeepSeek，
-    余额 0 → 402），判定层会**静默永久退化**成模板兜底（实测日志
+    顺序：① judgeProvider/judgeModel 显式配置（两键都填才用）② 主模型
+    （judgeFollowMain 默认 True，读 Hermes 主 config.yaml 的 model 段）
+    ③ JUDGE_FALLBACKS 兜底：stepfun/step-3.7-flash → 全局 AGENT_*。
+
+    🚨 踩坑（保留）：`_agent_endpoint(None, None)` 回退全局 AGENT_*（本部署曾
+    = DeepSeek 余额 0 → 402），判定层会**静默永久退化**成模板兜底（实测日志
     「LLM 判定失败: HTTP Error 402」而服务照跑，看似在岗实则失能）。
-    故默认走 stepfun step-3.7-flash，只在它也挂时才回退全局端点。
+    故主模型/自定义端点失败后一律继续走兜底候选，绝不直接落模板。
     """
     cfg = get_config()
     want = (cfg.get("judgeProvider") or "", cfg.get("judgeModel") or "")
-    order = ([want] if any(want) else []) + JUDGE_FALLBACKS
+    order, src = [], {}
+    if any(want):
+        order.append(want)
+        src[want] = "自定义"
+    if cfg.get("judgeFollowMain", True):
+        mm = _main_model()
+        if any(mm):
+            order.append(mm)
+            src.setdefault(mm, "主模型")
+    for cand in JUDGE_FALLBACKS:
+        order.append(cand)
+        src.setdefault(cand, "兜底")
     seen = set()
     for prov, mdl in order:
         key0 = (prov, mdl)
@@ -710,11 +783,12 @@ def _judge_llm(signal):
                 obj = _parse_judge(msg.get("reasoning_content") or "")
             if obj is None:
                 raise ValueError("判定输出无 JSON content=%r" % (msg.get("content") or "")[:60])
-            print("[proactive] 判定端点 %s/%s ok" % (prov or "global", eff_model), flush=True)
+            print("[proactive] 判定端点 [%s] %s/%s ok"
+                  % (src.get(key0, ""), prov or "global", eff_model), flush=True)
             return obj
         except Exception as e:
-            print("[proactive] 判定端点 %s/%s 失败: %s"
-                  % (prov or "global", mdl or "-", str(e)[:120]), flush=True)
+            print("[proactive] 判定端点 [%s] %s/%s 失败: %s"
+                  % (src.get(key0, ""), prov or "global", mdl or "-", str(e)[:120]), flush=True)
     return None
 
 
