@@ -30,13 +30,16 @@
 
 约定：单条目/单源失败不影响其它；全部失败才 ok:false + error。上游请求短超时，
 整体收集有硬上限（不死等），失败降级为条目内 ok:false + error 文本。
-仅标准库（urllib + xml.etree + hashlib），无第三方依赖。
+仅标准库（urllib + xml.etree + hashlib + subprocess），无第三方依赖。
+资讯正文在 urllib 抓不到正文时走「无头浏览器兜底」：docker exec 到 Hermes 容器跑 playwright
+渲染页面后取 DOM（见 _headless_html；只在兜底时用，慢几秒，失败静默降级）。
 落盘配置：与本文件同目录的 life_config.json（改完即生效，无需重启进程）。
 """
 import hashlib
 import json
 import os
 import re
+import subprocess
 import threading
 import time
 import urllib.parse
@@ -66,7 +69,7 @@ RSS_TTL = 900             # RSS 缓存 15 分钟
 EXPRESS_TTL = 300         # 快递缓存 5 分钟（物流更新频率低）
 PRICE_TTL = 900           # 价格缓存 15 分钟
 MAX_ENTRIES_PER_FEED = 4  # 每个源取多少条
-MAX_ENTRIES = 8           # 合并后最多返回多少条（源多时保证首页只显示最近的）
+MAX_ENTRIES = 20          # 合并后最多返回多少条（用户 2026-10-12「博客资讯信息每次拉取改为 20 条」；每个源仍只取 MAX_ENTRIES_PER_FEED 条 → 合并后按时间取最近 20，单源最多占 4 席，防一个高频站刷满整卡）
 
 MAX_STOCKS = 20
 MAX_FEEDS = 20
@@ -137,6 +140,15 @@ RSS_CATALOG = (
     {"name": "TechCrunch", "url": "https://techcrunch.com/feed/"},
     {"name": "The Verge", "url": "https://www.theverge.com/rss/index.xml"},
     {"name": "Apple Newsroom", "url": "https://www.apple.com/newsroom/rss-feed.rss"},
+    # 科技 / AI 类（2026-10-11 追加；均为容器内同条件实测可用的源）
+    {"name": "量子位", "url": "https://www.qbitai.com/feed"},
+    {"name": "InfoQ 中文", "url": "https://www.infoq.cn/feed"},
+    {"name": "极客公园", "url": "https://www.geekpark.net/rss"},
+    {"name": "钛媒体", "url": "https://www.tmtpost.com/rss.xml"},
+    {"name": "Google AI Blog", "url": "https://blog.google/technology/ai/rss/"},
+    {"name": "The Decoder", "url": "https://the-decoder.com/feed/"},
+    {"name": "Ars Technica", "url": "https://feeds.arstechnica.com/arstechnica/index"},
+    {"name": "MIT Tech Review", "url": "https://www.technologyreview.com/feed/"},
 )
 
 DEFAULT_EXPRESS_SOURCE = {
@@ -149,6 +161,33 @@ DEFAULT_EXPRESS_SOURCE = {
     "context_key": "context",
     "state_path": "state",
 }
+
+
+# ---------------------------------------------------------------- 无头兜底（JS 渲染 / 反爬页）
+# 轻聊后端容器自身没有浏览器内核（宿主镜像也缺浏览器依赖库）→ 复用 Hermes 容器里现成的
+# playwright + chrome-headless-shell：qingliao 容器挂了 docker.sock 与 docker CLI，
+# 可直接 docker exec 进 Hermes 容器跑 render.py，取 JS 渲染后的 DOM。
+# 只在 urllib 抓不到正文时兜底（普通静态页不受影响）；失败一律返回空串，静默降级，绝不抛异常。
+HEADLESS_CONTAINER = os.environ.get("QL_HERMES_CONTAINER", "hermes-container")          # 可用 QL_HERMES_CONTAINER 覆盖
+HEADLESS_PY = os.environ.get("QL_HERMES_DATA", "/data/hermes") + "/venvs/browser/bin/python3"
+HEADLESS_SCRIPT = os.environ.get("QL_HERMES_DATA", "/data/hermes") + "/scripts/browser_agent/render.py"
+HEADLESS_TIMEOUT = 30                            # 秒；压在 App 侧 30s 请求上限内
+
+
+def _headless_html(url):
+    """无头兜底：让 Hermes 容器的无头浏览器渲染页面，返回渲染后 HTML；任何失败返回空串。"""
+    cname = (os.environ.get("QL_HERMES_CONTAINER") or HEADLESS_CONTAINER).strip() or HEADLESS_CONTAINER
+    py = os.environ.get("QL_HEADLESS_PY") or HEADLESS_PY
+    script = os.environ.get("QL_HEADLESS_SCRIPT") or HEADLESS_SCRIPT
+    try:
+        p = subprocess.run(["docker", "exec", cname, py, script, url],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=HEADLESS_TIMEOUT)
+        if p.returncode != 0 or not p.stdout:
+            return ""
+        return p.stdout.decode("utf-8", "ignore")
+    except Exception:
+        return ""
 
 
 def _default_config():
@@ -1112,6 +1151,13 @@ def _fetch_article(url, title="", fresh=False):
         return payload
     html = raw.decode("utf-8", "ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
     page_title, text = _extract_article(html)
+    via = "http"
+    if len(text) < ARTICLE_MIN_CHARS:
+        _hl = _headless_html(url)      # 无头兜底：SPA/JS 渲染页用 urllib 只能拿到空壳
+        if _hl:
+            _t2, _text2 = _extract_article(_hl)
+            if len(_text2) >= ARTICLE_MIN_CHARS:
+                page_title, text, via = (page_title or _t2), _text2, "headless"
     if len(text) < ARTICLE_MIN_CHARS:
         payload = {"ok": False, "url": url, "title": page_title or title,
                    "error": "该页面抓不到正文（可能需 JS 渲染或反爬）"}
@@ -1121,11 +1167,11 @@ def _fetch_article(url, title="", fresh=False):
     ai = _ai_tidy(title or page_title, feed)
     if ai:
         payload = {"ok": True, "url": url, "title": title or page_title, "content": ai,
-                   "source": "ai", "raw_chars": len(text), "chars": len(ai),
+                   "source": "ai", "via": via, "raw_chars": len(text), "chars": len(ai),
                    "truncated": len(text) > ARTICLE_MAX_CHARS, "ts": int(time.time())}
     else:
         payload = {"ok": True, "url": url, "title": title or page_title, "content": feed,
-                   "source": "raw", "raw_chars": len(text), "chars": len(feed),
+                   "source": "raw", "via": via, "raw_chars": len(text), "chars": len(feed),
                    "truncated": len(text) > ARTICLE_MAX_CHARS, "ts": int(time.time())}
     _ARTICLE_CACHE[key] = (time.time(), payload)
     return payload
@@ -2405,6 +2451,13 @@ def _fetch_article(url, title="", fresh=False):
         return payload
     html = raw.decode("utf-8", "ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
     page_title, text = _extract_article(html)
+    via = "http"
+    if len(text) < ARTICLE_MIN_CHARS:
+        _hl = _headless_html(url)      # 无头兜底：SPA/JS 渲染页用 urllib 只能拿到空壳
+        if _hl:
+            _t2, _text2 = _extract_article(_hl)
+            if len(_text2) >= ARTICLE_MIN_CHARS:
+                page_title, text, via = (page_title or _t2), _text2, "headless"
     if len(text) < ARTICLE_MIN_CHARS:
         payload = {"ok": False, "url": url, "title": page_title or title,
                    "error": "该页面抓不到正文（可能需 JS 渲染或反爬）"}
@@ -2414,11 +2467,11 @@ def _fetch_article(url, title="", fresh=False):
     ai = _ai_tidy(title or page_title, feed)
     if ai:
         payload = {"ok": True, "url": url, "title": title or page_title, "content": ai,
-                   "source": "ai", "raw_chars": len(text), "chars": len(ai),
+                   "source": "ai", "via": via, "raw_chars": len(text), "chars": len(ai),
                    "truncated": len(text) > ARTICLE_MAX_CHARS, "ts": int(time.time())}
     else:
         payload = {"ok": True, "url": url, "title": title or page_title, "content": feed,
-                   "source": "raw", "raw_chars": len(text), "chars": len(feed),
+                   "source": "raw", "via": via, "raw_chars": len(text), "chars": len(feed),
                    "truncated": len(text) > ARTICLE_MAX_CHARS, "ts": int(time.time())}
     _ARTICLE_CACHE[key] = (time.time(), payload)
     return payload
