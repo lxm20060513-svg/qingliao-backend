@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """文件管理 API：/api/files/list?path=... /api/files/download?path=...
 浏览 NAS 安全根目录内的文件，支持列表/下载/删除（限制在根目录内防穿越）
-新增：/api/files/upload 上传到微信文件目录
+新增：/api/files/upload 上传到聊天附件目录
 密码保护：所有请求需携带 X-Files-Password header
 """
 import http.server
@@ -53,7 +53,7 @@ def resolve_path(p):
         p = ''
     # 去掉可能的根标记
     p = p.lstrip('/')
-    # 优先：上传目录（微信文件）下的文件 —— 聊天附件上传的位置
+    # 优先：上传目录（聊天附件）下的文件 —— 聊天附件上传的位置
     up_abs = os.path.normpath(os.path.join(upload_config_helper.get_dir(), p))
     try:
         if os.path.commonpath([up_abs, upload_config_helper.get_dir()]) == upload_config_helper.get_dir():
