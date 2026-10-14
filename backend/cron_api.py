@@ -9,6 +9,85 @@ import os as _os
 HERMES_KEY = _os.environ.get("STREAM_HERMES_KEY") or _os.environ.get("QL_AGENT_KEY") or ""
 CRON_PASSWORD = _os.environ.get("QL_PASSWORD", "")
 
+# ---- v4.0.x 定时任务「信息推送通道」（2026-10-14）----
+# 通道是二维的（微信由 Hermes 的 deliver 决定、App 由 ql_task_push.py 决定），但用户只要一个
+# 选择 → App 侧只暴露 4 档，本模块把它落成两条真值：
+#   both   = 微信 + App   deliver=weixin, App 推
+#   wechat = 仅微信        deliver=weixin, App 不推
+#   app    = 仅 App        deliver=local,  App 推
+#   none   = 不推送（只留档）deliver=local, App 不推
+# 🚨 与 Hermes 的耦合点只有 deliver，且**只用它认识的 weixin / local 两个值**：
+#    往 deliver 里塞自造 token（如 "app"）会让 Hermes 判「no delivery target resolved」
+#    → 记 last_delivery_error + last_status=delivery_failed（App 任务行会显示成失败）。
+#    「是否推 App」因此记在 data/cron_channels.json，ql_task_push.py 读同一份文件。
+CHANNELS = ('both', 'wechat', 'app', 'none')
+CHANNEL_LABELS = {'both': '微信 + App', 'wechat': '仅微信', 'app': '仅 App', 'none': '不推送'}
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CHANNEL_FILE = os.path.join(
+    os.environ.get('QL_DATA_DIR', os.path.join(os.path.dirname(_BASE_DIR), 'data')),
+    'cron_channels.json')
+
+
+def load_channels():
+    try:
+        with open(CHANNEL_FILE, encoding='utf-8') as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_channels(d):
+    """原子写（临时文件 + os.replace）：ql_task_push.py 每分钟读一次，绝不能读到半截文件。"""
+    try:
+        os.makedirs(os.path.dirname(CHANNEL_FILE), exist_ok=True)
+        tmp = CHANNEL_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, CHANNEL_FILE)
+        return True
+    except Exception:
+        return False
+
+
+def set_channel(job_id, channel):
+    if not job_id or channel not in CHANNELS:
+        return False
+    d = load_channels()
+    d[str(job_id)] = channel
+    return save_channels(d)
+
+
+def drop_channel(job_id):
+    d = load_channels()
+    if str(job_id) in d:
+        d.pop(str(job_id), None)
+        return save_channels(d)
+    return False
+
+
+def deliver_for(channel):
+    """通道 → Hermes deliver：只用它认识的 weixin / local。"""
+    return 'weixin' if channel in ('both', 'wechat') else 'local'
+
+
+def channel_of(job_id, deliver):
+    """列表下发用：显式设过的按记录；没设过的按老口径推断
+    （deliver 含 weixin/origin/qqbot = 微信 + App，这是 ql_task_push 的既有判据）。"""
+    rec = load_channels().get(str(job_id or ''))
+    if rec in CHANNELS:
+        return rec
+    items = deliver if isinstance(deliver, (list, tuple)) else [deliver]
+    toks = set()
+    for it in items:
+        for x in str(it or '').replace(',', ' ').split():
+            toks.add(x.strip().lower())
+    if toks & {'weixin', 'origin', 'qqbot'}:
+        return 'both'
+    if 'all' in toks:
+        return 'wechat'
+    return 'none'
+
 class Handler(BaseHTTPRequestHandler):
     def _check_auth(self):
         import auth_api
@@ -43,6 +122,7 @@ class Handler(BaseHTTPRequestHandler):
                             'model': job.get('model'),
                             'provider': job.get('provider'),
                             'deliver': job.get('deliver', 'origin'),
+                            'channel': channel_of(job.get('id', ''), job.get('deliver', 'origin')),
                             'origin': job.get('origin', {})
                         })
                     self.send_json(transformed)
@@ -86,10 +166,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(400)
                 return
             try:
-                # deliver 白名单校验，防存储型 XSS
-                deliver = data.get('deliver', 'origin')
-                if deliver not in ('origin', 'weixin', 'local', 'all'):
-                    deliver = 'origin'
+                # v4.0.x：优先按「推送通道」落成 deliver（App 只传 channel）；
+                # 老客户端/别的调用方只传 deliver 时照旧走白名单，行为零变化。
+                channel = data.get('channel') if data.get('channel') in CHANNELS else None
+                if channel:
+                    deliver = deliver_for(channel)
+                else:
+                    # deliver 白名单校验，防存储型 XSS
+                    deliver = data.get('deliver', 'origin')
+                    if deliver not in ('origin', 'weixin', 'local', 'all'):
+                        deliver = 'origin'
                 payload = {
                     'name': str(data.get('name', '未命名'))[:200],
                     'prompt': str(data.get('prompt', ''))[:4000],
@@ -108,6 +194,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     result = json.loads(resp.read().decode('utf-8'))
+                    if channel:
+                        set_channel(((result or {}).get('job') or {}).get('id'), channel)
                     self.send_json(result)
             except Exception as e:
                 self.send_error(500, str(e))
@@ -151,7 +239,10 @@ class Handler(BaseHTTPRequestHandler):
                     payload['schedule'] = str(data.get('cron'))[:100]
                 if 'prompt' in data and data.get('prompt'):
                     payload['prompt'] = str(data.get('prompt'))[:4000]
-                if 'deliver' in data and data.get('deliver'):
+                channel = data.get('channel') if data.get('channel') in CHANNELS else None
+                if channel:
+                    payload['deliver'] = deliver_for(channel)
+                elif 'deliver' in data and data.get('deliver'):
                     d = data.get('deliver')
                     if d in ('origin', 'weixin', 'local', 'all'):
                         payload['deliver'] = d
@@ -166,6 +257,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     result = json.loads(resp.read().decode('utf-8'))
+                    if channel:
+                        set_channel(task_id, channel)
                     self.send_json(result)
             except Exception as e:
                 self.send_error(500, str(e))
@@ -186,6 +279,9 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     result = json.loads(resp.read().decode('utf-8'))
+                    # 记账要在回包**之前**：放在 send_json 之后会与客户端形成竞态
+                    #（实测探针删完立刻回读，记录还在 —— 服务端线程还没走到下一行）。
+                    drop_channel(task_id)
                     self.send_json(result)
             except Exception as e:
                 self.send_error(500, str(e))
