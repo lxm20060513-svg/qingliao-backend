@@ -247,6 +247,7 @@ _cleanup_started = False
 # V1.5.9：各 provider 的模型列表端点 + config key 路径
 SYNC_ENDPOINTS = {
     "opencode-apple": ("https://opencode.ai/zen/go/v1/models", ["providers", "opencode-apple", "api_key"]),
+    "opencode-go": ("https://opencode.ai/zen/go/v1/models", ["providers", "opencode-go", "api_key"]),
     "stepfun": ("https://api.stepfun.com/step_plan/v1/models", ["providers", "stepfun", "api_key"]),
     "xiaomi": ("https://token-plan-cn.xiaomimimo.com/v1/models", ["providers", "xiaomi", "api_key"]),
     "sensenova": ("https://token.sensenova.cn/v1/models", ["providers", "sensenova", "api_key"]),
@@ -379,7 +380,7 @@ def _collect_nas_status():
         if os.path.isdir("/host_root"):
             # 宿主候选挂载点（系统盘 + 数据盘；/tmp 相对次要）
             cands = ["/boot", "/rootfs", "/ugreen", "/mnt/factory", "/overlay",
-                     "/data", "/volume2", "/volume3"]
+                     "/volume1", "/volume2", "/volume3"]
             df = subprocess.run(["df", "-B1"] + ["/host_root" + c for c in cands],
                                 capture_output=True, text=True, timeout=10)
         else:
@@ -1937,7 +1938,7 @@ SOUL_PROMPT = (
 QCARD_PROMPT = (
     "\n\n【结果卡片协议（可选）】当回复属于结构化结果类（体检/诊断/巡检/任务清单/对比表格/多步骤结果汇报），"
     "在文字总结之后追加一个 ```ql-card 代码围栏，围栏内是单个 JSON 对象（不要多对象）。字段（全部可选，有什么写什么）："
-    'type(result|metrics|list|table|status|plan)/title/subtitle/status({text,tone:ok|warn|error|info})/'
+    'type(result|metrics|list|table|status|plan|form|file)/title/subtitle/status({text,tone:ok|warn|error|info})/'
     'fields([{key,value}])/metrics([{label,value,unit?,tone?}])/list([{title,subtitle?,status?,tone?}])/'
     'table 必须是**嵌套对象**：table({"columns":["列1","列2"],"rows":[["值1","值2"]]})，'
     'columns/rows 只能写在 table 里面，**禁止提到 JSON 顶层**'
@@ -1947,6 +1948,18 @@ QCARD_PROMPT = (
     "围栏独占一行、必须闭合；围栏外文字照常写。纪律：闲聊/解释/短回复一律不要用卡片；"
     "【闭合纪律】收尾的三反引号必须另起一行、独占一行（前面不许粘 JSON 的结尾花括号或任何字符），否则客户端认不出闭合，整张卡片会被当代码块原样显示。JSON 与闭合围栏之间不要留空行。"
     "【围栏格式铁律】ql-card 围栏一律用【三个】反引号，开头行就是 ```ql-card、后面绝对不许再嵌套任何代码块（严禁写四个反引号、严禁在 ql-card 内部再写 ```json 之类——JSON 直接裸写在围栏内）。整条回复里只有开头和结尾两行含反引号。"
+    # v4.0.104（#25/#17）：可交互表单卡 + 成品文件卡。这两段是**能力开关**：
+    # 不写进提示词，模型永远不会产出 form/file 卡，App 侧解析再全也等于没启用。
+    "【表单卡 type=form】当「必须用户先填/选几个值你才能继续算」时用（例：算 BMI 要身高体重、算预算要金额、"
+    '生成表单要标题和字段）。写法：form({"fields":[{"key":"height","label":"身高","kind":"number","unit":"cm","required":true}],'
+    '"submit":{"label":"算一下","template":"我的身高{height}cm，请帮我算 BMI"}})。'
+    'kind 只认 text/number/choice（choice 必须给 options 数组）；key 用英文小写短词、不重复（重复的客户端会改名）；'
+    "template 里用 {key} 占位，客户端把用户填的值替换进去后**当作用户消息发给你** —— 你随后收到的是用户消息，不要自己去找参数、也不要空等。"
+    "字段只放真的非填不可的（1~4 个），能猜的一律别问。\n"
+    "【成品文件卡 type=file】当你**真的用 office 工具生成了文件**、用户需要拿走时用："
+    'file({"path":"office/周报.docx","name":"周报.docx","kind":"docx"})。'
+    "path 必须是 office/ 开头的相对路径（= 你写文件时用的那个相对路径），name/kind 可省（客户端按 path 推断）；"
+    "没真的生成文件就不要出这张卡（点了会 404）。文件内容/摘要照常写在正文里，别把全文塞进卡片。"
     "一张卡片讲完当前这轮结果，不要多卡堆叠；JSON 必须合法（客户端解析失败会原样显示文本，不会报错）。"
 )
 
@@ -1970,6 +1983,10 @@ def _goal_auto_detect_enabled():
 # v4.0.20（#2）：抽出来的目标动作说明（原内联在 QLACTION_PROMPT 中段）。
 # 抽出来是为了能按开关整段门控；内联时没法只摘这一段。
 _GOAL_ACTION_DOC = (
+    "goal.edit（goalId 必填【要改的目标 id】；title/paused/morningHour/eveningHour/morningEnabled/eveningEnabled 至少给一个）—— "
+    "用户要**改**已有长期目标时用它：改标题、暂停/恢复后台推进（paused=true 暂停、false 恢复）、"
+    "改每天推进时刻（0-23 整点）或开关早/晚推进。暂停/恢复会同步停/启后台推送，改完即时生效。"
+    "【注意】新增步骤请用 goal.create 重建或建议用户在 App 目标卡里加，不要硬编 goal.edit 的参数。"
     "goal.create（title 必填【目标标题】、steps 必填【拆出的步骤，JSON 数组字符串，例 \"[\\\"定产品线\\\",\\\"备货5000\\\"]\"】、"
     "morningHour 可选【每天几点推进，默认 9】）—— "
     "判定用户说的是**长期目标**（要花几天到几周、需要分多步推进的事）时用它："
@@ -2054,7 +2071,7 @@ QLACTION_PROMPT = (
     "JSON 必须合法（解析失败客户端会原样显示文本，不会报错）。"
     "【任务中途追问（可选）】执行多步骤任务时若卡在必须用户拍板的岔路口"
     "（选方案、定范围、确认删哪些、补缺失参数），不要自己猜，用本地脚本问用户：\n"
-    "python3 /data/hermes/scripts/ql_ask/ask_user.py --question \"问题正文\" --options \"选项A|选项B\" --timeout 600\n"
+    "python3 /opt/data/scripts/ql_ask/ask_user.py --question \"问题正文\" --options \"选项A|选项B\" --timeout 600\n"
     "它在 App 任务中心发一张问题卡，用户在卡片上作答后答案会打到 stdout，你据此继续；"
     "能给选项就给选项（App 渲染成按钮）；退出码 2=超时未答（按缺省方案继续并在回复里说明），"
     "3=接口出错（改用文字提问不要卡死）。拿到答案先复述一句再动手。"
@@ -2384,13 +2401,50 @@ def _worker(task_id, task):
         _cmd_head = ((last_user_text or "").strip().split() or [""])[0]
         _local_reply = {
             "/new": "👋 新会话已开启，说吧。",
-            "/help": ("轻聊里真正生效的指令只有两条：\n"
+            "/help": ("轻聊里真正生效的指令：\n"
                       "• /new — 开一个新会话\n"
+                      "• /status — 会话速览（会话号/历史条数）\n"
+                      "• /usage — Token 用量（今日/本月）\n"
                       "• /help — 看这条说明\n"
                       "其它 Hermes 命令（/model、/skills、/cron、/memory…）在轻聊里不生效，"
-                      "功能都在 App 里：模型→设置·模型管理，记忆→设置·AI 记忆，技能→技能页，定时→任务中心。\n"
+                      "功能都在 App 里：模型→设置·模型管理，记忆→设置·AI 记忆，技能→技能页，定时→工作台·定时任务。\n"
                       "想让我直接动手做的事，用大白话说一句就行。"),
         }.get(_cmd_head)
+        # v4.0.x：/status、/usage —— 同为就地应答（Hermes 捷径面板同步列出，App 侧 ChatSheets.items）。
+        # /status：读任务自带 state，零外部调用；/usage：读 token_usage_api 只读聚合（Hermes state.db 账本）。
+        if _local_reply is None and _cmd_head == "/status":
+            _n = len(st.get("messages") or [])
+            _agent = "开" if st.get("agentEnabled", True) else "关"
+            _local_reply = ("🟢 会话速览\n"
+                            "会话：%s\n"
+                            "历史：%d 条\n"
+                            "执行工具：%s\n"
+                            "（联网与设备工具随消息自动启用，无需配置）"
+                            % (str(st.get("sessionId") or "")[:8] or "无", _n, _agent))
+        if _local_reply is None and _cmd_head == "/usage":
+            try:
+                import token_usage_api
+                _u = token_usage_api.collect_token_usage()
+
+                def _fmt_token_total(b):
+                    t = int((b or {}).get("total") or 0)
+                    if t >= 1_000_000:
+                        return "%.2fM" % (t / 1e6)
+                    if t >= 1_000:
+                        return "%.1fK" % (t / 1e3)
+                    return str(t)
+
+                if _u.get("ok"):
+                    _local_reply = ("📊 Token 用量\n"
+                                    "今日：%s\n"
+                                    "本月：%s\n"
+                                    "（读 Hermes 账本，含输入/输出/缓存）"
+                                    % (_fmt_token_total(_u.get("today")),
+                                       _fmt_token_total(_u.get("month"))))
+                else:
+                    _local_reply = "用量账本暂时读不到（%s），稍后再试。" % str(_u.get("error"))[:60]
+            except Exception as _ue:
+                _local_reply = "用量账本暂时读不到（%s），稍后再试。" % str(_ue)[:60]
         if _local_reply is None and _cmd_head in (
                 "/model", "/compress", "/memory", "/skills", "/skill", "/cron", "/voice", "/undo",
                 "/title", "/usage", "/status", "/personality", "/reasoning", "/background",
