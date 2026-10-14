@@ -2451,7 +2451,7 @@ def _worker(task_id, task):
                 "/queue", "/fast", "/resume", "/sethome", "/update", "/tools", "/sessions",
                 "/reload", "/stop", "/clear"):
             _local_reply = ("「%s」是 Hermes 命令行命令，轻聊里不生效（等价的界面入口：模型→设置·模型管理，"
-                            "记忆→设置·AI 记忆，技能→技能页，定时→任务中心）。想让我做的事直接用大白话说就行。" % _cmd_head)
+                            "记忆→设置·AI 记忆，技能→工作台·技能库，定时→工作台·定时任务）。想让我做的事直接用大白话说就行。" % _cmd_head)
         if _local_reply:
             st["agent"] = False
             st["content"] = _local_reply
