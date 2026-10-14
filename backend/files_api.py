@@ -44,15 +44,64 @@ ROOT = os.environ.get("QL_DATA_DIR", "/data")
 # 注意：不包含 hermes-data 根（其下有 config.yaml 等敏感文件）
 ALLOWED_ROOTS = [ROOT]
 # 上传目标目录
+# v4.0.104（#17）：AI 成品文件的**只读别名根**（生产用 env QL_EXTRA_ROOTS 注入真实路径，
+# 仓内默认值仅占位；别名不放宽 ROOT 沙箱，别名内仍走 commonpath 穿越校验）。
+DEFAULT_EXTRA_ROOTS = "office=/data/qingliao-workspace"
+
+
+def _parse_extra_roots(spec):
+    """解析别名根配置：只收「别名=真实存在的目录」，其余静默丢弃。
+    配置写坏不该让整个模块导入失败（那会拖垮全部 /api/files 能力）。"""
+    out = []
+    for item in (spec or "").split(":"):
+        alias, sep, abs_path = item.partition("=")
+        alias, abs_path = alias.strip(), abs_path.strip()
+        if not sep or not alias or not abs_path:
+            continue
+        if alias in (".", "..") or "/" in alias:
+            continue
+        if not os.path.isdir(abs_path):
+            continue
+        out.append((alias, os.path.normpath(abs_path)))
+    return out
+
+
+EXTRA_ROOTS = _parse_extra_roots(os.environ.get("QL_EXTRA_ROOTS") or DEFAULT_EXTRA_ROOTS)
+
+# 上传目标目录
 UPLOAD_DIR = os.environ.get("QL_UPLOAD_DIR", "/data/uploads")
 
 
-def resolve_path(p):
-    """把请求的相对路径解析为绝对路径，并做穿越防护（commonpath 严格校验）"""
+def resolve_path(p):  # v4.0.110-ql-sync
+    """把请求的相对路径解析为绝对路径，并做穿越防护（commonpath 严格校验）。
+
+    v4.0.104（#17）：先判**别名根**（`office/xxx.docx` → 别名根下的 xxx.docx，只读下发）。
+    命中别名就只在那个根内校验，越界直接拒（不回落 ROOT 再猜一次，免得把越界请求变成合法命中）。
+    """
     if not p:
         p = ''
+    # v4.0.110：AI 推的文件卡常带**绝对路径**，lstrip('/') 会把它打回相对形态 → 永远 404。
+    # 绝对路径命中某个别名根真实目录时归一化成别名形态（office/x）再走下方正常逻辑；
+    # 未命中维持原语义。安全：归一化后仍要过别名分支的 commonpath 严格校验，可读范围零扩大。
+    _ap = os.path.normpath(p)
+    if os.path.isabs(_ap):
+        for _alias, _base in EXTRA_ROOTS:
+            try:
+                if os.path.commonpath([_ap, _base]) == _base:
+                    p = _alias + "/" + os.path.relpath(_ap, _base)
+                    break
+            except ValueError:
+                continue
     # 去掉可能的根标记
     p = p.lstrip('/')
+    for alias, base in EXTRA_ROOTS:
+        if p == alias or p.startswith(alias + "/"):
+            cand = os.path.normpath(os.path.join(base, p[len(alias):].lstrip("/")))
+            try:
+                if os.path.commonpath([cand, base]) == base:
+                    return cand, base
+            except ValueError:
+                pass
     # 优先：上传目录（聊天附件）下的文件 —— 聊天附件上传的位置
     up_abs = os.path.normpath(os.path.join(upload_config_helper.get_dir(), p))
     try:
@@ -342,6 +391,29 @@ class FilesHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(401, {"error": "需要密码"})
             return
         parsed = urllib.parse.urlparse(self.path)
+        # v4.0.110：产物列表 POST 形态 —— iOS 蜂窝直连「带 query 的 GET」会静默挂 10s 超时
+        # （v2.0.5 已知坑），工作区列表 GET ?path=office 蜂窝下打不开（真机实报「产物 0 个」）。
+        # POST JSON body {path} 蜂窝直连通、失败还能走 relay 兜底（App 对写形态允许 relay）。
+        # GET 形态保留，向后兼容。
+        if parsed.path.startswith('/api/files/list'):
+            body = self._read_json() or {}
+            rel_path = (body.get('path') or '').strip()
+            abs_path, base = resolve_path(rel_path)
+            if not abs_path:
+                self._send_json(403, {"error": "路径超出允许范围"})
+                return
+            entries, err = list_dir(abs_path)
+            if err:
+                self._send_json(500, {"error": err})
+                return
+            rel = os.path.relpath(abs_path, base or ROOT)
+            self._send_json(200, {
+                "cwd": '' if rel == '.' else rel.replace(os.sep, '/'),
+                "entries": entries,
+                "dir_count": sum(1 for e in entries if e['is_dir']),
+                "file_count": sum(1 for e in entries if not e['is_dir']),
+            })
+            return
         if parsed.path.startswith('/api/files/delete'):
             body = self._read_json()
             rel = (body or {}).get('path') or ''
