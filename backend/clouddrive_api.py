@@ -11,7 +11,8 @@
   GET  /api/clouddrive/drives              → {"ok":true,"drives":[{id,name,nickname,status,error}]}
   POST /api/clouddrive/add                 {skill_url, auth_code, name?}
   POST /api/clouddrive/remove               {id}
-  GET  /api/clouddrive/list?drive=<id>&fid=<fid>   （fid 空 = 根目录 0）
+  GET  /api/clouddrive/list?drive=<id>&fid=<fid>   （fid 空 = 根目录 0；GET 形态保留，兼容旧客户端）
+  POST /api/clouddrive/list {drive,fid}            （v4.0.114：弱网加固，App 现走这条）
   GET  /api/clouddrive/download?drive=<id>&fid=<fid>&name=<文件名>
 
 为什么 CLI 要 docker exec：官方 skill 的 CLI 是 node 程序，而 node 只装在 hermes 容器里
@@ -445,6 +446,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/api/clouddrive/remove"):
             self._do_remove(body)
+            return
+        # v4.0.114（用户「让弱网更稳」）：列表也收 POST —— iOS 蜂窝直连「带 query 的 GET」会静默挂
+        # 10s 超时（App 侧 AuthStore 有实测定性；files_api 的产物列表 v4.0.110 同因已改 POST）。
+        # 前端改用 POST body {drive,fid}；GET 形态保留，旧客户端不受影响。
+        if parsed.path.startswith("/api/clouddrive/list"):
+            self._do_list(str(body.get("drive", "")), str(body.get("fid", "")))
             return
         self._send(404, {"ok": False, "error": "Not Found"})
 
