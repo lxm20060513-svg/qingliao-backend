@@ -42,8 +42,29 @@ MCP_TEMPLATES = [
         "desc": "天气/POI搜索/路径规划/导航/打车等地图能力",
         "url_template": "https://mcp.amap.com/mcp?key={key}",
         "key_hint": "高德开放平台 Web服务 Key（lbs.amap.com 免费申请）",
+        # v4.0.117：模板自带视觉标识（SF Symbol 名 + 语义色名），App 按它渲染服务行图标
+        "icon": "map.fill",
+        "color": "green",
     },
 ]
+
+def _lookup_style(name):
+    """按服务名匹配预置模板 → (icon, color)；未命中返回 ("", "") 由 App 侧兜底映射。
+
+    v4.0.117：App「MCP 工具服务」列表原先所有行共用一枚写死的拼图图标。
+    现模板来的服务带自带图标；用户自填 URL 接的服务（office/迅雷/浏览器…）
+    后端不认识，返回空让 App 按名兜底 —— 后端只对「自己发出去的模板」负责。
+    """
+    key = str(name or "").strip().lower()
+    if not key:
+        return "", ""
+    for t in MCP_TEMPLATES:
+        if not isinstance(t, dict):
+            continue
+        if key in (str(t.get("id") or "").lower(), str(t.get("name") or "").lower()):
+            return str(t.get("icon") or ""), str(t.get("color") or "")
+    return "", ""
+
 
 _LOCK = threading.Lock()
 _RESTARTING = False
@@ -231,6 +252,7 @@ class Handler(BaseHTTPRequestHandler):
                     kind = "url"
                     summary = _mask_key(url) or "（无 url）"
                 include = (e.get("tools") or {}).get("include") or []
+                _style = _lookup_style(name)
                 safe[name] = {
                     "url": _mask_key(url),
                     "has_key": "key=" in url,
@@ -240,6 +262,9 @@ class Handler(BaseHTTPRequestHandler):
                     "type": kind,
                     "summary": summary,
                     "tools_count": len(include) if isinstance(include, list) else 0,
+                    # v4.0.117：行图标（模板命中才有值；空串 = 交给 App 按名兜底）
+                    "icon": _style[0],
+                    "color": _style[1],
                 }
             self._send(200, {"ok": True, "servers": safe, "templates": MCP_TEMPLATES})
             return
