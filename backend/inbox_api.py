@@ -436,6 +436,16 @@ class Handler(BaseHTTPRequestHandler):
         return bool(INBOX_TOKEN) and hmac.compare_digest(
             self.headers.get("X-Inbox-Token", ""), INBOX_TOKEN)
 
+    def _auth_app_or_hermes(self):
+        """v4.0.116：App 登录 token 或服务间 token 任一通过即放行（问题卡服务侧两跳专用）。
+
+        原先这两跳只认 X-Auth-Token：Hermes 侧脚本得拿 QL_PASSWORD 去 login_get 换 token。
+        而用户「修改登录密码」只重写 auth_config.json、**不更新容器 env 的 QL_PASSWORD**（真源漂移）
+        → 改密后服务侧恒 401：卡推得出去、答案取不回来，还静默等到超时。
+        服务间 token（X-Inbox-Token）与用户密码解耦 ⇒ 用户改密不再影响这条链路。
+        """
+        return self._auth_app() or self._auth_hermes()
+
     def do_OPTIONS(self):
         # v3.9.57：CORS 预检必须不经鉴权（返回 401 会让浏览器/客户端预检直接失败，
         # 表现为"接口完全打不通"）。原 do_GET/do_POST 的鉴权逻辑保持不变。
@@ -492,7 +502,8 @@ class Handler(BaseHTTPRequestHandler):
         # ⚠️ 必须排在下面 /api/inbox 泛匹配**之前**：否则会被「App 拉待取消息」分支吞掉，
         # 表现为 AI 侧永远拿到 {"ok":true,"items":[...]} 而不是答案。
         if self.path.startswith("/api/inbox/answer"):
-            if not self._auth_app():
+            # v4.0.116：AI 侧脚本可用服务间 token 取答案（与用户密码解耦，改密不再打挂问题卡）
+            if not self._auth_app_or_hermes():
                 print("[inbox] GET answer 401 未授权 path=%s" % self.path[:60], flush=True)
                 self._send(401, {"ok": False, "error": "unauthorized"})
                 return
@@ -521,7 +532,8 @@ class Handler(BaseHTTPRequestHandler):
         # POST /api/inbox/{id}/done —— App 消费后标记已读
         m = re.match(r"^/api/inbox/([0-9a-f]+)/done$", self.path)
         if m:
-            if not self._auth_app():
+            # v4.0.116：AI 侧脚本可用服务间 token 收尾（同上）
+            if not self._auth_app_or_hermes():
                 print("[inbox] POST 401 未授权 done id=%s" % m.group(1), flush=True)
                 self._send(401, {"ok": False, "error": "unauthorized"})
                 return
