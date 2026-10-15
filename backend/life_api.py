@@ -2498,11 +2498,17 @@ def _placeholder(kind, title, err, hint=""):
             "error": err, "hint": hint, "configured": False}
 
 
-def _collect(fresh=False):
+def _collect(fresh=False, parts=None):
+    # v4.0.114（用户「股票栏位的刷新和博客资讯栏位的刷新分开」）：parts = 只强刷这些板块；
+    # 空 = 沿用旧口径（fresh=True 全刷）。前端三个刷新胶囊各传自己的板块名，互不牵连。
+    only = {str(p).strip().lower() for p in (parts or ()) if str(p).strip()}
+
+    def _fresh(part):
+        return part in only if only else fresh
     cfg = load_config()
     sig = _sig()
     cards = []
-    stocks = _cached("stock:" + sig, STOCK_TTL, lambda: _collect_stocks(cfg), fresh)
+    stocks = _cached("stock:" + sig, STOCK_TTL, lambda: _collect_stocks(cfg), _fresh("stock"))
     if isinstance(stocks, list) and stocks:
         cards.extend(stocks)
     elif isinstance(stocks, list):
@@ -2510,15 +2516,15 @@ def _collect(fresh=False):
     else:
         cards.append(_placeholder("stock", "股票行情", "行情获取失败: %s" % stocks.get("_error", "")))
 
-    rss = _cached("rss:" + sig, RSS_TTL, lambda: _collect_feeds(cfg), fresh)
+    rss = _cached("rss:" + sig, RSS_TTL, lambda: _collect_feeds(cfg), _fresh("rss"))
     cards.append(rss if isinstance(rss, dict) and "entries" in rss
                  else _placeholder("rss", "资讯", "订阅源获取失败"))
 
-    exp = _cached("express:" + sig, EXPRESS_TTL, lambda: _collect_express(cfg), fresh)
+    exp = _cached("express:" + sig, EXPRESS_TTL, lambda: _collect_express(cfg), _fresh("express"))
     cards.append(exp if isinstance(exp, dict) and "packages" in exp
                  else _placeholder("express", "快递", "快递查询失败"))
 
-    prc = _cached("price:" + sig, PRICE_TTL, lambda: _collect_price(cfg), fresh)
+    prc = _cached("price:" + sig, PRICE_TTL, lambda: _collect_price(cfg), _fresh("price"))
     cards.append(prc if isinstance(prc, dict) and "items" in prc
                  else _placeholder("price", "价格监控", "价格获取失败"))
 
@@ -2591,8 +2597,15 @@ class LifeHandler(BaseHTTPRequestHandler):
         params = urllib.parse.parse_qs(parsed.query)
         try:
             if parsed.path.startswith("/api/life/cards"):
-                fresh = params.get("fresh", ["0"])[0] in ("1", "true", "yes")
-                self._send(200, _collect(fresh=fresh))
+                # v4.0.114：fresh 支持「板块名」——「1/true/yes」= 全刷（下拉刷新，兼容旧版），
+                # 「stock」/「rss」/「express」/「price」或逗号组合 = 只强刷这些板块，
+                # 其余板块走 TTL 缓存照常返回（响应结构不变）。
+                _raw = (params.get("fresh", ["0"])[0] or "").strip().lower()
+                if _raw in ("1", "true", "yes"):
+                    _fresh_all, _parts = True, None
+                else:
+                    _fresh_all, _parts = False, tuple(p for p in _raw.split(",") if p)
+                self._send(200, _collect(fresh=_fresh_all, parts=_parts))
             elif parsed.path.startswith("/api/life/config"):
                 self._send(200, {"ok": True, "config": load_config(), "presets": _presets(),
                                  "path": CONFIG_PATH})
