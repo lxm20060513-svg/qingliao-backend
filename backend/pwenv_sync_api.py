@@ -244,7 +244,10 @@ class Handler(BaseHTTPRequestHandler):
                "step": st.get("step", ""), "task": st.get("task", "")}
         if st.get("status") == "failed":
             out["error"] = st.get("error", "同步失败")
-        out["log"] = _tail() if st.get("status") in ("failed", "running") else ""
+        # v4.0.116 发版审查 P2：本端点是**免鉴权** GET（探测 + 容器重建期间的轮询必须免鉴权：
+        # 重建中 token 会短暂失效），而 helper 的日志尾里含宿主绝对路径与备份文件名
+        # （例：`printf 'FAIL 新容器 env 未生效（可回滚：cp -a %s %s）'`），等于对外泄漏部署细节。
+        # 前端从未消费 log 字段 → 直接不回。排障改在 NAS 上直接看 data 目录的日志文件。
         self._send(200, out)
 
     def do_POST(self):
