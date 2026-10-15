@@ -674,6 +674,17 @@ CLEANUP_INTERVAL = 30      # 清理线程一轮秒数（原 300s）：判死由�
 #    永久卡死；轮询版无状态、超时必放行、用户点停止也能立刻放行。
 SESSION_CHAIN_TIMEOUT = 600.0     # 排队上限（秒），超时放行绝不卡死
 
+# ==== v4.1.x（插话暂停-恢复）====
+# 用户点「插话」→ 当前任务挂起（保留断点现场）→ 先把插话办完 → 办完由**后端**自动用
+# _build_resume_payload 把原任务接回来。硬保证落在两处：① _worker 包装层 finally（最及时）
+# ② cleanup_old_tasks 每 30s 的暂停孤儿扫描（兜底：插话流消失 / 进程重启）。
+# ⚠️ 与「从断点继续」同口径：工具在 Hermes 侧执行，轻聊手里没有执行现场 → 接回来是
+#    「带断点重开一轮」，靠提示压制重复，**不承诺零重做**。
+PAUSE_RESUME_TIMEOUT = 600.0      # 暂停后超过这么久还没被插话流接回来 → 兜底自动接回（秒）
+STREAM_PAUSE_TTL = 72 * 3600      # 暂停任务文件的保留期（与 STREAM_RESUME_TTL 同口径）
+# 一键回退开关：QL_STREAM_INTERJECT=0 → /api/stream/interject 返 501，App 自动退化回排队
+INTERJECT_ENABLED = os.environ.get("QL_STREAM_INTERJECT", "1") != "0"
+
 
 def _await_session_chain(session_id, task, timeout=SESSION_CHAIN_TIMEOUT):
     """等同会话里"更早的 streaming 任务"收尾；返回等待秒数（0 = 无需等待）。"""
@@ -1184,7 +1195,13 @@ def _build_resume_payload(parent_id):
             pst = json.load(f)
     except Exception:
         return False, "父任务记录损坏", None
-    if str(pst.get("status") or "") != "error" or str(pst.get("outcome") or "") != "outcome_unknown":
+    _p_status = str(pst.get("status") or "")
+    _p_outcome = str(pst.get("outcome") or "")
+    # v4.1.x：paused（用户插话暂停）与 error+outcome_unknown（崩溃中断）都允许续跑。
+    # 刻意**不放行** cancelled（用户主动停止 = 明确不要了，与「插话后自动接回」不是一回事）。
+    _resumable = ((_p_status == "error" and _p_outcome == "outcome_unknown")
+                  or _p_status == "paused")
+    if not _resumable:
         return False, "该任务不是中断任务，不能续跑", None
     if pst.get("resumedBy"):
         # 审查 P2：dedup 也要带回当时的中断步数，否则 App 展示「已完成第 k 步」归零，
@@ -1202,8 +1219,13 @@ def _build_resume_payload(parent_id):
         steps = [_TOOL_NAME_ZH.get(str(x), str(x)) for x in (pst.get("toolHistory") or [])]
     k = int(pst.get("toolSeq") or len(steps) or 0)
     tail = str(pst.get("content") or "")[-1500:]
-    hint = ("【断点续跑】上一轮任务在服务端重启/异常时中断，已完成第 %d 步：%s。\n"
-            "已完成的部分不要重做。\n" % (k, "、".join(steps[:20]) or "（无）"))
+    if _p_status == "paused":
+        hint = ("【插话后续跑】上一轮任务因为用户中途插话被暂停，用户插话的内容已经处理完。\n"
+                "已完成第 %d 步：%s。已完成的部分不要重做，直接接着把用户最初的要求做完。\n"
+                % (k, "、".join(steps[:20]) or "（无）"))
+    else:
+        hint = ("【断点续跑】上一轮任务在服务端重启/异常时中断，已完成第 %d 步：%s。\n"
+                "已完成的部分不要重做。\n" % (k, "、".join(steps[:20]) or "（无）"))
     if tail:
         hint += "以下是中断前已生成的内容（可能不完整）：\n" + tail + "\n"
     hint += "请接着把用户最初的要求做完，直接继续完成剩余部分。"
@@ -1241,6 +1263,255 @@ def _mark_resumed(parent_id, child_id):
             os.chmod(fp, mode)
         except Exception:
             pass
+
+
+# ==== ql-interject: 插话暂停-恢复 核心函数群（v4.1.x）====
+def _pause_task(task_id, note=""):
+    """v4.1.x：把正在跑的任务挂起——切断上游 + 保留断点现场 + 状态置 paused。
+
+    ⚠️ 与 /stop 的区别：stop 是丢弃（worker 收尾写 cancelled），pause 是**留档等恢复**
+    （messages/toolSeq/toolSpans/content 全保留，供 _build_resume_payload 重建上下文）。
+    ⚠️ 暂停不烧 token：切断 SSE 会让上游 Hermes 立即中断该轮（api_server 的断连分支）。
+    返回 (ok, err, info)；info = {"taskId", "step", "content"}。
+    """
+    with _tasks_lock:
+        task = _tasks.get(str(task_id))
+    if not task:
+        return False, "no such task", None
+    st = task["state"]
+    # 插话栈只保留 1 层（方案口径）：已经暂停的任务再插话 = 拒绝，由 App 走排队。
+    # 否则两条插话流都会去接同一个父流，第一条接回后第二条只能 dedup 空转，语义混乱。
+    if str(st.get("status") or "") == "paused" or task.get("paused"):
+        return False, "already paused", None
+    task["cancelled"] = True       # worker 循环读到即 break（切断上游 SSE）
+    task["paused"] = True          # 收尾钩子据此把状态钉回 paused（worker 会先写 cancelled）
+    st["pauseNote"] = str(note or "")[:200]
+    st["pausedAt"] = time.time()
+    st["status"] = "paused"
+    try:
+        _write_state(task_id, task)
+    except Exception as _e:
+        print("[interject] 暂停落盘失败 %s: %s" % (task_id, str(_e)[:120]), flush=True)
+    return True, "", {"taskId": str(task_id), "step": int(st.get("toolSeq") or 0),
+                      "content": str(st.get("content") or "")}
+
+
+def _mark_pause_link(parent_id, child_id):
+    """父流记 pausedBy/pausedByAt（原子写，保留属主与权限）——照 _mark_resumed 的口径。"""
+    fp = os.path.join(STREAM_DIR, str(parent_id) + ".json")
+    with open(fp, "r", encoding="utf-8") as f:
+        pst = json.load(f)
+    pst["pausedBy"] = str(child_id)
+    pst["pausedByAt"] = time.time()
+    uid = gid = mode = None
+    try:
+        _s = os.stat(fp)
+        uid, gid, mode = _s.st_uid, _s.st_gid, _s.st_mode & 0o7777
+    except Exception:
+        pass
+    tmp = fp + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(pst, f, ensure_ascii=False)
+    os.replace(tmp, fp)
+    if uid is not None:
+        try:
+            os.chown(fp, uid, gid)
+            os.chmod(fp, mode)
+        except Exception:
+            pass
+
+
+def _spawn_stream_task(session_id, model, messages, provider, reasoning,
+                       push_enabled, agent_enabled, resume_from="", extra_state=None):
+    """v4.1.x：建流 + 登记 + 起 worker；返回 (task_id, err)。
+
+    **仅供插话链路使用** —— 刻意不复用 /api/stream/start 的入参解析：那条是线上热路径，
+    整段重构的回归风险 > 复用收益（本仓有过「重构热路径顺手改坏」的事故）。
+    任务 state 形状与 /api/stream/start 保持一致（含 resumedFrom/resumeStep/resumeAt）。
+    """
+    if not messages or not isinstance(messages, list):
+        return "", "messages required"
+    task_id = uuid.uuid4().hex[:12]
+    state = {
+        "sessionId": str(session_id or ""),
+        "model": str(model or "deepseek-v4-flash"),
+        "messages": messages,
+        "content": "",
+        "status": "streaming",
+        "pushEnabled": bool(push_enabled),
+        "agentEnabled": bool(agent_enabled),
+        "provider": str(provider or ""),
+        "reasoning": str(reasoning or ""),
+        "createdAt": time.time(),
+        "updatedAt": time.time(),
+        "resumedFrom": str(resume_from or ""),
+        "resumeStep": 0,
+        "resumeAt": time.time() if resume_from else 0,
+    }
+    if isinstance(extra_state, dict):
+        state.update(extra_state)
+    task = {"cancelled": False, "lock": threading.Lock(), "state": state}
+    with _tasks_lock:
+        _tasks[task_id] = task
+    # 立刻落一次盘：App 起流后马上就会轮询，文件不存在会被当 404；也让 pausedResumeOf 从
+    # 第一秒就可读（排查「这条流是谁的插话」时不必等它开工）。
+    try:
+        _write_state(task_id, task)
+    except Exception as _we:
+        print("[interject] 建流落盘失败 %s: %s" % (task_id, str(_we)[:120]), flush=True)
+    threading.Thread(target=_worker, args=(task_id, task), daemon=True).start()
+    return task_id, ""
+
+
+def _resume_paused_pair(paused_id):
+    """v4.1.x：起恢复流 T3 = _build_resume_payload(暂停流)；父流已续过 → 返回旧 child（幂等）。
+    返回 (ok, err, task_id)。"""
+    try:
+        ok, err, ctx = _build_resume_payload(paused_id)
+    except Exception as e:
+        return False, "断点重建失败: %s" % str(e)[:120], None
+    if not ok:
+        return False, err, None
+    if ctx.get("dedup"):
+        return True, "", ctx.get("taskId")
+    try:
+        with open(os.path.join(STREAM_DIR, str(paused_id) + ".json"), "r", encoding="utf-8") as f:
+            pst = json.load(f)
+    except Exception as e:
+        return False, "父任务记录损坏: %s" % str(e)[:120], None
+    t3, serr = _spawn_stream_task(pst.get("sessionId"), pst.get("model"), ctx["messages"],
+                                  pst.get("provider"), pst.get("reasoning"),
+                                  pst.get("pushEnabled"), pst.get("agentEnabled", True),
+                                  resume_from=str(paused_id))
+    if serr:
+        return False, serr, None
+    try:
+        _mark_resumed(paused_id, t3)
+    except Exception as e:
+        # 与 /api/stream/start 的 P2 口径一致：父流没落 resumedBy 就不能当成功
+        with _tasks_lock:
+            _tasks.pop(t3, None)
+        return False, "父任务标记失败: %s" % str(e)[:120], None
+    # 摘掉内存里的暂停任务（磁盘记录才是「接回来」的依据）；同步 resumedBy 防后续内存写覆盖
+    with _tasks_lock:
+        _t = _tasks.get(str(paused_id))
+        if _t is not None:
+            try:
+                _t["state"]["resumedBy"] = str(t3)
+            except Exception:
+                pass
+            _tasks.pop(str(paused_id), None)
+    return True, "", t3
+
+
+def _demote_paused_to_error(paused_id, err):
+    """接回失败 → 把暂停流降级成「可续跑的中断流」，复用 App 现成的「继续完成」按钮。"""
+    fp = os.path.join(STREAM_DIR, str(paused_id) + ".json")
+    try:
+        with open(fp, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if str(d.get("status") or "") != "paused":
+            return
+        uid = gid = mode = None
+        try:
+            _s = os.stat(fp)
+            uid, gid, mode = _s.st_uid, _s.st_gid, _s.st_mode & 0o7777
+        except Exception:
+            pass
+        d["status"] = "error"
+        d["outcome"] = "outcome_unknown"
+        d["error"] = "插话后续跑失败（%s），可点「继续完成」" % str(err or "")[:80]
+        tmp = fp + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, fp)
+        if uid is not None:
+            try:
+                os.chown(fp, uid, gid)
+                os.chmod(fp, mode)
+            except Exception:
+                pass
+        with _tasks_lock:
+            _t = _tasks.get(str(paused_id))
+            if _t is not None:
+                _t["state"]["status"] = "error"
+                _t["state"]["outcome"] = "outcome_unknown"
+                _t["state"]["error"] = d["error"]
+    except Exception as e:
+        print("[interject] 降级失败 %s: %s" % (paused_id, str(e)[:120]), flush=True)
+
+
+def _finalize_interject(task_id, task):
+    """v4.1.x：_worker 收尾钩子（finally —— 所有退出路径都会跑到）。
+
+    ① 本任务是被插话暂停的父流 → 状态钉回 paused（worker 收尾会先写 cancelled/done）。
+    ② 本任务是插话流 → 收尾后**自动**把被暂停的原任务接回来（本功能的硬保证主路径）。
+    """
+    st = task.get("state") or {}
+    if task.get("paused"):
+        st["status"] = "paused"
+        try:
+            _write_state(task_id, task)
+        except Exception:
+            pass
+        print("[interject] 父流已暂停 %s（已完成 %s 步）" % (task_id, st.get("toolSeq")), flush=True)
+        return
+    parent = str(st.get("pausedResumeOf") or "")
+    if not parent:
+        return
+    ok, err, t3 = _resume_paused_pair(parent)
+    st["resumedChild"] = str(t3 or "")
+    try:
+        _write_state(task_id, task)
+    except Exception:
+        pass
+    if ok:
+        print("[interject] 插话流 %s 收尾 → 原任务 %s 已接回为 %s" % (task_id, parent, t3), flush=True)
+    else:
+        print("[interject] 插话流 %s 收尾但接回失败 %s: %s" % (task_id, parent, err), flush=True)
+        _demote_paused_to_error(parent, err)
+
+
+def _resume_orphan_paused(now=None):
+    """v4.1.x 兜底：暂停流若「插话流已不在跑」且暂停超过 PAUSE_RESUME_TIMEOUT → 强制接回。
+    防的是「插话流异常消失 / 后端重启丢内存态」把原任务永久搁置。"""
+    if not os.path.isdir(STREAM_DIR):
+        return
+    now = float(now or time.time())
+    for fn in os.listdir(STREAM_DIR):
+        if not fn.endswith(".json"):
+            continue
+        fp = os.path.join(STREAM_DIR, fn)
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(d, dict) or str(d.get("status") or "") != "paused":
+            continue
+        if d.get("resumedBy"):
+            continue
+        child = str(d.get("pausedBy") or "")
+        if child:
+            with _tasks_lock:
+                _ct = _tasks.get(child)
+            if _ct is not None and str((_ct.get("state") or {}).get("status") or "") == "streaming":
+                continue    # 插话流还在跑（长插话）→ 不许抢跑，等它自己的收尾钩子
+        try:
+            _paused_at = float(d.get("pausedAt") or 0)
+        except Exception:
+            _paused_at = 0.0
+        if not _paused_at:
+            try:
+                _paused_at = os.path.getmtime(fp)
+            except Exception:
+                _paused_at = now
+        if now - _paused_at < PAUSE_RESUME_TIMEOUT:
+            continue
+        ok, err, t3 = _resume_paused_pair(fn[:-5])
+        print("[interject] 兜底接回 %s ok=%s %s" % (fn[:-5], ok, err or t3), flush=True)
+        if not ok:
+            _demote_paused_to_error(fn[:-5], err)
 
 
 def _touch_state(task_id, task):
@@ -2355,6 +2626,22 @@ def _do_qingliao_post(req):
 
 
 def _worker(task_id, task):
+    """v4.1.x（插话暂停-恢复）：worker 包装层 —— 保证「内层无论怎么退出」都跑收尾钩子。
+
+    ⚠️ 为什么要包一层：`_worker_run` 有多条 early return（本地模型短路、回退分支…），
+    在函数尾直接追加钩子**在那些路径上不会执行** —— 而「插话流跑完必须把原任务接回来」
+    是硬保证，不能只在正常路径成立。故用 try/finally 包住整个内层 worker。
+    """
+    try:
+        _worker_run(task_id, task)
+    finally:
+        try:
+            _finalize_interject(task_id, task)
+        except Exception as _fe:
+            print("[interject] 收尾钩子异常 %s: %s" % (task_id, str(_fe)[:200]), flush=True)
+
+
+def _worker_run(task_id, task):
     st = task["state"]
     last_write = time.time()
     # ---- v4.0.37（借鉴①）：登记 worker 线程 + 起手先打一次心跳 ----
@@ -2944,6 +3231,15 @@ def _hermes_responses_worker(task_id, task, req_body, headers, last_write):
                 text = j.get("text") or ""
                 if text and not st["content"]:
                     st["content"] = text[:MAX_CONTENT_LEN]
+            elif jtype == "response.completed":
+                # v4.0.112：到迭代上限的收尾总结。Hermes 在 envelope 的 hermes 字段标出
+                # budget_exhausted（加法字段，见 gateway/platforms/api_server_openai_routes.py
+                # 的 _budget_handoff_note）。这里只记标记、**不碰 content** —— App 轮询是
+                # offset 增量协议，正文只能追加不能插入。
+                _env = j.get("response") if isinstance(j.get("response"), dict) else {}
+                _note = _env.get("hermes") if isinstance(_env.get("hermes"), dict) else {}
+                if _note.get("budget_exhausted"):
+                    st["notice"] = "budget"
             elif jtype in ("response.failed", "response.incomplete"):
                 env = j.get("response") if isinstance(j.get("response"), dict) else {}
                 e = env.get("error")
@@ -2984,7 +3280,7 @@ def _hermes_responses_worker(task_id, task, req_body, headers, last_write):
 
 
 # ==== iOS 2.0 Safari relay aliases (/r/stream/* -> /api/stream/*) ====
-_RELAY_OPS = {"start", "stop", "poll"}
+_RELAY_OPS = {"start", "stop", "poll", "interject"}   # v4.1.x：+interject（蜂窝 relay 路径版）
 
 def _relay_alias(path):
     # /r/stream/start/{uid} -> /api/stream/start
@@ -2995,6 +3291,10 @@ def _relay_alias(path):
         op = parts[3]
         if op == "start":
             return "/api/stream/start"
+        elif op == "interject":
+            # v4.1.x：/r/stream/interject/{uid} -> /api/stream/interject
+            # （蜂窝走 Safari relay；nginx 的 `location /r` 与 ALLOWED_RELAY 的 "/r/" 已覆盖，零改 nginx）
+            return "/api/stream/interject"
         elif op == "stop" and len(parts) >= 6:
             return f"/api/stream/{parts[5]}/stop"
         elif op == "poll" and len(parts) >= 7:
@@ -3256,6 +3556,43 @@ class StreamHandler(BaseHTTPRequestHandler):
             threading.Thread(target=_worker, args=(task_id, task), daemon=True).start()
             return self._send(200, {"taskId": task_id, "resumedFrom": resume_from or "",
                                     "resumeStep": int((_rctx or {}).get("step") or 0)})
+
+        # v4.1.x（插话暂停-恢复）：暂停父流 + 原子起插话流
+        if self.path == "/api/stream/interject":
+            if not INTERJECT_ENABLED:
+                return self._send(501, {"error": "interject disabled"})
+            paused_id = str(data.get("pausedTaskId") or "").strip()
+            # 与 resumeFrom 同口径白名单：该 id 会拼进文件路径（读 + 写）
+            if not paused_id or not re.fullmatch(r"[A-Za-z0-9_-]{4,64}", paused_id):
+                return self._send(400, {"error": "bad pausedTaskId"})
+            _imsgs = data.get("messages")
+            if not _imsgs or not isinstance(_imsgs, list):
+                return self._send(400, {"error": "messages required"})
+            _pok, _perr, _pinfo = _pause_task(paused_id, note="user_interject")
+            if not _pok:
+                return self._send(400, {"error": _perr})
+            _t2, _serr = _spawn_stream_task(
+                str(data.get("sessionId", "")), str(data.get("model", "deepseek-v4-flash")),
+                _imsgs, str(data.get("provider", "") or ""),
+                str(data.get("reasoning", "") or "").strip().lower(),
+                bool(data.get("pushEnabled", False)), bool(data.get("agentEnabled", True)),
+                extra_state={"pausedResumeOf": paused_id})
+            if _serr:
+                return self._send(400, {"error": _serr})
+            try:
+                _mark_pause_link(paused_id, _t2)
+            except Exception as _le:
+                # 与 /api/stream/start 的 P2 口径一致：父流没落 pausedBy 就不能当成功返回
+                print("[interject] 父流暂停对账失败 %s: %s" % (paused_id, _le), flush=True)
+                with _tasks_lock:
+                    _bt = _tasks.get(_t2)
+                    if _bt is not None:
+                        _bt["cancelled"] = True
+                    _tasks.pop(_t2, None)
+                return self._send(500, {"error": "父任务标记失败，请重试"})
+            return self._send(200, {"taskId": _t2,
+                                    "paused": {"taskId": paused_id,
+                                               "step": int((_pinfo or {}).get("step") or 0)}})
 
         # stop
         if self.path.startswith("/api/stream/") and self.path.endswith("/stop"):
@@ -3574,6 +3911,9 @@ class StreamHandler(BaseHTTPRequestHandler):
                         # v3.9.14：纯增量字段，语义显式化（App 不用也无害）
                         "isWorking": st["status"] == "streaming",
                         "error": st.get("error", ""),
+                        # v4.1.x（插话暂停-恢复）：纯增量键
+                        "paused": st["status"] == "paused",
+                        "pausedBy": str(st.get("pausedBy") or ""),
                         "fromMemory": True
                     })
             # 2) 磁盘兜底：扫描 streams/*.json 按 sessionId 匹配（v3.5.2 fix：同样取最新一条）
@@ -3711,7 +4051,15 @@ class StreamHandler(BaseHTTPRequestHandler):
                 "toolNames": [_TOOL_NAME_ZH.get(x, x) for x in _th],
                 "toolSpans": _tspans,               # v3.9.58：已完成步骤的耗时（秒）
                 "lastToolAt": st.get("lastToolAt") or 0,
-                "resumedFrom": str(st.get("resumedFrom") or "")   # v4.0.96：本流由哪条父流续来
+                "resumedFrom": str(st.get("resumedFrom") or ""),  # v4.0.96：本流由哪条父流续来
+                # v4.1.x（插话暂停-恢复）：纯增量键，老 App 忽略即向后兼容
+                "paused": st["status"] == "paused",           # 本流被插话暂停中
+                "pausedBy": str(st.get("pausedBy") or ""),    # 哪条插话流把它挂起的
+                "pausedResumeOf": str(st.get("pausedResumeOf") or ""),  # 本流是哪条暂停流的插话
+                "resumedChild": str(st.get("resumedChild") or ""),      # 接回后的新流 id
+                # v4.0.112：本轮到迭代上限、正文是模型的收尾总结 → App 给「阶段总结」标记。
+                # 纯增量键：老 App 不认识就忽略，行为与改动前一致。
+                "notice": str(st.get("notice") or "")
             })
         return self._send(404, {"error": "not found"})
 
@@ -3916,6 +4264,10 @@ def cleanup_old_tasks():
                 t = _tasks[tid]
                 st = t["state"]
                 if st["status"] != "streaming":
+                    # v4.1.x：paused 是「等接回」的活任务，不按 TASK_TTL 回收、也不判死
+                    # （它没有任何在跑的证据 —— 线程已退、心跳已停，走判死分支会被当僵尸）。
+                    if st["status"] == "paused":
+                        continue
                     if now - st["updatedAt"] > TASK_TTL:
                         del _tasks[tid]
                     continue
@@ -3970,7 +4322,11 @@ def cleanup_old_tasks():
                         # v4.0.96：未续过的中断任务改用 STREAM_RESUME_TTL（默认 72h）——
                         # 否则「继续完成」的父流会被 2 小时清理掉，用户点按钮只剩 400。
                         _ttl = STREAM_FILE_TTL
-                        if (isinstance(_st, dict) and _st.get("outcome") == "outcome_unknown"
+                        if (isinstance(_st, dict) and _st.get("status") == "paused"
+                                and not _st.get("resumedBy")):
+                            # v4.1.x：暂停中的文件是「接回原任务」的唯一依据，绝不能按 2h 清掉
+                            _ttl = STREAM_PAUSE_TTL
+                        elif (isinstance(_st, dict) and _st.get("outcome") == "outcome_unknown"
                                 and not _st.get("resumedBy")):
                             _ttl = STREAM_RESUME_TTL
                         if now - os.path.getmtime(fp) > _ttl:
@@ -3979,6 +4335,12 @@ def cleanup_old_tasks():
                         pass
         except Exception:
             pass
+        # v4.1.x（插话暂停-恢复）：暂停孤儿兜底 —— 插话流异常消失 / 后端重启丢内存态时，
+        # 绝不能让原任务被永久搁置（硬保证之二；之一在 _worker 包装层的 finally）。
+        try:
+            _resume_orphan_paused(now)
+        except Exception as _oe:
+            print("[interject] 暂停孤儿扫描异常: %s" % str(_oe)[:200], flush=True)
 
 
 def reconcile_streams_on_startup():
