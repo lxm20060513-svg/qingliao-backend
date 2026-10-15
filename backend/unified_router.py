@@ -32,6 +32,9 @@ ROUTE_TABLE = {
     "/api/files":     ("files_api",    "FilesHandler"),
     "/api/sessions":  ("sessions_api", "SessionsHandler"),
     "/api/auth":      ("auth_api",     "AuthHandler"),
+    # v4.0.116：改密后一键同步宿主环境（.env / .ql_cred / 重建容器）。
+    # 比 "/api/auth" 更长 → 最长前缀优先命中本模块，既有 auth 路由不受影响。
+    "/api/auth/sync-env": ("pwenv_sync_api", "Handler"),
     "/api/cron":      ("cron_api",     "Handler"),
     "/api/secrets":   ("secrets_api",  "Handler"),
     "/api/docker":    ("docker_api",   "DockerHandler"),
