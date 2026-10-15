@@ -47,6 +47,12 @@ DATA_DIR = os.environ.get("QL_DATA_DIR", "/data")
 STORE = os.path.join(DATA_DIR, "mail_accounts.json")
 KEY_FILE = os.path.join(DATA_DIR, ".mail_key")
 
+# v4.0.116：服务间 token（与 inbox_api.INBOX_TOKEN 同源：容器 env QL_INBOX_TOKEN）。
+# Hermes 侧脚本（mailctl.py）用它在 mail 接口上通行，与用户登录密码**解耦** ——
+# 用户改登录密码只重写 auth_config.json、不动容器 env，旧写法（env 密码换 App token）
+# 会恒 401 且静默失败。空值 = 关闭该通道（保持原行为）。
+INBOX_TOKEN = os.environ.get("QL_INBOX_TOKEN", "")
+
 CONNECT_TIMEOUT = 8      # TCP 连接超时（秒）
 READ_TIMEOUT = 15        # 收发读超时（秒）
 MAX_LIMIT = 50           # 单次最多取多少封
@@ -424,13 +430,16 @@ def read_message(aid=None, email_addr=None, uid=None, folder="INBOX"):
 
 # ---------------------------------------------------------------- 删除
 def _trash_folder(M):
-    """找「已删除」文件夹名（163 显示为 modified-UTF7 的 &XfJT0ZAB-）。找不到返回 ""。"""
+    """找「已删除」文件夹名。优先按 LIST 行的 \\Trash 属性（本地化/UTF-7 安全，如 Gmail
+    中文界面为 [Gmail]/&XfJSIJZkkK5O9g-）；没有该属性时回退名字匹配（163 的 &XfJT0ZAB-）。
+    找不到返回 \"\"。"""
     try:
         typ, data = M.list()
     except Exception:
         return ""
     if typ != "OK":
         return ""
+    fallback = ""
     for raw in (data or []):
         try:
             s = raw.decode("utf-8", "ignore") if isinstance(raw, bytes) else str(raw)
@@ -438,11 +447,14 @@ def _trash_folder(M):
             continue
         m = re.search(r'"([^"]*)"\s*$', s.strip())
         name = m.group(1) if m else s.strip().split(" ")[-1].strip('"')
-        pretty = name.replace("&XfJT0ZAB-", "已删除")
-        low = pretty.lower()
-        if ("已删除" in pretty) or ("deleted" in low) or ("trash" in low):
+        if "\\Trash" in s:
             return name
-    return ""
+        if not fallback:
+            pretty = name.replace("&XfJT0ZAB-", "已删除")
+            low = pretty.lower()
+            if ("已删除" in pretty) or ("deleted" in low) or ("trash" in low):
+                fallback = name
+    return fallback
 
 
 def delete_messages(aid=None, email_addr=None, uids=None, folder="INBOX", dry_run=False, unflag=False):
@@ -689,8 +701,14 @@ class MailHandler(BaseHTTPRequestHandler):
             import auth_api
         except Exception:
             return not os.environ.get("QL_PASSWORD")
-        return auth_api.check_auth(self.headers, "X-Mail-Password",
-                                   os.environ.get("QL_PASSWORD", ""))
+        if auth_api.check_auth(self.headers, "X-Mail-Password",
+                               os.environ.get("QL_PASSWORD", "")):
+            return True
+        # v4.0.116：服务间 token 同样放行（Hermes 侧脚本 mailctl.py 用）——
+        # 与用户登录密码解耦，用户改密后邮件链路不再恒 401。
+        import hmac
+        return bool(INBOX_TOKEN) and hmac.compare_digest(
+            self.headers.get("X-Inbox-Token", ""), INBOX_TOKEN)
 
     def _body(self):
         try:
@@ -746,13 +764,22 @@ class MailHandler(BaseHTTPRequestHandler):
             if p.path.startswith("/api/mail/accounts"):
                 self._send(200, {"ok": True, "account": save_account(body)})
             elif p.path.startswith("/api/mail/test"):
-                aid = (body.get("account") or "").strip()
+                # App「测试连接」发的是 id（与保存账号同字段），旧调用发 account —— 两个都收。
+                # 只认 account 时，编辑已有账号（授权码留空复用已存密文）会被当成新账号草稿，
+                # 草稿 normalize() 里没有 secret 字段 → KeyError('secret')，用户只看到 "'secret'"。
+                aid = (body.get("account") or body.get("id") or "").strip()
+                sec = (body.get("secret") or "").strip()
                 draft = bool(body.get("email")) and not aid
                 if draft:
                     a = {**normalize(body), "id": "draft"}
                 else:
                     a = pick_account(aid, body.get("email"))
-                res = test_connection(a, pwd=(body.get("secret") or "").strip() or None)
+                if not sec and not a.get("secret"):
+                    # 兜底：没有可用密文时给可读提示，别把 KeyError 文本直接甩给用户
+                    res = {"ok": False, "imap": {"ok": False, "error": "请先填写授权码/密码"},
+                           "smtp": {"ok": False, "error": ""}, "error": "请先填写授权码/密码"}
+                else:
+                    res = test_connection(a, pwd=sec or None)
                 if not draft:               # 测完把结果记回账号卡片的连通状态点
                     with _lock:
                         items = _load()
