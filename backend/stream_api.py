@@ -3676,6 +3676,23 @@ class StreamHandler(BaseHTTPRequestHandler):
                         audio_bytes = r.read()
                     data_b64 = base64.b64encode(audio_bytes).decode("ascii")
                     return self._send(200, {"ok": True, "audio": data_b64, "format": "mp3"})
+                # Edge TTS（微软神经音色，免费无 key）：容器内 edge_tts 合成 → mp3 base64
+                if provider == "edge":
+                    import asyncio
+                    async def _edge_synth():
+                        import edge_tts
+                        v = voice if voice not in ("", "mimo_default") else "zh-CN-XiaoxiaoNeural"
+                        com = edge_tts.Communicate(text, v)
+                        buf = bytearray()
+                        async for chunk in com.stream():
+                            if chunk["type"] == "audio":
+                                buf.extend(chunk["data"])
+                        return bytes(buf)
+                    audio_bytes = asyncio.run(asyncio.wait_for(_edge_synth(), timeout=30))
+                    if not audio_bytes:
+                        return self._send(500, {"ok": False, "error": "edge tts 未返回音频"})
+                    data_b64 = base64.b64encode(audio_bytes).decode("ascii")
+                    return self._send(200, {"ok": True, "audio": data_b64, "format": "mp3", "provider": "edge"})
                 # 智谱 glm-tts：POST {base}/audio/speech，body {model,input,voice,response_format:wav}
                 # 非流式 wav 返回原始音频字节 → 转 base64
                 if provider == "zai":
