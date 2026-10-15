@@ -46,7 +46,12 @@ ALLOWED_ROOTS = [ROOT]
 # 上传目标目录
 # v4.0.104（#17）：AI 成品文件的**只读别名根**（生产用 env QL_EXTRA_ROOTS 注入真实路径，
 # 仓内默认值仅占位；别名不放宽 ROOT 沙箱，别名内仍走 commonpath 穿越校验）。
-DEFAULT_EXTRA_ROOTS = "office=/data/qingliao-workspace"
+# v4.0.114（用户「AI 生产的其他产物也要加到产物里」）：加 artifacts 别名根 ——
+# Hermes 干活时生成的非文档产物（图/截图/代码/数据/压缩包/音频…）落在 hermes-data/artifacts/；
+# 该目录与 qingliao 容器**同路径直挂**（后端可直读），且**不含** config.yaml / state.db 等敏感文件
+# （比直接暴露 hermes-data 根安全）。生产路径同样由 env QL_EXTRA_ROOTS 注入；仓内只放占位。
+DEFAULT_EXTRA_ROOTS = ("office=/data/qingliao-workspace"
+                       ":artifacts=/data/artifacts")
 
 
 def _parse_extra_roots(spec):
