@@ -44,6 +44,11 @@ ROUTE_TABLE = {
     "/api/weather":   ("weather_api",  "WeatherHandler"),
     "/api/scenes":    ("scenes_api",   "Handler"),
     "/api/agent":     ("agent_api",    "Handler"),
+    # v4.0.118：日程预排（推送及时性 ①：已知时刻事件预排成本地通知）。
+    # 借 /api/agent 前缀 → lucky 白名单 / 蜂窝 relay / nginx 三处零改动；
+    # /api/schedule 是给 Hermes 侧脚本（push_schedule.py）用的规范路径。
+    "/api/agent/schedule": ("schedule_api", "Handler"),
+    "/api/schedule": ("schedule_api", "Handler"),
     # v4.0.11 主动型 Agent 中枢。借 /api/agent 前缀 → lucky 白名单/relay/nginx 三处零改动。
     # 放最前面只为读起来显眼；_resolve_handler 是最长前缀优先，故 /api/agent/tasks、
     # /api/agent/usage、/api/agent/tts 这几条更长前缀仍优先命中，不受影响。
