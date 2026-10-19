@@ -64,6 +64,10 @@ ROUTE_TABLE = {
     "/api/channel":   ("channel_api",  "Handler"),
     "/api/router":   ("router_api",  "Handler"),
     "/api/mcp":      ("mcp_api",     "Handler"),
+    # 工作台「Hermes 插件」：已安装（含手动装）+ 官方插件库 + 安装/启停。
+    # 别名 /api/agent/plugins 与技能库同因：lucky 白名单 + 蜂窝 relay 只放行 /api/agent。
+    "/api/plugins":  ("plugins_api",  "Handler"),
+    "/api/agent/plugins": ("plugins_api", "Handler"),
     "/api/clouddrive": ("clouddrive_api", "Handler"),
     "/api/diag":     ("diag_api",    "DiagHandler"),
     # v4.0.13：后端版本查询（免鉴权，App「关于」页用；详见 version_api.py 头注释）
