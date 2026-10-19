@@ -292,7 +292,7 @@ def _atomic_write(path, text):
         pass
 
 
-def _set_plugin_enabled(name, enabled):
+def _set_plugin_enabled(name, enabled, drop=False):
     """只改 config.yaml 顶层 plugins 段的 enabled 列表，其余字节不动。
 
     返回 (ok, error)。写后 yaml 回读校验，失败回滚。
@@ -309,7 +309,12 @@ def _set_plugin_enabled(name, enabled):
             break
     new_en = set(en)
     new_dis = set(dis)
-    if enabled:
+    if drop:
+        # v4.0.126：卸载时把键从 enabled/disabled **两个列表都摘掉**——
+        # 只写 disabled 会留下脏条目，同名插件下次安装会被当成「停用」。
+        new_en.discard(key)
+        new_dis.discard(key)
+    elif enabled:
         new_en.add(key)
         new_dis.discard(key)
     else:
@@ -656,6 +661,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/plugins/toggle"):
             self._do_toggle(body)
             return
+        if parsed.path.startswith("/api/plugins/uninstall"):
+            self._do_uninstall(body)
+            return
         self._send(404, {"ok": False, "error": "Not Found"})
 
     def _do_install(self, body):
@@ -683,6 +691,45 @@ class Handler(BaseHTTPRequestHandler):
                              name="plugin-install-%s" % name).start()
         self._send(200, {"ok": True, "job": job, "name": name,
                          "msg": "已开始安装，约 30~120 秒"})
+
+    def _do_uninstall(self, body):
+        """v4.0.126：卸载插件 = 摘 config 键 + `hermes plugins remove` + 重启网关。
+
+        · 只允许卸载插件根下的目录（NAME_RE 白名单，防 ../ 逃逸）
+        · 桌面端插件（desktop-plugins/）不归轻聊管，直接拒
+        · 删除后不自动备份：插件是 catalog 可重装的，用户点一下就回来
+        """
+        name = str(body.get("name") or "").strip()
+        row = _find_plugin(name)
+        if not row:
+            self._send(404, {"ok": False, "error": "插件不存在"})
+            return
+        if not row.get("manageable", True):
+            self._send(400, {"ok": False, "error": "桌面端插件由桌面 App 管理，轻聊不能卸载"})
+            return
+        dirname = str(row.get("dir") or row.get("name") or "")
+        if not NAME_RE.match(dirname):
+            self._send(400, {"ok": False, "error": "插件目录名非法"})
+            return
+        try:
+            r = subprocess.run(["docker", "exec", "-u", "10000", HERMES_CONTAINER,
+                                HERMES_BIN, "plugins", "remove", dirname],
+                               capture_output=True, text=True, timeout=180)
+            out = ((r.stdout or "") + (r.stderr or "")).strip()
+            rc = r.returncode
+        except Exception as e:  # noqa: BLE001
+            self._send(500, {"ok": False, "error": "执行卸载失败：%s" % str(e)[:200]})
+            return
+        if rc != 0:
+            self._send(500, {"ok": False, "error": "卸载未成功（退出码 %s）" % rc,
+                             "log": out[-1200:]})
+            return
+        # 目录已删，再清 config 键（顺序反了会留下指向不存在目录的键）
+        _set_plugin_enabled(str(row.get("name") or dirname), False, drop=True)
+        _restart_hermes_async()
+        self._send(200, {"ok": True, "name": row.get("name") or dirname, "removed": dirname,
+                         "restart": True, "msg": "已卸载，约 30 秒后网关重启生效",
+                         "log": out[-600:]})
 
     def _do_toggle(self, body):
         name = str(body.get("name") or "").strip()
