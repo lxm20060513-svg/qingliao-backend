@@ -538,7 +538,10 @@ def remove_drive(skill_id):
 
 
 # ── 展示名 ──
-DISPLAY_NAMES = {"quarkclouddrive": "夸克网盘", BAIDU_ID: BAIDU_NAME}
+# 展示名只影响 UI 列表（BAIDU_NAME 仍用于接入提示文案）。
+# 百度开放接口只授权 /apps/bdpan 这一个应用目录，个人网盘文件不在授权范围内
+# （实测「路径超出授权目录范围」）→ 名字里点明是共享目录，空目录别被当成故障。
+DISPLAY_NAMES = {"quarkclouddrive": "夸克网盘", BAIDU_ID: "百度网盘 · AI 共享目录"}
 
 
 def display_name(skill_id):
@@ -607,7 +610,10 @@ class Handler(BaseHTTPRequestHandler):
     def _drives_payload(self):
         with _LOCK:
             items = list(_load_drives())
-        return [{"id": d.get("id", ""), "name": d.get("name") or display_name(d.get("id", "")),
+        # 展示名以代码为准：台账里存的是接入当时的旧名，改名后老记录不会自动更新
+        return [{"id": d.get("id", ""),
+                 "name": (DISPLAY_NAMES.get(d.get("id", ""))
+                          or d.get("name") or display_name(d.get("id", ""))),
                  "nickname": d.get("nickname", ""), "status": d.get("status", "ready"),
                  "error": d.get("error", ""), "added_at": d.get("added_at", 0)}
                 for d in items]
