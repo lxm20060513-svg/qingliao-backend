@@ -43,6 +43,12 @@ HOST_SKILLS_DIR = os.environ.get("QL_HOST_SKILLS_DIR", os.environ.get("QL_HERMES
 HERMES_SKILLS_DIR = os.environ.get("QL_HERMES_DATA", "/data/hermes") + "/skills"
 DRIVE_REGISTRY = os.environ.get("QL_DRIVE_REGISTRY", "/data/cloud_drives.json")
 DL_DIR = os.environ.get("QL_CLOUDDRIVE_DL", "/data/clouddrive_dl")
+# ⚠️ 下载落点必须是「两个容器都看得见的同一物理目录」：官方 CLI 在 hermes 容器里跑，
+# 而读文件、回传是本进程（qingliao 容器）干的。hermes 容器里没有 /data（实测），
+# 所以 DL_DIR 不能直接甩给 CLI —— 否则 CLI 报「成功(code 0)」而文件根本没落下来。
+DL_DIR_HERMES = os.environ.get("QL_DL_DIR_HERMES", "/opt/data/clouddrive_dl")
+DL_DIR_LOCAL = os.environ.get("QL_DL_DIR_LOCAL",
+                              "/volume1/docker/hermes/hermes-data/clouddrive_dl")
 
 # CLI 需要的 host-agent 标记（官方 CLI 靠 env 探针识别宿主，不设就报「无法识别 Agent 环境」）
 AGENT_ENV = {"HERMES_INTERACTIVE": "1"}
@@ -163,9 +169,8 @@ BAIDU_TIMEOUT = 120
 # ⚠️ 下载落点必须是「两个容器都看得见的同一个物理目录」：bdpan 在 hermes 容器里跑，
 # 而读文件、回传是 qingliao 容器干的。qingliao 的 /data 在 hermes 容器里并不存在
 # （实测：hermes 容器内无 /data），所以改用 hermes-data —— 它被两边同时挂载。
-BAIDU_DL_HERMES = os.environ.get("QL_BAIDU_DL_HERMES", "/opt/data/clouddrive_dl")
-BAIDU_DL_LOCAL = os.environ.get("QL_BAIDU_DL_LOCAL",
-                                "/volume1/docker/hermes/hermes-data/clouddrive_dl")
+BAIDU_DL_HERMES = DL_DIR_HERMES    # 与夸克共用同一个双向挂载落点
+BAIDU_DL_LOCAL = DL_DIR_LOCAL
 
 
 def is_baidu(drive_id):
@@ -607,6 +612,13 @@ class Handler(BaseHTTPRequestHandler):
         if not cli_ok(result):
             self._send(200, {"ok": False, "error": cli_err(result, "读取网盘文件失败")})
             return
+        if not items:
+            # browse 的文件列表在 result.data.file_list 里，而 type="list" 那种行只有
+            # upload 才会输出 —— 只认 type=list 会让夸克目录在 App 里恒为空（实测踩过）。
+            data = result.get("data") if isinstance(result, dict) else None
+            if isinstance(data, dict):
+                items = [x for x in (data.get("file_list") or data.get("list") or [])
+                         if isinstance(x, dict)]
         entries = []
         for it in items:
             if not isinstance(it, dict) or "filename" not in it:
@@ -631,10 +643,12 @@ class Handler(BaseHTTPRequestHandler):
         if is_baidu(drive_id):
             self._do_download_baidu(drive_id, fid, name)
             return
-        os.makedirs(DL_DIR, exist_ok=True)
+        os.makedirs(DL_DIR_LOCAL, exist_ok=True)
         safe = re.sub(r"[^A-Za-z0-9一-鿿._-]", "_", name or "download")[:80]
-        outdir = tempfile.mkdtemp(prefix="dl_", dir=DL_DIR)
-        rc, out = run_cli(drive_id, ["download", "--fid", fid, "--output-dir", outdir],
+        outdir = tempfile.mkdtemp(prefix="dl_", dir=DL_DIR_LOCAL)
+        # CLI 在 hermes 容器里按「hermes 视角」写，本进程按「qingliao 视角」读，同一物理目录
+        outdir_h = os.path.join(DL_DIR_HERMES, os.path.basename(outdir))
+        rc, out = run_cli(drive_id, ["download", "--fid", fid, "--output-dir", outdir_h],
                           timeout=300)
         _, result = parse_cli_lines(out)
         files = [os.path.join(outdir, f) for f in os.listdir(outdir)
