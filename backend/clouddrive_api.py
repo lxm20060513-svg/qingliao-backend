@@ -50,6 +50,22 @@ DL_DIR_HERMES = os.environ.get("QL_DL_DIR_HERMES", "/opt/data/clouddrive_dl")
 DL_DIR_LOCAL = os.environ.get("QL_DL_DIR_LOCAL",
                               "/volume1/docker/hermes/hermes-data/clouddrive_dl")
 
+
+# ── 请求日志 ──
+# App 侧报错（如「加载失败：已取消」）时，服务端此前没有任何请求记录 → 无法判断请求
+# 是否到达。这里统一打一行「入站」+ 一行「出站（状态码/耗时）」，排查时直接看容器日志：
+#   docker logs qingliao --since 10m | grep clouddrive
+# 关掉：环境变量 QL_CLOUDDRIVE_LOG=0
+_CD_LOG = os.environ.get("QL_CLOUDDRIVE_LOG", "1") != "0"
+
+
+def _cd_log(msg):
+    if _CD_LOG:
+        try:
+            print("[clouddrive] %s" % msg, flush=True)
+        except Exception:  # noqa: BLE001
+            pass
+
 # CLI 需要的 host-agent 标记（官方 CLI 靠 env 探针识别宿主，不设就报「无法识别 Agent 环境」）
 AGENT_ENV = {"HERMES_INTERACTIVE": "1"}
 
@@ -538,6 +554,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Auth-Token")
 
     def _send(self, code, obj):
+        _cd_log("%s %s -> %s  %.2fs" % (getattr(self, "_ql_m", "?"), self.path, code,
+                                        time.time() - getattr(self, "_ql_t0", time.time())))
         body = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(code)
         self._cors()
@@ -561,6 +579,9 @@ class Handler(BaseHTTPRequestHandler):
 
     # ── GET ──
     def do_GET(self):
+        self._ql_t0 = time.time()
+        self._ql_m = "GET"
+        _cd_log("» GET %s from=%s" % (self.path, self.client_address[0]))
         if not self._check_auth():
             self._send(401, {"ok": False, "error": "未授权"})
             return
@@ -679,6 +700,9 @@ class Handler(BaseHTTPRequestHandler):
 
     # ── POST ──
     def do_POST(self):
+        self._ql_t0 = time.time()
+        self._ql_m = "POST"
+        _cd_log("» POST %s from=%s" % (self.path, self.client_address[0]))
         if not self._check_auth():
             self._send(401, {"ok": False, "error": "未授权"})
             return
