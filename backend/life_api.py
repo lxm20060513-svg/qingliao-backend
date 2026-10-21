@@ -343,7 +343,6 @@ def _to_int(v, d):
 #    磁盘上遗留的旧配置段原样塞回来，等于功能没删干净。删除功能时必须登记进这里。
 
 
-
 def _norm_expense(raw):
     """记账条目：{id, date(YYYY-MM-DD), amount(元,正数=支出/负数=收入), name, note}。
 
@@ -364,19 +363,21 @@ def _norm_expense(raw):
         d = _s(it.get("date"), 10)
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", d):
             d = time.strftime("%Y-%m-%d")
-        key = (d, round(amt, 2), _s(it.get("name"), 60))
-        if key in seen:
-            continue
-        seen.add(key)
-        items.append({"id": _s(it.get("id"), 24) or hashlib.md5(
-            ("%s|%s|%s" % key).encode()).hexdigest()[:10],
+        # 去重只认 id(v4.0.142):同天同额同名是合法的两笔(早晚各买一次菜),
+        # 旧的三元组去重会静默吞掉第二笔;无 id 的旧条目不去重。
+        key = _s(it.get("id"), 24)
+        if key:
+            if key in seen:
+                continue
+            seen.add(key)
+        items.append({"id": key or hashlib.md5(
+            ("%s|%.2f|%s|%d" % (d, amt, _s(it.get("name"), 60), len(items))).encode()).hexdigest()[:10],
             "date": d, "amount": round(amt, 2),
             "name": _s(it.get("name"), 60) or "未命名", "note": _s(it.get("note"), 200)})
         if len(items) >= MAX_EXPENSE_ITEMS:
             break
     items.sort(key=lambda x: (x["date"], x["id"]))
     return {"items": items}
-
 
 
 def _norm_notify(raw):
@@ -392,7 +393,6 @@ def _norm_notify(raw):
         "weeklyReportHour": max(0, min(23, int(_to_int(raw.get("weeklyReportHour"), 20)))),
         "scheduler": _b("scheduler", True),           # 总开关：进程内调度线程
     }
-
 
 
 def normalize_config(raw):
@@ -415,7 +415,6 @@ def normalize_config(raw):
         if _k not in out and _k not in RETIRED_CONFIG_KEYS:
             out[_k] = _v
     return out
-
 
 
 def load_config():
@@ -554,7 +553,6 @@ TX_SUGGEST = "https://smartbox.gtimg.cn/s3/?v=2&q=%s&t=all"
 # 市场编号 → 腾讯代码前缀（105/106/107 都是美股，腾讯统一 us 前缀）
 TX_PREFIX = {"1": "sh", "0": "sz", "116": "hk", "105": "us", "106": "us", "107": "us"}
 TX_MARKET_BACK = {"sh": "1", "sz": "0", "hk": "116", "us": "105"}
-
 
 
 def _tx_code(market, code):
@@ -742,39 +740,6 @@ _KLINE_CACHE_TTL = 6 * 3600
 _KLINE_CACHE_LOCK = threading.Lock()
 
 
-def stock_history(market, code, days=30):
-    """近 N 日收盘价列表（旧→新），sparkline 用。失败返回空列表（App 画不出线就不画）。"""
-    market, code = str(market), str(code)
-    tx = _tx_code(market, code)
-    if not tx:
-        return []
-    secid = "%s.%s" % (market, code)
-    now = time.time()
-    with _KLINE_CACHE_LOCK:
-        hit = _KLINE_CACHE.get(secid)
-        if hit and now - hit[0] < _KLINE_CACHE_TTL:
-            return list(hit[1])
-    try:
-        raw = _get(_TX_KLINE_URL % (tx, max(5, min(int(days), 90))), timeout=HTTP_TIMEOUT)
-        j = json.loads(raw.decode("utf-8", "ignore"))
-        node = (j.get("data") or {}).get(tx) or {}
-        rows = node.get("qfqday") or node.get("day") or []
-        closes = []
-        for r in rows:
-            # 每行 [date, open, close, high, low, ...]；收盘在第 3 列（index 2）
-            c = _num(r[2]) if isinstance(r, (list, tuple)) and len(r) > 2 else None
-            if c is not None and c > 0:
-                closes.append(round(c, 3))
-        closes = closes[-int(days):]
-        with _KLINE_CACHE_LOCK:
-            if len(_KLINE_CACHE) > 64:
-                _KLINE_CACHE.clear()   # 简单防爆（与 life 其他缓存同款策略）
-            _KLINE_CACHE[secid] = (now, closes)
-        return list(closes)
-    except Exception:
-        return []
-
-
 # ---------------------------------------------------------------- RSS / Atom
 
 
@@ -789,7 +754,6 @@ def _fetch_stock(item, index=0):
         return em
     # 两边都失败：给更能指导用户的错误文案（腾讯先失败的原因 + 东财的结果）
     return em if isinstance(em, dict) and em.get("error") else r
-
 
 
 def _collect_stocks(cfg):
@@ -863,214 +827,9 @@ def stock_history(market, code, days=30):
 
 
 # ---------------------------------------------------------------- RSS / Atom
-def _local(tag):
-    return str(tag).rsplit("}", 1)[-1].lower()
-
-
-def _text(el):
-    try:
-        return "".join(el.itertext()).strip()
-    except Exception:
-        return ""
-
-
-def _clean(s, limit=160):
-    s = re.sub(r"<[^>]+>", " ", s or "")
-    s = re.sub(r"\s+", " ", s).strip()
-    s = (s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-          .replace("&quot;", '"').replace("&#39;", "'"))
-    return s[:limit]
-
-
-def _iso(s):
-    """RSS pubDate(RFC822) / Atom published(ISO8601) → UTC ISO8601。"""
-    s = (s or "").strip()
-    if not s:
-        return ""
-    dt = None
-    try:
-        dt = parsedate_to_datetime(s)
-    except Exception:
-        dt = None
-    if dt is None:
-        try:
-            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        except Exception:
-            return ""
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _parse_feed(raw):
-    root = ET.fromstring(raw)          # 传 bytes：让 ET 自行按 XML 声明解码
-    out = []
-    for el in root.iter():
-        if _local(el.tag) not in ("item", "entry"):
-            continue
-        title, link, date = "", "", ""
-        for ch in list(el):
-            n = _local(ch.tag)
-            if n == "title" and not title:
-                title = _text(ch)
-            elif n == "link" and not link:
-                href = ch.get("href")
-                if href:                # Atom
-                    if (ch.get("rel") or "alternate") == "alternate":
-                        link = href
-                elif (ch.text or "").strip():
-                    link = ch.text.strip()
-            elif n in ("pubdate", "published", "updated", "date") and not date:
-                date = _text(ch)
-        out.append({"title": _clean(title, 120), "link": link.strip(), "published": _iso(date)})
-    return out
-
-
-def _fetch_feed(feed, index=0):
-    name, url = feed.get("name") or "RSS", feed.get("url") or ""
-    try:
-        raw = _get(url, timeout=HTTP_TIMEOUT + COLLECT_SLACK)
-    except Exception as e:
-        return {"name": name, "ok": False, "error": "抓取失败: %s" % e, "entries": []}
-    items = []
-    try:
-        items = _parse_feed(raw)
-    except Exception:
-        # 声明编码非 UTF-8 且解析失败：按内容解码后再试一次（仅对「编码问题」有效）
-        try:
-            m = re.search(r'encoding=["\']([\w\-]+)["\']', raw[:200].decode("ascii", "ignore"))
-            enc = (m.group(1) if m else "utf-8")
-            items = _parse_feed(raw.decode(enc, "ignore").encode("utf-8"))
-        except Exception as e:
-            return {"name": name, "ok": False, "error": "解析失败(不符合 RSS/Atom): %s" % e,
-                    "entries": []}
-    if not items:
-        return {"name": name, "ok": False, "error": "无条目", "entries": []}
-    dated = sorted([i for i in items if i.get("published")],
-                   key=lambda x: x["published"], reverse=True)
-    undated = [i for i in items if not i.get("published")]
-    picked = (dated + undated)[:MAX_ENTRIES_PER_FEED]
-    for i in picked:
-        i["source"] = name
-    return {"name": name, "ok": True, "error": "", "entries": picked}
-
-
-def _collect_feeds(cfg):
-    feeds = cfg["rss"]
-    if not feeds:
-        return {"kind": "rss", "id": "rss", "title": "资讯", "ok": False,
-                "entries": [], "sources": [], "error": "未添加资讯源"}
-    out = _collect_one(_fetch_feed, feeds, HTTP_TIMEOUT + COLLECT_SLACK * 2, "rss")
-    norm = []
-    for i, r in enumerate(out):
-        if not isinstance(r, dict) or "entries" not in r:
-            norm.append({"name": feeds[i].get("name") or "RSS", "ok": False,
-                         "error": (r or {}).get("_error") or "超时", "entries": []})
-        else:
-            norm.append(r)
-    entries, sources = [], []
-    for f in norm:
-        sources.append({"name": f["name"], "ok": bool(f.get("ok")),
-                        "error": f.get("error") or "", "count": len(f.get("entries") or [])})
-        entries.extend(f.get("entries") or [])
-    entries.sort(key=lambda e: e.get("published") or "", reverse=True)
-    entries = entries[:MAX_ENTRIES]
-    ok = any(f.get("ok") for f in norm)
-    bad = [f["name"] for f in norm if not f.get("ok")]
-    return {"kind": "rss", "id": "rss", "title": "资讯", "ok": ok,
-            "entries": entries, "sources": sources,
-            "error": "" if ok else "全部订阅源获取失败（%s）" % "、".join(bad[:3])}
 
 
 # ---------------------------------------------------------------- 快递
-def _fetch_package(item, index=0):
-    cfg = load_config()
-    src = cfg["express"]["source"]
-    no = item.get("no") or ""
-    carrier = item.get("carrier") or ""
-    phone = item.get("phone") or ""
-    base = {"no": no, "carrier": carrier,
-            "carrierName": CARRIER_NAME.get(carrier, carrier or "快递"),
-            "name": item.get("name") or no, "ok": False, "error": "", "state": "",
-            "stateText": "", "latest": None}
-
-    if src.get("type") == "custom":
-        tpl = src.get("url_template") or ""
-        if not tpl or "{no}" not in tpl:
-            base["error"] = "自定义源未配置 URL 模板（需含 {no} 占位）"
-            return base
-        url = (tpl.replace("{no}", urllib.parse.quote(no))
-                  .replace("{carrier}", urllib.parse.quote(carrier))
-                  .replace("{key}", urllib.parse.quote(src.get("key") or ""))
-                  .replace("{phone}", urllib.parse.quote(phone)))
-        try:
-            j = json.loads(_get(url, timeout=HTTP_TIMEOUT + COLLECT_SLACK,
-                                headers=src.get("headers") or {}).decode("utf-8", "ignore") or "{}")
-        except Exception as e:
-            base["error"] = "查询失败: %s" % e
-            return base
-        rows = _dig(j, src.get("list_path") or "data") or []
-        state = _dig(j, src.get("state_path") or "state")
-        time_key = src.get("time_key") or "time"
-        ctx_key = src.get("context_key") or "context"
-    else:
-        url = KUAIDI100_FREE.format(carrier=urllib.parse.quote(carrier), no=urllib.parse.quote(no),
-                                    ts=round(time.time() % 1000, 3), phone=urllib.parse.quote(phone))
-        try:
-            j = json.loads(_get(url, timeout=HTTP_TIMEOUT + COLLECT_SLACK,
-                                headers={"Referer": "https://www.kuaidi100.com/"}).decode("utf-8", "ignore") or "{}")
-        except Exception as e:
-            base["error"] = "查询失败: %s" % e
-            return base
-        if str(j.get("status")) not in ("200", "0") or j.get("message") not in ("ok", "", None):
-            base["error"] = _s(j.get("message") or "查询失败", 60)
-            return base
-        rows = j.get("data") or []
-        state = j.get("state")
-        time_key, ctx_key = "time", "context"
-
-    if not isinstance(rows, list):
-        base["error"] = "返回结构无法识别（列表路径: %s）" % (src.get("list_path") or "data")
-        return base
-    if not rows:
-        base["error"] = "暂无物流信息"
-        return base
-    latest = rows[0] if isinstance(rows[0], dict) else {}
-    ctx = _clean(latest.get(ctx_key), 120)
-    # 快递100 对不存在的单号也会返回一条「查无结果」轨迹 + state=3，不能当成已签收
-    if "查无结果" in ctx or "无结果" in ctx or "no result" in ctx.lower():
-        base["error"] = "查无此单号（核对单号与快递公司）"
-        base["latest"] = {"time": _s(latest.get(time_key), 40), "context": ctx}
-        return base
-    base["ok"] = True
-    base["state"] = _s(state, 6)
-    base["stateText"] = STATE_TEXT.get(_s(state, 6), "已查询")
-    base["latest"] = {"time": _s(latest.get(time_key), 40), "context": ctx}
-    return base
-
-
-def _collect_express(cfg):
-    src = cfg["express"]
-    pkgs = src["packages"]
-    if not pkgs:
-        return {"kind": "express", "id": "express", "title": "快递", "ok": False,
-                "packages": [], "error": "未添加快递单号", "hint": "设置 → 生活卡片 → 快递"}
-    out = _collect_one(_fetch_package, pkgs, HTTP_TIMEOUT + COLLECT_SLACK * 3, "express")
-    norm = []
-    for i, r in enumerate(out):
-        if not isinstance(r, dict) or "no" not in r:
-            p = pkgs[i]
-            norm.append({"no": p.get("no", ""), "carrier": p.get("carrier", ""),
-                         "carrierName": CARRIER_NAME.get(p.get("carrier", ""), "快递"),
-                         "name": p.get("name") or p.get("no", ""), "ok": False,
-                         "error": (r or {}).get("_error") or "超时", "state": "",
-                         "stateText": "", "latest": None})
-        else:
-            norm.append(r)
-    ok = any(p.get("ok") for p in norm)
-    bad = [p["no"] for p in norm if not p.get("ok")]
-    return {"kind": "express", "id": "express", "title": "快递", "ok": ok,
-            "packages": norm, "error": "" if ok else ("查询失败: %s" % "、".join(bad[:3]))}
 
 
 # ---------------------------------------------------------------- v3.6.2 资讯正文
@@ -1083,98 +842,6 @@ _SPACE_RE = re.compile(r"[ \t\u00a0]+")
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.S | re.I)
 _ARTICLE_RE = re.compile(r"<article\b[^>]*>(.*?)</article>", re.S | re.I)
 _PARA_RE = re.compile(r"<p\b[^>]*>(.*?)</p>", re.S | re.I)
-
-
-def _extract_article(html):
-    """极简正文提取（纯标准库）：优先 <article> 块，退化到全页 <p> 段落。
-    返回 (页面标题, 正文文本)；只做去标签 + 丢弃导航短句，不做站点适配。"""
-    raw = html or ""
-    raw = _COMMENT_RE.sub(" ", raw)
-    raw = _SCRIPT_RE.sub(" ", raw)
-    m = _TITLE_RE.search(raw)
-    page_title = unescape(_TAG_RE.sub("", m.group(1))).strip() if m else ""
-    blocks = _ARTICLE_RE.findall(raw)
-    scope = max(blocks, key=len) if blocks else raw
-    paras = _PARA_RE.findall(scope)
-    if not paras:
-        paras = [scope]
-    out = []
-    for p in paras:
-        t = unescape(_TAG_RE.sub(" ", p))
-        t = _SPACE_RE.sub(" ", t).strip()
-        if len(t) >= 20:              # 丢导航/按钮/版权等短句
-            out.append(t)
-    text = "\n".join(out).strip()
-    return page_title, re.sub(r"\n{3,}", "\n\n", text)
-
-
-def _ai_tidy(title, text):
-    """把正文交给模型整理（去导航/广告、保留完整内容）。
-    模型不可用/判定失败 → 返回空串，调用方降级用清洗后的原文。"""
-    try:
-        import stream_api               # 同进程模块（qingliao_all.py 一并 import）
-        prompt = ("下面是从网页抓取并已去掉 HTML 标签的文章正文。请输出这篇文章的完整内容："
-                  "保留原文段落结构与全部信息、数据、人名，只删除导航、广告、版权声明、"
-                  "推荐阅读之类噪音。不要总结、不要评论、不要客套、不要加任何前缀说明。"
-                  "如果这段文本明显不是正文（乱码、只有登录或验证提示、内容过短），"
-                  "只回复四个字：无法提取。\n\n标题：" + (title or "(无)") + "\n正文：\n" + text)
-        body = {"model": stream_api.AGENT_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": False, "max_tokens": 1400}
-        resp = stream_api._chat_once(body)
-        out = ((resp.get("choices") or [{}])[0].get("message", {}) or {}).get("content", "") or ""
-        out = out.strip()
-        if len(out) < ARTICLE_MIN_CHARS or "无法提取" in out[:12]:
-            return ""
-        return out
-    except Exception:
-        return ""
-
-
-def _fetch_article(url, title="", fresh=False):
-    """单条资讯正文：抓 HTML → 提正文 → 模型整理；按 URL 缓存（成功 6h / 失败 10min）。"""
-    url = _s(url, 1000)
-    title = _s(title, 200)
-    if not re.match(r"^https?://", url, re.I):
-        return {"ok": False, "error": "仅支持 http/https 链接"}
-    key = hashlib.md5(url.encode("utf-8")).hexdigest()[:12]
-    ts, val = _ARTICLE_CACHE.get(key, (0.0, None))
-    ttl = ARTICLE_TTL if (val or {}).get("ok") else ARTICLE_FAIL_TTL
-    if not fresh and val is not None and (time.time() - ts) < ttl:
-        return dict(val, cached=True)
-    try:
-        raw = _get(url, timeout=ARTICLE_FETCH_TIMEOUT,
-                   headers={"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"})
-    except Exception as e:
-        payload = {"ok": False, "url": url, "error": "抓取失败: %s" % str(e)[:120]}
-        _ARTICLE_CACHE[key] = (time.time(), payload)
-        return payload
-    html = raw.decode("utf-8", "ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
-    page_title, text = _extract_article(html)
-    via = "http"
-    if len(text) < ARTICLE_MIN_CHARS:
-        _hl = _headless_html(url)      # 无头兜底：SPA/JS 渲染页用 urllib 只能拿到空壳
-        if _hl:
-            _t2, _text2 = _extract_article(_hl)
-            if len(_text2) >= ARTICLE_MIN_CHARS:
-                page_title, text, via = (page_title or _t2), _text2, "headless"
-    if len(text) < ARTICLE_MIN_CHARS:
-        payload = {"ok": False, "url": url, "title": page_title or title,
-                   "error": "该页面抓不到正文（可能需 JS 渲染或反爬）"}
-        _ARTICLE_CACHE[key] = (time.time(), payload)
-        return payload
-    feed = text[:ARTICLE_MAX_CHARS]
-    ai = _ai_tidy(title or page_title, feed)
-    if ai:
-        payload = {"ok": True, "url": url, "title": title or page_title, "content": ai,
-                   "source": "ai", "via": via, "raw_chars": len(text), "chars": len(ai),
-                   "truncated": len(text) > ARTICLE_MAX_CHARS, "ts": int(time.time())}
-    else:
-        payload = {"ok": True, "url": url, "title": title or page_title, "content": feed,
-                   "source": "raw", "via": via, "raw_chars": len(text), "chars": len(feed),
-                   "truncated": len(text) > ARTICLE_MAX_CHARS, "ts": int(time.time())}
-    _ARTICLE_CACHE[key] = (time.time(), payload)
-    return payload
 
 
 # ---------------------------------------------------------------- 待办 / 记账 / 周报
@@ -1465,7 +1132,6 @@ def _expense_op(body):
         save_config(cfg)
         return _collect_expense() | {"op": "del", "id": eid}
     return {"ok": False, "op": op, "error": "op 只支持 add/del"}
-
 
 
 def _weekly_report(days=7, push=False):
@@ -1786,7 +1452,6 @@ def check_price_changes(push=True, force=False):
                          "currency": c["currency"], "hit": c.get("hit")} for c in changed]}
 
 
-
 # ---------------------------------------------------------------- 进程内调度线程
 # 之前 expressWatchEvery / weeklyReport 只是配置项，没有任何循环去读它们（形同虚设）。
 # 这里起一个 daemon 线程：快递轮询 + 每周固定时刻推周报，只依赖本进程，不依赖 Hermes 在线。
@@ -1853,201 +1518,7 @@ def _start_scheduler():
 _CACHE = {}
 
 
-def _cached(key, ttl, builder, fresh=False):
-    ts, val = _CACHE.get(key, (0.0, None))
-    if not fresh and val is not None and (time.time() - ts) < ttl:
-        return val
-    try:
-        val = builder()
-    except Exception as e:
-        val = {"_error": str(e)}
-    _CACHE[key] = (time.time(), val)
-    return val
-
-
-def _placeholder(kind, title, err, hint=""):
-    return {"kind": kind, "id": kind, "title": title, "ok": False,
-            "error": err, "hint": hint, "configured": False}
-
-
-def _collect(fresh=False):
-    cfg = load_config()
-    sig = _sig()
-    cards = []
-    stocks = _cached("stock:" + sig, STOCK_TTL, lambda: _collect_stocks(cfg), fresh)
-    if isinstance(stocks, list) and stocks:
-        cards.extend(stocks)
-    elif isinstance(stocks, list):
-        cards.append(_placeholder("stock", "股票行情", "未添加股票", "设置 → 生活卡片 → 股票"))
-    else:
-        cards.append(_placeholder("stock", "股票行情", "行情获取失败: %s" % stocks.get("_error", "")))
-
-    rss = _cached("rss:" + sig, RSS_TTL, lambda: _collect_feeds(cfg), fresh)
-    cards.append(rss if isinstance(rss, dict) and "entries" in rss
-                 else _placeholder("rss", "资讯", "订阅源获取失败"))
-
-    exp = _cached("express:" + sig, EXPRESS_TTL, lambda: _collect_express(cfg), fresh)
-    cards.append(exp if isinstance(exp, dict) and "packages" in exp
-                 else _placeholder("express", "快递", "快递查询失败"))
-
-    ok = any(c.get("ok") for c in cards)
-    return {"ok": ok, "ts": int(time.time()), "cards": cards,
-            "error": "" if ok else "全部数据源获取失败"}
-
-
-def _presets():
-    return {
-        "stocks": [dict(x) for x in DEFAULT_STOCK_PRESETS],
-        "rss": [dict(x) for x in RSS_CATALOG],
-        "carriers": [{"code": c, "name": n} for c, n in CARRIERS],
-        "markets": [{"code": c, "name": n} for c, n in MARKETS],
-    }
-
-
 # ---------------------------------------------------------------- HTTP
-class LifeHandler(BaseHTTPRequestHandler):
-    def _cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Auth-Token")
-
-    def _send(self, code, obj):
-        body = json.dumps(obj, ensure_ascii=False).encode()
-        self.send_response(code)
-        self._cors()
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _check_auth(self):
-        """与其他模块一致：复用 auth_api.check_auth（主进程内存 token / X-Auth-Token）。
-
-        auth_api 仅在部署容器内存在；本机自测（源码树直接跑）无该模块 →
-        退化为「未设置 QL_PASSWORD 时放行」，设置了密码则拒绝（不放口子）。
-        """
-        try:
-            import auth_api
-        except Exception:
-            return not os.environ.get("QL_PASSWORD")
-        return auth_api.check_auth(self.headers, "X-Life-Password",
-                                   os.environ.get("QL_PASSWORD", ""))
-
-    def _body(self):
-        try:
-            n = int(self.headers.get("Content-Length") or 0)
-        except Exception:
-            n = 0
-        if n <= 0:
-            return {}
-        try:
-            return json.loads(self.rfile.read(n).decode("utf-8", "ignore") or "{}")
-        except Exception:
-            return {}
-
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self._cors()
-        self.end_headers()
-
-    def do_GET(self):
-        if not self._check_auth():
-            self._send(401, {"ok": False, "error": "未授权"})
-            return
-        parsed = urllib.parse.urlparse(self.path)
-        params = urllib.parse.parse_qs(parsed.query)
-        try:
-            if parsed.path.startswith("/api/life/cards"):
-                fresh = params.get("fresh", ["0"])[0] in ("1", "true", "yes")
-                self._send(200, _collect(fresh=fresh))
-            elif parsed.path.startswith("/api/life/config"):
-                self._send(200, {"ok": True, "config": load_config(), "presets": _presets(),
-                                 "path": CONFIG_PATH})
-            elif parsed.path.startswith("/api/life/stock/search"):
-                q = (params.get("q") or [""])[0]
-                self._send(200, {"ok": True, "items": search_stocks(q)})
-            elif parsed.path.startswith("/api/life/stock/history"):
-                # v3.9.58：sparkline 日K——/api/life/stock/history?market=1&code=601138&days=30
-                _m = (params.get("market") or [""])[0]
-                _c = (params.get("code") or [""])[0]
-                try:
-                    days = int((params.get("days") or ["30"])[0])
-                except ValueError:
-                    days = 30
-                closes = stock_history(_m, _c, days)
-                self._send(200, {"ok": bool(closes), "closes": closes})
-            elif parsed.path.startswith("/api/life/stock/history"):
-                # v3.9.58：sparkline 日K——/api/life/stock/history?market=1&code=601138&days=30
-                m = (params.get("market") or [""])[0]
-                c = (params.get("code") or [""])[0]
-                try:
-                    days = int((params.get("days") or ["30"])[0])
-                except ValueError:
-                    days = 30
-                closes = stock_history(m, c, days)
-                self._send(200, {"ok": bool(closes), "closes": closes})
-            elif parsed.path.startswith("/api/life/todo"):
-                self._send(200, _collect_todo())
-            elif parsed.path.startswith("/api/life/expense"):
-                self._send(200, _collect_expense())
-            elif parsed.path.startswith("/api/life/weekly"):
-                self._send(200, _weekly_report(days=(params.get("days") or ["7"])[0]))
-            elif parsed.path.startswith("/api/life/express/watch"):
-                self._send(200, check_express_changes(
-                    push=(params.get("push", ["0"])[0] in ("1", "true", "yes"))))
-            elif parsed.path.startswith("/api/life/price/watch"):
-                self._send(200, check_price_changes(
-                    push=(params.get("push", ["0"])[0] in ("1", "true", "yes")),
-                    force=(params.get("force", ["0"])[0] in ("1", "true", "yes"))))
-            else:
-                self._send(404, {"ok": False, "error": "Not Found"})
-        except Exception as e:
-            self._send(200, {"ok": False, "error": "内部错误: %s" % e})
-
-    def do_POST(self):
-        if not self._check_auth():
-            self._send(401, {"ok": False, "error": "未授权"})
-            return
-        parsed = urllib.parse.urlparse(self.path)
-        body = self._body()
-        try:
-            if parsed.path.startswith("/api/life/config"):
-                cfg = save_config(body.get("config") if "config" in body else body)
-                self._send(200, {"ok": True, "config": cfg, "presets": _presets()})
-            elif parsed.path.startswith("/api/life/article"):
-                # v3.6.2：单条资讯正文（后端抓取 + 模型整理，按 URL 缓存）
-                self._send(200, _fetch_article(body.get("url"), body.get("title"),
-                                               fresh=bool(body.get("fresh"))))
-            elif parsed.path.startswith("/api/life/expense"):
-                self._send(200, _expense_op(body))
-            elif parsed.path.startswith("/api/life/weekly/report"):
-                self._send(200, _weekly_report(days=body.get("days") or 7, push=True))
-            elif parsed.path.startswith("/api/life/express/check"):
-                self._send(200, check_express_changes(push=bool(body.get("push", True))))
-            elif parsed.path.startswith("/api/life/price/check"):
-                self._send(200, check_price_changes(push=bool(body.get("push", True)),
-                                                    force=bool(body.get("force", False))))
-            elif parsed.path.startswith("/api/life/sched"):
-                n = load_config().get("notify", {}) or {}
-                alive = any(t.name == "life-sched" for t in threading.enumerate())
-                self._send(200, {"ok": True, "threadAlive": alive,
-                                 "scheduler": n.get("scheduler", True),
-                                 "expressWatch": n.get("expressWatch"),
-                                 "priceWatch": n.get("priceWatch"),
-                                 "expressWatchEvery": n.get("expressWatchEvery"),
-                                 "weeklyReport": n.get("weeklyReport"),
-                                 "weeklyReportDay": n.get("weeklyReportDay"),
-                                 "weeklyReportHour": n.get("weeklyReportHour"),
-                                 "lastExpress": _SCHED_STATE["lastExpress"],
-                                 "lastWeekly": _SCHED_STATE["lastWeekly"],
-                                 "lastError": _SCHED_STATE["lastError"]})
-            else:
-                self._send(404, {"ok": False, "error": "Not Found"})
-        except Exception as e:
-            self._send(200, {"ok": False, "error": "内部错误: %s" % e})
-
-    def log_message(self, fmt, *args):
-        pass
 
 
 # 生产里 life_api 是被 unified_router **import** 加载的（__name__ != "__main__"），
@@ -2065,26 +1536,6 @@ def _ensure_scheduler():
 
 
 _ensure_scheduler()
-
-
-if __name__ == "__main__":
-    # 本地自测：python3 life_api.py [--fresh] [--config] [端口]
-    import sys
-    if "--fresh" in sys.argv:
-        print(json.dumps(_collect(fresh=True), ensure_ascii=False, indent=2))
-        raise SystemExit(0)
-    if "--config" in sys.argv:
-        print(json.dumps({"config": load_config(), "presets": _presets()},
-                         ensure_ascii=False, indent=2))
-        raise SystemExit(0)
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 9136
-    print("life_api v2 配置: %s" % CONFIG_PATH)
-    _ensure_scheduler()
-    print("调度线程已启动（快递轮询 + 每周 %s %02d:00 周报）" % (
-        "一二三四五六日"[int(load_config().get("notify", {}).get("weeklyReportDay", 6))],
-        int(load_config().get("notify", {}).get("weeklyReportHour", 20))))
-    ThreadingHTTPServer(("127.0.0.1", port), LifeHandler).serve_forever()
-
 
 
 def _local(tag):
