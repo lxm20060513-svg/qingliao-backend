@@ -345,17 +345,9 @@ class AuthHandler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "token": tok, "expiresAt": exp, "username": _config.get("username"), "auto": True})
             return
         if self.path.startswith("/api/auth/login_get"):
-            print("[auth_api] LOGIN_GET reach", flush=True)
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(self.path).query)
-            user = (q.get("u", [""])[0]).strip()
-            pw = q.get("p", [""])[0]
-            print("[auth_api] LOGIN_GET user=" + user[:20], flush=True)
-            if verify_password(user, pw):
-                tok, exp = issue_token(q.get("r", ["0"])[0] == "1")
-                self._send(200, {"ok": True, "token": tok, "expiresAt": exp, "username": _config.get("username")})
-            else:
-                self._send(401, {"ok": False, "error": "用户名或密码错误"})
+            # v4.0.142 review第3条：下线 login_get——密码进 URL 会落访问日志。
+            # 脚本侧已改走 POST /api/auth/login（ql.py / mailctl.py / ask_user.py）。
+            self._send(404, {"ok": False, "error": "login_get removed; use POST /api/auth/login"})
             return
         if self.path.startswith("/api/auth/status"):
             if AUTO_LOGIN:
