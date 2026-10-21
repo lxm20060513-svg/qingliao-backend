@@ -7,6 +7,7 @@
 import http.server
 import json
 import os
+import errno
 import threading
 import base64
 import upload_config_helper
@@ -437,7 +438,17 @@ class FilesHandler(http.server.BaseHTTPRequestHandler):
                     os.remove(abs_path)
                 self._send_json(200, {"ok": True})
             except OSError as e:
-                self._send_json(500, {"error": "删除失败: " + str(e)[:150]})
+                # v4.0.143（用户真机：工作台产物里的文件提示删除失败，无法删除）：
+                # 只读挂载（EROFS）/ 权限不足（EACCES/EPERM）回可行动的原因。原先后端一律 500 带
+                # «[Errno 30] Read-only file system»，App 端又只显示「N 项删除失败」把原因丢了
+                # → 用户只能反复点。根因：office 别名根 /volume3 整盘 ro 挂载，已在 compose 给
+                # 「轻聊工作区」子目录单独挂 rw。
+                if e.errno == errno.EROFS:
+                    self._send_json(403, {"error": "该目录是只读来源（挂载为只读），无法删除"})
+                elif e.errno in (errno.EACCES, errno.EPERM):
+                    self._send_json(403, {"error": "没有删除权限（文件属主或目录权限限制）"})
+                else:
+                    self._send_json(500, {"error": "删除失败: " + str(e)[:150]})
             return
         if parsed.path.startswith('/api/files/rename'):
             body = self._read_json() or {}
