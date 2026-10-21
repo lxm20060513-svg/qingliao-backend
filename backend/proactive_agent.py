@@ -902,6 +902,9 @@ def deliver(text, kind="agent", event_id=""):
         ok, msg = False, str(e)
     entry["ok"] = bool(ok)
     entry["err"] = "" if ok else str(msg)[:120]
+    # v4.0.x Critical 修复：落盘日志必须带 spoke 键 —— budget_left() 与 _week_stats()
+    # 都按 e.get("spoke") 统计，缺了它 dailyMax 上限永不生效（内存 _log 回改救不了落盘）。
+    entry["spoke"] = bool(ok)
     record([entry])
     _log_add(entry)
     if ok:
@@ -1470,7 +1473,8 @@ class Handler(BaseHTTPRequestHandler):
         # v4.0.x 第 6 项：反思日记（预览默认 dry_run；答问才写盘）
         if tail == "/journal":
             dry = bool(body.get("dry_run", True))
-            n, detail = stock_event(dry_run=dry)
+            # v4.0.x 修复 copy-paste 残留：下一行 journal_event 会覆盖 (n, detail)，
+            # stock_event 白带真实副作用（真发判定事件）。只留 journal_event。
             n, detail = journal_event(dry_run=dry)
             return self._send({"ok": True, "dry_run": dry, "produced": n,
                                "detail": detail or [],

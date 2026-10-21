@@ -177,6 +177,10 @@ def _should_spawn(sid, cooldown):
             return False
         _INFLIGHT.add(sid)
         _LAST_TS[sid] = time.time()
+        # v-fix：_LAST_TS 防无界增长（复用 MAX_SESSIONS 上限，按 ts 丢最旧）
+        if len(_LAST_TS) > MAX_SESSIONS:
+            for _lk in sorted(_LAST_TS, key=lambda x: _LAST_TS.get(x, 0))[:len(_LAST_TS) - MAX_SESSIONS]:
+                _LAST_TS.pop(_lk, None)
     return True
 
 
@@ -199,7 +203,12 @@ def _spawn(sid, older, fp, n, path, ask, chars, src_chars):
             with _LOCK:
                 _INFLIGHT.discard(sid)
 
-    threading.Thread(target=run, daemon=True, name="ctx-summary").start()
+    try:
+        threading.Thread(target=run, daemon=True, name="ctx-summary").start()
+    except Exception:
+        with _LOCK:
+            _INFLIGHT.discard(sid)   # v-fix：start 失败时释放占位，别让 sid 永久卡死 _INFLIGHT
+        return False
 
 
 def apply(msgs, session_id, ask, recent_turns=None, data_dir=None):

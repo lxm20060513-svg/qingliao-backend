@@ -700,7 +700,7 @@ class MailHandler(BaseHTTPRequestHandler):
         try:
             import auth_api
         except Exception:
-            return not os.environ.get("QL_PASSWORD")
+            return False  # 修复：fail-open 兜底改 fail-closed（auth_api 不可用时不放行）
         if auth_api.check_auth(self.headers, "X-Mail-Password",
                                os.environ.get("QL_PASSWORD", "")):
             return True
@@ -739,7 +739,8 @@ class MailHandler(BaseHTTPRequestHandler):
         one = lambda k, d=None: (q.get(k) or [d])[0]
         try:
             if p.path.startswith("/api/mail/accounts"):
-                self._send(200, {"ok": True, "accounts": list_accounts(), "path": STORE})
+                # 修复：删掉 path 字段（服务端路径泄露，无消费方）
+                self._send(200, {"ok": True, "accounts": list_accounts()})
             elif p.path.startswith("/api/mail/messages"):
                 self._send(200, list_messages(
                     aid=one("account"), email_addr=one("email"),

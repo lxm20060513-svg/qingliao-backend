@@ -32,6 +32,15 @@ def set_dir(path):
     p = os.path.normpath(path)
     if not os.path.isabs(p):
         return False, "必须是绝对路径"
+    # 沙箱：只允许默认 uploads 根本身或其子目录（防把匿名下载根重定向到 / 等任意位置）。
+    # 生产现状 upload 目录即默认 uploads 根，必然放行。
+    _root = os.path.realpath(DEFAULT_DIR)
+    _rp = os.path.realpath(p)
+    try:
+        if os.path.commonpath([_rp, _root]) != _root:
+            return False, "上传目录必须是默认上传目录或其子目录"
+    except ValueError:
+        return False, "上传目录无效"
     try:
         os.makedirs(p, exist_ok=True)
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:

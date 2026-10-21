@@ -140,6 +140,96 @@ def _job_id_of(result):
     return ""
 
 
+def _job_patch(job_id, payload):
+    """改 hermes job（enabled/schedule/name/prompt）。失败返回 None 不抛。"""
+    try:
+        return _hermes("PATCH", "/api/jobs/%s" % job_id, payload)
+    except Exception as e:
+        print("[goals] patch job %s failed: %s" % (job_id, e))
+        return None
+
+
+# v4.0.x：目标 job 的槽位靠**名前缀**识别（create 时就这么命名，不靠 cronJobIDs 顺序——
+# 顺序在「只开晚推」等场景下会错位）。
+_JOB_SLOT_PREFIX = {"morning": "目标·早推进·", "evening": "目标·晚复盘·"}
+
+
+def _slot_job_map(goal):
+    """在 hermes 全量 job 列表里按名前缀认领该目标的早/晚 job，返回 {slot: job_id}。"""
+    ids = set(goal.get("cronJobIDs") or ([goal["cronJobID"]] if goal.get("cronJobID") else []))
+    if not ids:
+        return {}
+    try:
+        jobs = _hermes("GET", "/api/jobs?include_disabled=true")
+    except Exception as e:
+        print("[goals] list jobs failed: %s" % e)
+        return {}
+    if isinstance(jobs, dict):
+        jobs = jobs.get("jobs") or jobs.get("items") or []
+    out = {}
+    for j in (jobs if isinstance(jobs, list) else []):
+        if not isinstance(j, dict):
+            continue
+        jid = str(j.get("id") or "")
+        if jid not in ids:
+            continue
+        name = str(j.get("name") or "")
+        for slot, prefix in _JOB_SLOT_PREFIX.items():
+            if name.startswith(prefix):
+                out[slot] = jid
+    return out
+
+
+def _sync_goal_jobs(g_old, g_new):
+    """把目标的早/晚 cron job 对账到目标当前状态（开关/时刻/暂停/标题）——
+    这是「暂停要同步 disable job」这句老注释的落地：
+    - 关掉的槽 → 删 job（与 goals_delete 同口径，不留 disabled 孤儿）
+    - 开着的槽 → PATCH enabled(=非暂停)/schedule/name/prompt（名字带新标题，prompt 用新快照）
+    - 槽位 job 缺失（旧数据/手动删过）且开关开着 → 按当前口径补建
+    只在 goals_update 改了 job 相关字段时调用（纯勾步骤不触发，别刷 API）。
+    返回错误列表（空=全成功）；g_new 的 cronJobIDs/cronJobID 原地维护。"""
+    errs = []
+    slots = _slot_job_map(g_old)
+    paused = bool(g_new.get("paused", False))
+    for slot in ("morning", "evening"):
+        on = bool(g_new.get(slot + "Enabled", True))
+        jid = slots.get(slot)
+        prefix = _JOB_SLOT_PREFIX[slot]
+        if not on:
+            if jid:
+                _job_delete(jid)
+                g_new["cronJobIDs"] = [x for x in (g_new.get("cronJobIDs") or []) if x != jid]
+            continue
+        hour = int(g_new.get(slot + "Hour", 9 if slot == "morning" else 21))
+        # 与 goals_create 同一套 cron 写法（早 "%d 9 * * *"、晚 "%d 21 * * *"）
+        cron = ("%d 9 * * *" if slot == "morning" else "%d 21 * * *") % hour
+        prompt_fn = _goal_morning_prompt if slot == "morning" else _goal_evening_prompt
+        if jid:
+            ok = _job_patch(jid, {
+                "enabled": not paused,
+                "schedule": cron,
+                "name": (prefix + g_new.get("title", ""))[:200],
+                "prompt": prompt_fn(g_new)[:4000],
+            })
+            if ok is None:
+                errs.append("%s: job 对账失败" % slot)
+        else:
+            try:
+                nid = _job_id_of(_job_create((prefix + g_new.get("title", ""))[:200], cron,
+                                             prompt_fn(g_new), deliver="weixin"))
+                if nid:
+                    g_new.setdefault("cronJobIDs", []).append(nid)
+            except Exception as e:
+                errs.append("%s: job 补建失败 %s" % (slot, e))
+    ids = [x for x in (g_new.get("cronJobIDs") or []) if x]
+    if ids:
+        g_new["cronJobIDs"] = ids
+        g_new["cronJobID"] = ids[0]
+    elif "cronJobID" in g_new:
+        g_new["cronJobID"] = ""
+    return errs
+
+
 def _steps_digest(steps):
     return "\n".join("  [%s] %s" % ("x" if s.get("done") else " ", s.get("title", ""))
                      for s in steps)
@@ -405,6 +495,7 @@ def goals_update(payload):
         g = goals.get(gid)
         if not g:
             return 404, {"ok": False, "error": "目标不存在"}
+        g_old = dict(g)   # job 对账要用改前快照（认领旧槽位）
         if "paused" in payload:
             g["paused"] = bool(payload["paused"])
         for k in ("title",):
@@ -415,7 +506,12 @@ def goals_update(payload):
                 g[k] = bool(payload[k])
         for k in ("morningHour", "eveningHour"):
             if k in payload:
-                g[k] = min(max(int(payload[k]), 0), 23)
+                # v4.0.x 修复：非法值（字符串/None/小数串）int() 抛 ValueError 直达顶层 → 连接重置。
+                # 错误返回惯例与本函数其余分支一致: (400, {"ok": False, "error": ...})。
+                try:
+                    g[k] = min(max(int(payload[k]), 0), 23)
+                except (TypeError, ValueError):
+                    return 400, {"ok": False, "error": "%s 需 0-23 的整数" % k}
         if "doneStepIds" in payload:
             want = set(payload.get("doneStepIds") or [])
             for s in g.get("steps", []):
@@ -436,7 +532,12 @@ def goals_update(payload):
         _sync_todos_finish(gid)
     # v4.0.45：App 端勾选/取消勾选步骤也要对账进待办（原先这条路径没挂钩 → 待办永远不划）
     _sync_todos_backfill(gid)
-    return 200, {"ok": True, "goal": g, "finished": bool(finished)}
+    # job 对账只在动了 job 相关字段时做（纯勾步骤/查改不碰 hermes，别刷 API）
+    job_errs = []
+    if any(k in payload for k in ("paused", "title", "morningEnabled",
+                                  "eveningEnabled", "morningHour", "eveningHour")):
+        job_errs = _sync_goal_jobs(g_old, g)
+    return 200, {"ok": True, "goal": g, "finished": bool(finished), "jobErrs": job_errs}
 
 
 def goals_delete(goal_id):
@@ -1036,10 +1137,20 @@ def _watch_answer(mid, gid, sid):
         return
     try:
         deadline = time.time() + QUESTION_TIMEOUT
+        # v4.0.x 修复：read_answer 异常原先被当「卡还在」(found=True, ans=None)，
+        # 后端持续异常时会空转满 QUESTION_TIMEOUT(6h) 占住 watcher 名额。
+        # 改连续异常计数：满 20 次(约 100s)放弃等待并打日志；正常返回则计数归零。
+        _err_streak = 0
         while time.time() < deadline:
             try:
                 found, ans = inbox_api.read_answer(mid)
-            except Exception:
+                _err_streak = 0
+            except Exception as e:
+                _err_streak += 1
+                if _err_streak >= 20:
+                    print("[goals] read_answer 连续异常 %d 次，放弃等待 id=%s: %s"
+                          % (_err_streak, mid, str(e)[:120]), flush=True)
+                    return
                 found, ans = True, None
             if not found:
                 print("[goals] 问题卡已收尾/被清 id=%s" % mid, flush=True)

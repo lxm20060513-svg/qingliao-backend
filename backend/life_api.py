@@ -1503,10 +1503,11 @@ def _weekly_report(days=7, push=False):
     for r in rows[:6]:
         if not r.get("ok"):
             continue
-        chg = r.get("changePct")
-        lines.append("📈 %s %s %s（%s）" % (r.get("name", ""), r.get("price", ""),
-                                          ("%+.2f%%" % chg) if isinstance(chg, (int, float)) else "—",
-                                          r.get("stateText", "")))
+        # v4.0.x 修复字段名：股票卡真源是 change_pct（见 _fetch_stock），changePct/stateText
+        # 都不存在 → 涨跌幅永远显示「—」。
+        chg = r.get("change_pct")
+        lines.append("📈 %s %s %s" % (r.get("name", ""), r.get("price", ""),
+                                      ("%+.2f%%" % chg) if isinstance(chg, (int, float)) else "—"))
     if not any(r.get("ok") for r in rows):
         lines.append("📈 股票：行情获取失败")
 
@@ -2310,6 +2311,9 @@ def _extract_price(text, item, src):
     if not pat:
         return None, "未配置提取规则"
     try:
+        # v4.0.x ReDoS 缓解：pattern 是用户自定义的，跑在全量页面上可能灾难性回溯
+        # → 先截断到 20 万字符（价格抓取需要的上下文远小于此）。
+        text = text[:200_000]
         m = re.search(pat, text, re.S)
     except re.error as e:
         return None, "正则错误: %s" % e
@@ -2686,8 +2690,11 @@ class LifeHandler(BaseHTTPRequestHandler):
         if not parsed.path.startswith("/api/life/goal") or goal_module is None:
             self._send(404, {"ok": False, "error": "Not Found"})
             return
-        code, obj = goal_module.goals_update(self._body())
-        self._send(code, obj)
+        try:  # PATCH-ERRGUARD：参照 do_POST —— 非法 body/参数抛异常会让连接重置，必须兜住
+            code, obj = goal_module.goals_update(self._body())
+            self._send(code, obj)
+        except Exception as e:
+            self._send(200, {"ok": False, "error": "内部错误: %s" % e})
 
     def do_DELETE(self):
         """v4.0.7 删目标 —— 服务端连带删掉它的 cron job。"""

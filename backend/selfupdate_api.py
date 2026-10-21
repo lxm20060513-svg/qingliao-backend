@@ -265,7 +265,7 @@ class Handler(BaseHTTPRequestHandler):
         if auth_api is not None:
             return auth_api.check_auth(self.headers, "X-Life-Password",
                                        os.environ.get("QL_PASSWORD", ""))
-        return not os.environ.get("QL_PASSWORD")
+        return False  # 修复：fail-open 兜底改 fail-closed（auth_api 不可用时不放行）
 
     def _send(self, code, obj):
         try:

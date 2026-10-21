@@ -203,7 +203,22 @@ def _restart_hermes_async():
 
 
 def _mask_key(url):
-    return re.sub(r"(key=)[^&]+", r"\1***", url)
+    """修复：原只脱敏 key= 参数，其余 query 参数值（token/pw/api_key 等）明文外泄。
+    改为对 query string 全部参数值统一脱敏（保 key 名，值换 ***）；
+    无 query 的 URL 原样返回；userinfo 形态（scheme://user:pass@host）一并打码。"""
+    try:
+        head, sep, tail = url.partition("?")
+        if not sep:
+            head = re.sub(r"^([a-zA-Z][a-zA-Z0-9+.\-]*://)([^@/\s]+)@", r"\1***@", head)
+            return head
+        frag = ""
+        if "#" in tail:
+            tail, _, frag = tail.partition("#")
+        tail = re.sub(r"=([^&#]*)", "=***", tail)
+        head = re.sub(r"^([a-zA-Z][a-zA-Z0-9+.\-]*://)([^@/\s]+)@", r"\1***@", head)
+        return head + "?" + tail + (("#" + frag) if frag else "")
+    except Exception:
+        return re.sub(r"(key=)[^&]+", r"\1***", url)
 
 
 class Handler(BaseHTTPRequestHandler):

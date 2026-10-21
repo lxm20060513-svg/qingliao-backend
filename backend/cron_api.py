@@ -127,7 +127,8 @@ class Handler(BaseHTTPRequestHandler):
                         })
                     self.send_json(transformed)
             except Exception as e:
-                self.send_json([])
+                # 修复：异常不再吞成 200+空数组（App 无法区分「无任务」与「上游故障」）
+                self.send_json({'error': str(e)[:200]}, 502)
         elif self.path == '/api/cron/logs':
             try:
                 req = urllib.request.Request(f"{HERMES_API}/api/jobs", headers={
@@ -149,7 +150,8 @@ class Handler(BaseHTTPRequestHandler):
                     logs.sort(key=lambda x: x.get('time', ''), reverse=True)
                     self.send_json(logs[:50])
             except Exception as e:
-                self.send_json([])
+                # 修复：同上，502 + 错误摘要
+                self.send_json({'error': str(e)[:200]}, 502)
         else:
             self.send_error(404)
 

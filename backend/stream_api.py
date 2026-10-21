@@ -1625,6 +1625,10 @@ def _maybe_push_app(st, task_id=None):
         if task_id:
             try:
                 _sig = hashlib.md5(content.encode("utf-8")).hexdigest()
+                # v-fix：去重表防无界增长（仿 _MAINTAIN_TRIES 500 上限，按 ts 删最旧）
+                if len(_APP_PUSH_DEDUP) > 500:
+                    for _dk in sorted(_APP_PUSH_DEDUP, key=lambda k: _APP_PUSH_DEDUP[k].get("ts", 0))[:200]:
+                        _APP_PUSH_DEDUP.pop(_dk, None)
                 _dedup = _APP_PUSH_DEDUP.setdefault(task_id, {})
                 if _dedup.get("sig") == _sig and time.time() - _dedup.get("ts", 0) < 120:
                     print("[push] App收件箱跳过：同任务同内容%.0fs内已推过" % (time.time() - _dedup.get("ts", 0)), flush=True)
@@ -4007,6 +4011,9 @@ class StreamHandler(BaseHTTPRequestHandler):
                             offset = int(kv[7:])
                         except Exception:
                             offset = 0
+                    # v-fix：负 offset 会返回 content 尾部片段，破坏「offset 只增」增量协议
+                    if offset < 0:
+                        offset = 0
             with _tasks_lock:
                 task = _tasks.get(task_id)
             if not task:

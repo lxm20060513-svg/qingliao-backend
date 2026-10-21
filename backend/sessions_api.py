@@ -436,9 +436,11 @@ class SessionsHandler(http.server.BaseHTTPRequestHandler):
                 return
             incoming = body.get('sessions') or []
             deleted = body.get('deleted') or []
-            current = load_sessions()
-            merged = merge_sessions(current, incoming, deleted)
-            save_sessions(merged)
+            # 修复：load+merge+save 整段持锁（原三步无锁，并发 merge 互相覆盖丢数据；_save_lock 是 RLock，save_sessions 内层加锁无副作用）
+            with _save_lock:
+                current = load_sessions()
+                merged = merge_sessions(current, incoming, deleted)
+                save_sessions(merged)
             self._send_json(200, {"ok": True, "saved": len(incoming), "deleted": len(deleted), "total": len(merged)})
             return
         if self.path.startswith('/api/sessions/search'):
@@ -481,9 +483,11 @@ class SessionsHandler(http.server.BaseHTTPRequestHandler):
             if body is None or not isinstance(body, list):
                 self._send_json(400, {"error": "无效的请求体，需要会话数组"})
                 return
-            current = load_sessions()
-            merged = merge_sessions(current, body, [])
-            save_sessions(merged)
+            # 兼容旧路径同样持锁（与 merge 接口同口径）
+            with _save_lock:
+                current = load_sessions()
+                merged = merge_sessions(current, body, [])
+                save_sessions(merged)
             self._send_json(200, {"ok": True, "saved": len(body), "total": len(merged)})
             return
         self._send_json(404, {"error": "not found"})

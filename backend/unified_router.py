@@ -134,7 +134,7 @@ def _load_handler(prefix):
         return cls
     except Exception as e:
         print(f"[router] load {mod_name}.{cls_name} FAILED: {e}", flush=True)
-        _handler_cache[prefix] = None
+        # v-fix：失败不缓存 None——瞬时导入失败只影响本次请求，下次请求自动重试
         return None
 
 

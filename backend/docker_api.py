@@ -125,7 +125,9 @@ def _container_action(name, action):
     try:
         cmd = {"stop": ["docker", "stop", name],
                "start": ["docker", "start", name],
-               "rm": ["docker", "rm", "-f", name]}.get(action, ["docker", action, name])
+               "rm": ["docker", "rm", "-f", name],
+               # 修复：目录无 docker-compose.yml 时 down 落到这里，原样拼出无效的 docker down
+               "down": ["docker", "rm", "-f", name]}.get(action, ["docker", action, name])
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if r.returncode == 0:
             msg = {"stop": "已停止", "start": "已启动", "rm": "已删除容器"}.get(action, "操作成功")
@@ -138,8 +140,11 @@ def _container_action(name, action):
 def _resolve_action(name, action):
     """按项目目录决定：有 docker-compose.yml 的目录走 compose 命令，否则按容器名通用操作
     （修复：目录存在但无 compose 文件（UGOS 部署）时 compose 报 no config 失败，卡片点了没反应）"""
+    # 修复：fallback 分支原先不过 NAME_RE 白名单（防路径穿越），入口统一先校验再路由
+    if not NAME_RE.match(name):
+        return False, "名称不合法（仅字母/数字/下划线/中划线，1-64 字符）"
     d = os.path.join(DOCKER_ROOT, name)
-    if (NAME_RE.match(name) and os.path.isdir(d)
+    if (os.path.isdir(d)
             and os.path.exists(os.path.join(d, "docker-compose.yml"))):
         return _compose_action(name, action)
     return _container_action(name, action)

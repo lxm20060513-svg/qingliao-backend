@@ -24,6 +24,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -277,22 +278,48 @@ def _read_readme(dir_path, limit=4000):
 
 # ─────────────────────────── config.yaml 写入 ───────────────────────────
 
+# 修复①：config.yaml 读-改-写（_set_plugin_enabled）全程持模块级 RLock（原无锁，
+# 并发 toggle 互相覆盖）；RLock 便于调用方已持锁时重入。
+# 修复②：_atomic_write 原 tmp 名是毫秒时间戳，并发写互踩；改 tempfile.mkstemp
+# 同目录唯一 tmp + os.replace，沿用原文件 mode/owner（mkstemp 天生 0600 需显式
+# chmod；口径参考 typesafe_api._atomic_write_json）。
+_PLUGIN_CFG_LOCK = threading.RLock()
+
+
 def _atomic_write(path, text):
-    st = os.stat(path)
-    tmp = "%s.tmp-qlplugin-%d" % (path, int(time.time() * 1000))
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.chmod(tmp, st.st_mode & 0o777)
-    os.replace(tmp, path)
     try:
-        os.chown(path, st.st_uid, st.st_gid)   # mode 与 owner 是两件事，原子替换只沿用 mode
+        st = os.stat(path)
     except OSError:
-        pass
+        st = None
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp",
+                               dir=os.path.dirname(path) or ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, (st.st_mode & 0o777) if st else 0o644)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    if st:
+        try:
+            os.chown(path, st.st_uid, st.st_gid)   # mode 与 owner 是两件事，原子替换只沿用 mode
+        except OSError:
+            pass
 
 
 def _set_plugin_enabled(name, enabled, drop=False):
+    """持锁委托 _set_plugin_enabled_locked（读-改-写全程串行化）。"""
+    with _PLUGIN_CFG_LOCK:
+        return _set_plugin_enabled_locked(name, enabled, drop)
+
+
+def _set_plugin_enabled_locked(name, enabled, drop=False):
     """只改 config.yaml 顶层 plugins 段的 enabled 列表，其余字节不动。
 
     返回 (ok, error)。写后 yaml 回读校验，失败回滚。
@@ -725,7 +752,12 @@ class Handler(BaseHTTPRequestHandler):
                              "log": out[-1200:]})
             return
         # 目录已删，再清 config 键（顺序反了会留下指向不存在目录的键）
-        _set_plugin_enabled(str(row.get("name") or dirname), False, drop=True)
+        # 修复③：清理 config 失败不能报 ok:true（否则 App 以为卸载完成，config 残留脏键）
+        cfg_ok, cfg_err = _set_plugin_enabled(str(row.get("name") or dirname), False, drop=True)
+        if not cfg_ok:
+            self._send(500, {"ok": False, "error": "插件目录已删，但清理 config 失败：%s" % cfg_err,
+                             "removed": dirname})
+            return
         _restart_hermes_async()
         self._send(200, {"ok": True, "name": row.get("name") or dirname, "removed": dirname,
                          "restart": True, "msg": "已卸载，约 30 秒后网关重启生效",

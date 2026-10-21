@@ -14,7 +14,7 @@
 视觉模型逻辑（Hermes agent.image_input_mode: auto 原生支持）：
 主模型 supports_vision → 原生传图用主模型；主模型不支持 + auxiliary.vision 显式配置 → 用视觉模型兜底。
 """
-import json, os, subprocess, tempfile, threading, hmac
+import json, os, re, subprocess, tempfile, threading, hmac
 from http.server import BaseHTTPRequestHandler
 import auth_api
 try:
@@ -145,6 +145,11 @@ def _read_model():
         return {"model": model, "provider": provider}
     except Exception as e:
         return {"model": None, "provider": None, "error": str(e)[:120]}
+
+
+def _valid_model_name(model):
+    """修复：model 值写前校验（原样拼进 YAML 行，换行/特殊字符可注入写坏 config.yaml）"""
+    return bool(re.fullmatch(r"[A-Za-z0-9._:/-]{1,80}", model))
 
 
 def _write_model(model, provider):
@@ -463,6 +468,9 @@ class Handler(BaseHTTPRequestHandler):
         if provider not in (VALID_PROVIDERS | _config_provider_keys()):
             self._send(400, {"error": "unsupported provider: %s" % provider})
             return
+        if not _valid_model_name(model):
+            self._send(400, {"error": "model 名不合法（仅限字母/数字/._:/-，1-80 字符）"})
+            return
         with _lock:
             try:
                 _write_model(model, _normalize_provider(provider))
@@ -491,6 +499,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if provider not in (VALID_PROVIDERS | _config_provider_keys()):
             self._send(400, {"error": "unsupported provider: %s" % provider})
+            return
+        if not _valid_model_name(model):
+            self._send(400, {"error": "model 名不合法（仅限字母/数字/._:/-，1-80 字符）"})
             return
         with _lock:
             try:

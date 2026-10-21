@@ -81,6 +81,10 @@ def _daily(w):
 
 
 def _get_weather(lat=None, lon=None, city=None):
+    # v4.0.x 修复：调用方显式传了 city 时，geocoding 失败**不得**被 IP 定位静默顶替
+    # （否则用户查「南宁」，IP 在上海 → 城市名与坐标全被换成 IP 所在地）。
+    # user_city=True 时跳过 ip-api 兑底，沿后续缓存/默认坐标逻辑走，city 保持用户输入。
+    user_city = bool(city)
     # 缓存（按坐标/城市区分）
     cache_key = ("%.3f,%.3f" % (lat, lon)) if lat is not None else (city or "ip")
     # 城市 → 坐标（Open-Meteo geocoding）
@@ -109,8 +113,8 @@ def _get_weather(lat=None, lon=None, city=None):
     # v2.0.87as：默认城市只在无 city 参数时（否则覆盖 geocoding 结果）
     if not city:
         city = "上海"   # 默认
-    if lat is None or lon is None:
-        # IP 定位
+    if (lat is None or lon is None) and not user_city:
+        # IP 定位（仅调用方未传 city 时允许；传了 city 的失败由下方旧缓存/默认坐标兜底）
         try:
             loc = _fetch("http://ip-api.com/json/?fields=lat,lon,city", timeout=6)
             if loc.get("status") == "success":

@@ -85,7 +85,7 @@ def clear_history():
         _write_history([])
     return []
 
-_lock = threading.Lock()
+_lock = threading.RLock()   # 修复：改 RLock——create/cancel/scheduler 整段读改写持锁，_load/_save 内层同锁可重入
 _scheduler_started = False
 
 
@@ -185,9 +185,11 @@ def create_automation(name, actions, delay_seconds):
         "run_at": time.time() + delay_seconds,
         "created": time.strftime("%Y-%m-%d %H:%M"),
     }
-    items = _load()
-    items.append(item)
-    _save(items)
+    # 修复：读-改-写整段持锁（原先与 scheduler/cancel 并发互相覆盖，任务静默丢失）
+    with _lock:
+        items = _load()
+        items.append(item)
+        _save(items)
     if delay_seconds < 60:
         return True, f"已创建自动化「{name}」，{delay_seconds} 秒后执行"
     m, s = divmod(delay_seconds, 60)
@@ -216,11 +218,13 @@ def list_automations():
 
 
 def cancel_automation(aid):
-    items = _load()
-    new = [a for a in items if a.get("id") != aid]
-    if len(new) == len(items):
-        return False
-    _save(new)
+    # 修复：读-改-写整段持锁（同 create_automation）
+    with _lock:
+        items = _load()
+        new = [a for a in items if a.get("id") != aid]
+        if len(new) == len(items):
+            return False
+        _save(new)
     return True
 
 
@@ -228,10 +232,15 @@ def _scheduler():
     while True:
         try:
             now = time.time()
-            items = _load()
-            due = [a for a in items if (a.get("run_at") or 0) <= now]
+            # 修复：锁内取出 due 并先落盘标记（防与 create/cancel 并发互相覆盖丢任务）；
+            # HA 调用/推送/写日志等慢 IO 在锁外执行，不持锁做网络请求
+            with _lock:
+                items = _load()
+                due = [a for a in items if (a.get("run_at") or 0) <= now]
+                if due:
+                    remaining = [a for a in items if (a.get("run_at") or 0) > now]
+                    _save(remaining)
             if due:
-                remaining = [a for a in items if (a.get("run_at") or 0) > now]
                 for a in due:
                     ok, results = exec_actions(a.get("actions", []))
                     try:
@@ -253,7 +262,6 @@ def _scheduler():
                         append_history("自动化", a.get("name"), ok, "; ".join(results[:2]))
                     except Exception:
                         pass
-                _save(remaining)
             # v3.9.21：条件规则求值（边沿触发 + 冷却 + 小时限额由 rules_engine 管）
             try:
                 rules_engine.tick(_exec_rule)
