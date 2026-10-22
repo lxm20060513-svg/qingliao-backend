@@ -788,7 +788,7 @@ def _bgjobs_flush():
         print("[bgjobs] 落盘失败（忽略）: %s" % e, flush=True)
 
 
-def _bgjob_register(job_id, title, detail=""):
+def _bgjob_register(job_id, title, detail="", boot_id=""):
     """登记/刷新一条后台作业（已存在则更新标题，状态重置 running）。
     v4.0.86（任务中心④）：带租约 —— leaseUntil 内不判死；过期 running 即僵尸，
     收进历史时标 error，App 不再「永远在跑」。"""
@@ -797,6 +797,7 @@ def _bgjob_register(job_id, title, detail=""):
         _background_jobs[job_id] = {
             "jobId": job_id, "title": title, "detail": detail,
             "status": "running",
+            "bootId": boot_id or (old.get("bootId") if old else None),
             "createdAt": old.get("createdAt", time.time()) if old else time.time(),
             "updatedAt": time.time(),
             # 租约：登记即授 30min；worker 推进时用 bg_update(detail/result) 续期。
@@ -822,11 +823,12 @@ def _bgjob_finish(job_id, ok=True, result=""):
     _bgjobs_flush()      # v4.0.40（#2）
 
 
-def bg_register(title, job_id=None, detail=""):
+def bg_register(title, job_id=None, detail="", boot_id=""):
     """v3.4.25：供 /api/tasks/bg 内部端点调用的登记入口（Hermes 派子代理/后台作业时上报进度）。
     job_id 不传则按标题+时间生成。返回 jobId 供后续更新状态。"""
     jid = job_id or ("bg-" + uuid.uuid4().hex[:10])
-    _bgjob_register(jid, title, detail)
+    _bgjob_reconcile_boot(boot_id)   # v4.0.147：新世代登记 → 判死上一世遗留
+    _bgjob_register(jid, title, detail, boot_id=boot_id)
     return jid
 
 
@@ -853,9 +855,98 @@ def bg_update(job_id, status=None, detail=None, result=None):
     return ok
 
 
+# ── v4.0.147（任务中心⑤）：后台主动清扫租约过期的 running 作业 ──────────────
+# 背景：租约判死原来只写在 _collect_active_tasks() 里 = 「有人看才判」，
+# App 不拉 /api/tasks/active 就永远不收尾（实测租约 09:16 到期，10:21 才判死）。
+# 现在 60s 主动扫一轮，与下发侧同口径；两处都保留，谁先到谁判，判死幂等。
+_BGJOB_SWEEP_SEC = 60
+_bgjobs_sweep_started = False
+
+
+def _bgjob_reap_expired(now=None):
+    """把租约过期的 running 标成 error（原地判死）。返回判死条数。"""
+    _bgjobs_load()
+    now = time.time() if now is None else float(now)
+    dead = []
+    with _background_jobs_lock:
+        for j in _background_jobs.values():
+            if j.get("status") == "running" and now > float(j.get("leaseUntil") or 0):
+                j["status"] = "error"
+                j["updatedAt"] = now
+                j["result"] = str(j.get("result") or "作业超时未收尾（租约过期）")[:2000]
+                j.pop("leaseUntil", None)
+                dead.append(j.get("jobId", ""))
+    if dead:
+        _bgjobs_flush()
+        print("[bgjobs] 后台清扫判死 %d 条: %s" % (len(dead), ",".join(dead[:5])), flush=True)
+    return len(dead)
+
+
+def _bgjob_reconcile_boot(boot_id):
+    """网关换世代（重启/被杀后拉起）时，把上一世遗留的 running 判死。
+
+    判据：作业登记时带了 bootId，且与本次 bootId 不同 ⇒ 收尾钩子必丢。
+    不带 bootId 的作业（cron/webhook 等别的生产者）不碰，避免误杀。
+    """
+    if not boot_id:
+        return 0
+    dead = []
+    now = time.time()
+    with _background_jobs_lock:
+        for j in _background_jobs.values():
+            if (j.get("status") == "running" and j.get("bootId")
+                    and j["bootId"] != boot_id):
+                j["status"] = "error"
+                j["updatedAt"] = now
+                j["result"] = "服务重启中断（作业未收尾）"
+                j.pop("leaseUntil", None)
+                dead.append(j.get("jobId", ""))
+    if dead:
+        _bgjobs_flush()
+        print("[bgjobs] 网关换代判死 %d 条: %s" % (len(dead), ",".join(dead[:5])), flush=True)
+    return len(dead)
+
+
+def _start_bgjobs_sweep():
+    """60s 一轮的租约清扫线程（模块级只起一次）。"""
+    global _bgjobs_sweep_started
+    if _bgjobs_sweep_started:
+        return
+    _bgjobs_sweep_started = True
+
+    def _loop():
+        while True:
+            time.sleep(_BGJOB_SWEEP_SEC)
+            try:
+                _bgjob_reap_expired()
+            except Exception as e:
+                print("[bgjobs] 清扫异常：%s" % str(e)[:200], flush=True)
+
+    print("[bgjobs] 租约清扫线程已启动（%ds 一轮）" % _BGJOB_SWEEP_SEC, flush=True)
+    threading.Thread(target=_loop, daemon=True, name="ql-bgjobs-sweep").start()
+
+
+
+
 # v4.0.86（任务中心③）：历史任务 —— bgjobs.json 里 done/error 的作业 + 最近流式收尾。
 # 背景：active 端点只吐「进行中 + 2h 内刚完成的 bg 作业」，跨夜全丢，失败原因无处看。
 # 口径：只读 bgjobs.json（落盘真源，重启也在），按 updatedAt 倒序，limit 上限 200。
+def _clear_task_history():
+    """v4.0.147（任务中心⑥）：清空历史（done/error）。running 绝不动。"""
+    _bgjobs_load()
+    with _background_jobs_lock:
+        before = len(_background_jobs)
+        keep = dict((k, v) for k, v in _background_jobs.items()
+                    if v.get("status") == "running")
+        _background_jobs.clear()
+        _background_jobs.update(keep)
+        n = before - len(keep)
+    if n:
+        _bgjobs_flush()
+    print("[bgjobs] 历史已清空 %d 条（运行中保留 %d 条）" % (n, len(keep)), flush=True)
+    return {"ok": True, "cleared": n, "kept": len(keep)}
+
+
 def _collect_task_history(limit=100):
     _bgjobs_load()
     try:
@@ -3400,12 +3491,18 @@ class StreamHandler(BaseHTTPRequestHandler):
             action = str(dat.get("action", "register"))
             title = str(dat.get("title", "")).strip()
             job_id = str(dat.get("jobId", "")).strip() or None
+            boot_id = str(dat.get("bootId") or "").strip()
             detail = dat.get("detail")
             result = dat.get("result")
+            if action == "boot":
+                # v4.0.147：网关换世代握手 —— 只做上一世对账，不产作业（不污染历史）
+                n = _bgjob_reconcile_boot(boot_id)
+                return self._send(200, {"ok": True, "reconciled": n})
             if action == "register":
                 if not title:
                     return self._send(400, {"error": "title required"})
-                jid = bg_register(title, job_id=job_id, detail=str(detail or ""))
+                jid = bg_register(title, job_id=job_id, detail=str(detail or ""),
+                                  boot_id=boot_id)
                 return self._send(200, {"ok": True, "jobId": jid})
             # update / finish
             if not job_id:
@@ -3421,6 +3518,10 @@ class StreamHandler(BaseHTTPRequestHandler):
         except Exception:
             return self._send(400, {"error": "bad json"})
 
+        # v4.0.147（任务中心⑥）：清空历史（只清 done/error，running 不动）
+        if self.path.split("?", 1)[0] in ("/api/tasks/history/clear",
+                                          "/api/agent/tasks/history/clear"):
+            return self._send(200, _clear_task_history())
         # v3.9.80：App 的「一问一答（非流式）」出口。
         # 根因（2026-09-25 取证）：App 侧三处（Siri「问轻聊」/ AI 翻译浮层 / 上下文自动压缩摘要）
         # 一直在 POST 这个路径，而后端**从来没实现过** —— do_POST 一路落到函数末尾统一 404。
@@ -4497,6 +4598,7 @@ def _start_maintain():
 
 # 模块级启动清理线程（import 与 __main__ 两条路径都覆盖，防重复）
 _start_cleanup()
+_start_bgjobs_sweep()   # v4.0.147：租约过期主动清扫（60s）
 
 # v4.0.37（借鉴⑤）：启动对账 + 补发线程（顺序重要：先对账把孤儿判死落盘，
 # 再起补发线程，否则补发线程可能读到"还在 streaming"的孤儿文件）。
