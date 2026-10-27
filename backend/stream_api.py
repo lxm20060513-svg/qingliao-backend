@@ -252,6 +252,7 @@ SYNC_ENDPOINTS = {
     "xiaomi": ("https://token-plan-cn.xiaomimimo.com/v1/models", ["providers", "xiaomi", "api_key"]),
     "sensenova": ("https://token.sensenova.cn/v1/models", ["providers", "sensenova", "api_key"]),
     "zai-coding": ("https://api.z.ai/api/coding/paas/v4/models", ["providers", "zai-coding", "api_key"]),
+    "spark": ("https://maas-api.cn-huabei-1.xf-yun.com/v2/models", ["providers", "spark", "api_key"]),
 }
 
 def _hermes_cfg_path():
